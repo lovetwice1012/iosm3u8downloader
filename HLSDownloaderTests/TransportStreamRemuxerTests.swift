@@ -72,15 +72,15 @@ final class TransportStreamRemuxerTests: XCTestCase {
         let asset = AVURLAsset(url: outputURL)
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-        let videoTrack = try XCTUnwrap(videoTracks.first)
-        let audioTrack = try XCTUnwrap(audioTracks.first)
-        let sampleTimes = try firstSamplePresentationTimes(
-            in: asset,
-            videoTrack: videoTrack,
-            audioTrack: audioTrack
-        )
-        let videoStart = CMTimeGetSeconds(sampleTimes.video)
-        let audioStart = CMTimeGetSeconds(sampleTimes.audio)
+        XCTAssertEqual(videoTracks.count, 1)
+        XCTAssertEqual(audioTracks.count, 1)
+        let duration = CMTimeGetSeconds(try await asset.load(.duration))
+        XCTAssertGreaterThan(duration, 2.5)
+        XCTAssertLessThan(duration, 3.5)
+
+        let editStarts = try initialEmptyEditDurations(at: outputURL)
+        let videoStart = try XCTUnwrap(editStarts["vide"])
+        let audioStart = try XCTUnwrap(editStarts["soun"])
 
         XCTAssertLessThan(abs(videoStart), 0.2, "video start: \(videoStart)")
         XCTAssertGreaterThan(
@@ -95,45 +95,148 @@ final class TransportStreamRemuxerTests: XCTestCase {
         )
     }
 
-    private enum SampleReadError: Error {
-        case cannotAddOutput
-        case cannotStartReading
-        case noSample
-        case invalidPresentationTime
+    private struct MP4Box {
+        let type: String
+        let payload: Range<Int>
     }
 
-    private func firstSamplePresentationTimes(
-        in asset: AVAsset,
-        videoTrack: AVAssetTrack,
-        audioTrack: AVAssetTrack
-    ) throws -> (video: CMTime, audio: CMTime) {
-        let reader = try AVAssetReader(asset: asset)
-        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
-        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-        videoOutput.alwaysCopiesSampleData = false
-        audioOutput.alwaysCopiesSampleData = false
-        guard reader.canAdd(videoOutput), reader.canAdd(audioOutput) else {
-            throw SampleReadError.cannotAddOutput
+    private enum MP4InspectionError: Error {
+        case malformed(String)
+    }
+
+    private func initialEmptyEditDurations(at url: URL) throws -> [String: TimeInterval] {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let topLevel = try mp4Boxes(in: data, range: 0..<data.count)
+        guard let movie = topLevel.first(where: { $0.type == "moov" }) else {
+            throw MP4InspectionError.malformed("moov box not found")
         }
-        reader.add(videoOutput)
-        reader.add(audioOutput)
-        guard reader.startReading() else {
-            if let error = reader.error { throw error }
-            throw SampleReadError.cannotStartReading
+        let movieChildren = try mp4Boxes(in: data, range: movie.payload)
+        guard let header = movieChildren.first(where: { $0.type == "mvhd" }) else {
+            throw MP4InspectionError.malformed("mvhd box not found")
         }
-        defer { reader.cancelReading() }
-        guard let videoSample = videoOutput.copyNextSampleBuffer(),
-              let audioSample = audioOutput.copyNextSampleBuffer() else {
-            if let error = reader.error { throw error }
-            throw SampleReadError.noSample
+        let timescale = try movieTimescale(in: data, header: header)
+        var result: [String: TimeInterval] = [:]
+
+        for track in movieChildren where track.type == "trak" {
+            let trackChildren = try mp4Boxes(in: data, range: track.payload)
+            guard let media = trackChildren.first(where: { $0.type == "mdia" }) else { continue }
+            let mediaChildren = try mp4Boxes(in: data, range: media.payload)
+            guard let handlerBox = mediaChildren.first(where: { $0.type == "hdlr" }) else { continue }
+            let handler = try fourCC(in: data, at: handlerBox.payload.lowerBound + 8)
+            guard handler == "vide" || handler == "soun" else { continue }
+
+            var emptyDuration: UInt64 = 0
+            if let editContainer = trackChildren.first(where: { $0.type == "edts" }) {
+                let editChildren = try mp4Boxes(in: data, range: editContainer.payload)
+                if let editList = editChildren.first(where: { $0.type == "elst" }) {
+                    emptyDuration = try initialEmptyEditDuration(in: data, editList: editList)
+                }
+            }
+            result[handler] = Double(emptyDuration) / Double(timescale)
         }
-        let videoTime = CMSampleBufferGetOutputPresentationTimeStamp(videoSample)
-        let audioTime = CMSampleBufferGetOutputPresentationTimeStamp(audioSample)
-        guard videoTime.isValid, videoTime.isNumeric,
-              audioTime.isValid, audioTime.isNumeric else {
-            throw SampleReadError.invalidPresentationTime
+        return result
+    }
+
+    private func movieTimescale(in data: Data, header: MP4Box) throws -> UInt32 {
+        let version = try byte(in: data, at: header.payload.lowerBound)
+        let offset: Int
+        switch version {
+        case 0: offset = header.payload.lowerBound + 12
+        case 1: offset = header.payload.lowerBound + 20
+        default: throw MP4InspectionError.malformed("unsupported mvhd version")
         }
-        return (videoTime, audioTime)
+        let timescale = try uint32(in: data, at: offset)
+        guard timescale > 0 else {
+            throw MP4InspectionError.malformed("invalid movie timescale")
+        }
+        return timescale
+    }
+
+    private func initialEmptyEditDuration(in data: Data, editList: MP4Box) throws -> UInt64 {
+        let version = try byte(in: data, at: editList.payload.lowerBound)
+        let entryCount = try uint32(in: data, at: editList.payload.lowerBound + 4)
+        guard entryCount > 0 else { return 0 }
+        let entryOffset = editList.payload.lowerBound + 8
+        let duration: UInt64
+        let mediaTime: Int64
+        switch version {
+        case 0:
+            duration = UInt64(try uint32(in: data, at: entryOffset))
+            mediaTime = Int64(Int32(bitPattern: try uint32(in: data, at: entryOffset + 4)))
+        case 1:
+            duration = try uint64(in: data, at: entryOffset)
+            mediaTime = Int64(bitPattern: try uint64(in: data, at: entryOffset + 8))
+        default:
+            throw MP4InspectionError.malformed("unsupported elst version")
+        }
+        return mediaTime == -1 ? duration : 0
+    }
+
+    private func mp4Boxes(in data: Data, range: Range<Int>) throws -> [MP4Box] {
+        guard range.lowerBound >= 0, range.upperBound <= data.count else {
+            throw MP4InspectionError.malformed("box range is outside the file")
+        }
+        var boxes: [MP4Box] = []
+        var offset = range.lowerBound
+        while offset < range.upperBound {
+            let remaining = range.upperBound - offset
+            guard remaining >= 8 else {
+                throw MP4InspectionError.malformed("truncated box header")
+            }
+            let size32 = try uint32(in: data, at: offset)
+            let type = try fourCC(in: data, at: offset + 4)
+            let headerSize: Int
+            let boxSize: UInt64
+            if size32 == 1 {
+                headerSize = 16
+                boxSize = try uint64(in: data, at: offset + 8)
+            } else if size32 == 0 {
+                headerSize = 8
+                boxSize = UInt64(remaining)
+            } else {
+                headerSize = 8
+                boxSize = UInt64(size32)
+            }
+            guard boxSize >= UInt64(headerSize), boxSize <= UInt64(remaining) else {
+                throw MP4InspectionError.malformed("invalid \(type) box size")
+            }
+            let end = offset + Int(boxSize)
+            boxes.append(MP4Box(type: type, payload: (offset + headerSize)..<end))
+            offset = end
+        }
+        return boxes
+    }
+
+    private func byte(in data: Data, at offset: Int) throws -> UInt8 {
+        guard offset >= 0, offset < data.count else {
+            throw MP4InspectionError.malformed("truncated byte")
+        }
+        return data[offset]
+    }
+
+    private func uint32(in data: Data, at offset: Int) throws -> UInt32 {
+        guard offset >= 0, data.count - offset >= 4 else {
+            throw MP4InspectionError.malformed("truncated UInt32")
+        }
+        return data[offset..<(offset + 4)].reduce(UInt32(0)) {
+            ($0 << 8) | UInt32($1)
+        }
+    }
+
+    private func uint64(in data: Data, at offset: Int) throws -> UInt64 {
+        guard offset >= 0, data.count - offset >= 8 else {
+            throw MP4InspectionError.malformed("truncated UInt64")
+        }
+        return data[offset..<(offset + 8)].reduce(UInt64(0)) {
+            ($0 << 8) | UInt64($1)
+        }
+    }
+
+    private func fourCC(in data: Data, at offset: Int) throws -> String {
+        guard offset >= 0, data.count - offset >= 4 else {
+            throw MP4InspectionError.malformed("truncated FourCC")
+        }
+        return String(decoding: data[offset..<(offset + 4)], as: UTF8.self)
     }
 
     private func fixture(named name: String) throws -> URL {
