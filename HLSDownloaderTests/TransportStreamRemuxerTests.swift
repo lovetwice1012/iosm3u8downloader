@@ -74,12 +74,19 @@ final class TransportStreamRemuxerTests: XCTestCase {
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         let videoTrack = try XCTUnwrap(videoTracks.first)
         let audioTrack = try XCTUnwrap(audioTracks.first)
-        let videoStart = CMTimeGetSeconds(try await videoTrack.load(.timeRange).start)
-        let audioStart = CMTimeGetSeconds(try await audioTrack.load(.timeRange).start)
+        let videoStart = CMTimeGetSeconds(try await firstPresentedTime(in: videoTrack))
+        let audioStart = CMTimeGetSeconds(try await firstPresentedTime(in: audioTrack))
 
         XCTAssertLessThan(abs(videoStart), 0.2)
         XCTAssertGreaterThan(audioStart - videoStart, 0.7)
         XCTAssertLessThan(audioStart - videoStart, 1.2)
+    }
+
+    private func firstPresentedTime(in track: AVAssetTrack) async throws -> CMTime {
+        // AVAssetTrack.timeRange includes an initial empty edit and therefore starts at zero.
+        // The first non-empty segment is the point at which this track is actually presented.
+        let segments = try await track.load(.segments)
+        return try XCTUnwrap(segments.first(where: { !$0.isEmpty })).timeMapping.target.start
     }
 
     private func fixture(named name: String) throws -> URL {
