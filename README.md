@@ -10,8 +10,10 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - 最高帯域variantと既定audio renditionの自動選択
 - MPEG-TS、fMP4 + `EXT-X-MAP`、`EXT-X-BYTERANGE`
 - 最大4並列の断片ダウンロードと一時的な通信エラーの再試行
+- HTTP 200のログインHTML・JSON等を断片として誤保存しない内容検査
+- 署名queryなし候補がエラーページを返した場合の同一origin query付き候補への再試行
 - identity `AES-128`（AES-CBC、鍵ローテーション、明示IV/sequence IV）
-- AVFoundationによるMP4作成
+- AVFoundationによるMP4作成と、断片単体を開けない場合のplaylist単位連結再試行
 - 完成MP4の共有・「ファイル」への保存
 
 ## GitHub Actionsで未署名IPAを作る

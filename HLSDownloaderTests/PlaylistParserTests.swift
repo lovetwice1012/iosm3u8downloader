@@ -126,3 +126,248 @@ final class PlaylistParserTests: XCTestCase {
         )
     }
 }
+
+final class MediaPayloadInspectorTests: XCTestCase {
+    func testDetectsTransportStreamByPacketSync() {
+        var data = Data(repeating: 0, count: 188 * 3)
+        data[0] = 0x47
+        data[3] = 0x10
+        data[188] = 0x47
+        data[191] = 0x10
+        data[376] = 0x47
+        data[379] = 0x10
+        XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: "text/html"), .transportStream)
+    }
+
+    func testDetectsPATAndPMTInitializationPackets() {
+        var data = Data(repeating: 0, count: 188 * 2)
+        data[0] = 0x47
+        data[3] = 0x10
+        data[188] = 0x47
+        data[189] = 0x01
+        data[191] = 0x10
+        XCTAssertNil(MediaPayloadInspector.detect(data, mimeType: nil))
+        XCTAssertEqual(MediaPayloadInspector.detectInitialization(data), .transportStream)
+    }
+
+    func testDetectsISOBaseMediaByBoxType() {
+        let data = Data([0, 0, 0, 16]) + Data("ftypisom0000".utf8)
+        XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .isoBaseMedia)
+    }
+
+    func testRejectsTruncatedFileTypeBox() {
+        let data = Data([0, 0, 0, 8]) + Data("ftyp".utf8)
+        XCTAssertNil(MediaPayloadInspector.detect(data, mimeType: "video/mp4"))
+    }
+
+    func testRecognizesFragmentThatNeedsInitializationMap() {
+        let data = Data([0, 0, 0, 8]) + Data("moof".utf8)
+        XCTAssertTrue(MediaPayloadInspector.isFragmentWithoutInitialization(data))
+        XCTAssertFalse(MediaPayloadInspector.isInitializationData(data, container: .isoBaseMedia))
+    }
+
+    func testAcceptsISOInitializationContainingMovieBox() {
+        let data = Data([0, 0, 0, 8]) + Data("moov".utf8)
+        XCTAssertTrue(MediaPayloadInspector.isInitializationData(data, container: .isoBaseMedia))
+    }
+
+    func testDetectsPackedAACAfterID3Timestamp() {
+        let id3 = Data([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0])
+        let adts = Data([0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc])
+        XCTAssertEqual(MediaPayloadInspector.detect(id3 + adts, mimeType: nil), .aac)
+    }
+
+    func testRejectsTruncatedAACHeader() {
+        XCTAssertNil(MediaPayloadInspector.detect(Data([0xff, 0xf1, 0x50, 0x80]), mimeType: "audio/aac"))
+    }
+
+    func testRejectsHTTP200HTMLBody() {
+        let data = Data("<!doctype html><title>login</title>".utf8)
+        XCTAssertNil(MediaPayloadInspector.detect(data, mimeType: "text/html"))
+        XCTAssertEqual(MediaPayloadInspector.signature(data), "HTML")
+    }
+
+    func testDistinguishesEnhancedAC3() {
+        var data = Data([0x0b, 0x77, 0, 0, 0, 0x58])
+        XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .eac3)
+        data[5] = 0x50
+        XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .ac3)
+    }
+}
+
+private final class URLProtocolStub: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+final class SourceResolverFallbackTests: XCTestCase {
+    override func tearDown() {
+        URLProtocolStub.handler = nil
+        super.tearDown()
+    }
+
+    func testPlaylistLoadRetriesSignedQueryCandidateAfterHTTP200HTML() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let resolver = SourceResolver(client: client)
+        let base = URL(string: "https://cdn.example/path/master.m3u8?token=valid")!
+        let candidates = try URIResolver.resolve("variant.m3u8", relativeTo: base)
+
+        URLProtocolStub.handler = { request in
+            let isSigned = request.url?.query == "token=valid"
+            let body = isSigned
+                ? "#EXTM3U\n#EXTINF:4,\nsegment.ts\n#EXT-X-ENDLIST\n"
+                : "<!doctype html><title>login</title>"
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": isSigned ? "application/vnd.apple.mpegurl" : "text/html"]
+            )!
+            return (response, Data(body.utf8))
+        }
+
+        let document = try await resolver.load(candidates, referer: base)
+        XCTAssertTrue(PlaylistParser.isPlaylist(document.text))
+        XCTAssertEqual(document.effectiveURL.query, "token=valid")
+    }
+}
+
+final class SegmentDownloaderFallbackTests: XCTestCase {
+    override func tearDown() {
+        URLProtocolStub.handler = nil
+        super.tearDown()
+    }
+
+    func testSegmentRetriesSignedQueryCandidateAfterHTTP200HTML() async throws {
+        let (downloader, playlist, directory) = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        URLProtocolStub.handler = { request in
+            let isSigned = request.url?.query == "token=valid"
+            return Self.response(
+                for: request,
+                mimeType: isSigned ? "video/mp2t" : "text/html",
+                data: isSigned ? Self.transportStream() : Data("<html>login</html>".utf8)
+            )
+        }
+
+        let result = try await downloader.download(
+            playlist: playlist,
+            prefix: "main",
+            directory: directory,
+            completedBefore: 0,
+            totalSegments: 1,
+            progress: { _ in }
+        )
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].container, .transportStream)
+        XCTAssertEqual(result[0].fileURL.pathExtension, "ts")
+    }
+
+    func testSegmentReportsInvalidPayloadWhenEveryCandidateIsHTML() async throws {
+        let (downloader, playlist, directory) = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        URLProtocolStub.handler = { request in
+            Self.response(
+                for: request,
+                mimeType: "text/html",
+                data: Data("<!doctype html><title>expired</title>".utf8)
+            )
+        }
+
+        do {
+            _ = try await downloader.download(
+                playlist: playlist,
+                prefix: "main",
+                directory: directory,
+                completedBefore: 0,
+                totalSegments: 1,
+                progress: { _ in }
+            )
+            XCTFail("HTMLがメディア断片として受理されました")
+        } catch let error as HLSError {
+            guard case .invalidMediaPayload(let stream, let number, let mimeType, _, let signature) = error else {
+                return XCTFail("想定外のエラー: \(error)")
+            }
+            XCTAssertEqual(stream, "映像")
+            XCTAssertEqual(number, 1)
+            XCTAssertEqual(mimeType, "text/html")
+            XCTAssertEqual(signature, "HTML")
+        }
+    }
+
+    private func makeFixture() throws -> (SegmentDownloader, MediaPlaylist, URL) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let downloader = SegmentDownloader(
+            client: HTTPClient(configuration: configuration),
+            maximumConcurrentDownloads: 1
+        )
+        let base = URL(string: "https://cdn.example/path/index.m3u8?token=valid")!
+        let segment = MediaSegment(
+            ordinal: 0,
+            mediaSequence: 0,
+            duration: 4,
+            url: try URIResolver.resolve("segment.ts", relativeTo: base),
+            byteRange: nil,
+            encryption: nil,
+            initializationMap: nil,
+            hasDiscontinuity: false
+        )
+        let playlist = MediaPlaylist(
+            effectiveURL: base,
+            requestReferer: base,
+            segments: [segment],
+            hasEndList: true
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SegmentDownloaderTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return (downloader, playlist, directory)
+    }
+
+    private static func response(
+        for request: URLRequest,
+        mimeType: String,
+        data: Data
+    ) -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": mimeType]
+        )!
+        return (response, data)
+    }
+
+    private static func transportStream() -> Data {
+        var data = Data(repeating: 0, count: 188 * 3)
+        for offset in stride(from: 0, to: data.count, by: 188) {
+            data[offset] = 0x47
+            data[offset + 3] = 0x10
+        }
+        return data
+    }
+}

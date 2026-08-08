@@ -122,6 +122,29 @@ struct DownloadPlan: Sendable {
 struct DownloadedSegment: Sendable {
     let source: MediaSegment
     let fileURL: URL
+    let container: MediaContainer
+    let byteCount: Int
+    let initializationDataLength: Int
+}
+
+enum MediaContainer: String, Sendable {
+    case transportStream = "MPEG-TS"
+    case isoBaseMedia = "fMP4"
+    case aac = "AAC"
+    case mp3 = "MP3"
+    case ac3 = "AC-3"
+    case eac3 = "E-AC-3"
+
+    var fileExtension: String {
+        switch self {
+        case .transportStream: return "ts"
+        case .isoBaseMedia: return "mp4"
+        case .aac: return "aac"
+        case .mp3: return "mp3"
+        case .ac3: return "ac3"
+        case .eac3: return "ec3"
+        }
+    }
 }
 
 enum HLSError: LocalizedError, Sendable {
@@ -137,6 +160,8 @@ enum HLSError: LocalizedError, Sendable {
     case invalidAESKey
     case decryptionFailed
     case byteRangeInvalid
+    case invalidMediaPayload(stream: String, number: Int, mimeType: String?, byteCount: Int, signature: String)
+    case mediaOpenFailed(stream: String, number: Int, container: String, byteCount: Int, detail: String)
     case noPlayableTracks
     case mp4ExportUnsupported
     case exportFailed(String)
@@ -168,6 +193,11 @@ enum HLSError: LocalizedError, Sendable {
             return "AES-128断片の復号に失敗しました。"
         case .byteRangeInvalid:
             return "HLSのバイト範囲が不正です。"
+        case .invalidMediaPayload(let stream, let number, let mimeType, let byteCount, let signature):
+            let type = mimeType.flatMap { $0.isEmpty ? nil : $0 } ?? "不明"
+            return "\(stream)断片\(number)がメディアデータではありません（Content-Type: \(type)、\(byteCount) bytes、先頭: \(signature)）。署名URLの期限やログイン状態を確認してください。"
+        case .mediaOpenFailed(let stream, let number, let container, let byteCount, let detail):
+            return "\(stream)断片\(number)を開けません（\(container)、\(byteCount) bytes）。\(detail)"
         case .noPlayableTracks:
             return "結合できる映像または音声トラックがありません。"
         case .mp4ExportUnsupported:

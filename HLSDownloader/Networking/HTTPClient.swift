@@ -10,8 +10,7 @@ struct HTTPPayload: Sendable {
 final class HTTPClient: @unchecked Sendable {
     private let session: URLSession
 
-    init() {
-        let configuration = URLSessionConfiguration.default
+    init(configuration: URLSessionConfiguration = .default) {
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 120
         configuration.waitsForConnectivity = true

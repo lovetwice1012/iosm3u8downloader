@@ -27,14 +27,7 @@ final class SourceResolver: Sendable {
         let candidates = extractM3U8Candidates(from: text, baseURL: payload.effectiveURL)
         for candidate in candidates.prefix(24) {
             do {
-                let candidatePayload = try await client.fetch(candidate, referer: payload.effectiveURL)
-                guard let candidateText = decodeText(candidatePayload.data),
-                      PlaylistParser.isPlaylist(candidateText) else { continue }
-                return PlaylistDocument(
-                    text: candidateText,
-                    effectiveURL: candidatePayload.effectiveURL,
-                    referer: payload.effectiveURL
-                )
+                return try await load(candidate, referer: payload.effectiveURL)
             } catch let error as HLSError {
                 if case .cancelled = error { throw error }
                 continue
@@ -48,11 +41,24 @@ final class SourceResolver: Sendable {
     }
 
     func load(_ candidates: URLCandidates, referer: URL?) async throws -> PlaylistDocument {
-        let payload = try await client.fetch(candidates, referer: referer)
-        guard let text = decodeText(payload.data), PlaylistParser.isPlaylist(text) else {
-            throw HLSError.invalidPlaylist("リンク先がm3u8ではありません")
+        var lastError: Error = HLSError.invalidPlaylist("リンク先がm3u8ではありません")
+        for candidate in candidates.all {
+            do {
+                let payload = try await client.fetch(candidate, referer: referer)
+                guard let text = decodeText(payload.data), PlaylistParser.isPlaylist(text) else {
+                    throw HLSError.invalidPlaylist("リンク先がm3u8ではありません")
+                }
+                return PlaylistDocument(text: text, effectiveURL: payload.effectiveURL, referer: referer)
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                if case .cancelled = error { throw error }
+                lastError = error
+            } catch {
+                lastError = error
+            }
         }
-        return PlaylistDocument(text: text, effectiveURL: payload.effectiveURL, referer: referer)
+        throw lastError
     }
 
     private func decodeText(_ data: Data) -> String? {

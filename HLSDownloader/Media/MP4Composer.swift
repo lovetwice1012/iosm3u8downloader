@@ -15,6 +15,43 @@ final class MP4Composer: @unchecked Sendable {
         externalAudio: [DownloadedSegment]?,
         outputURL: URL
     ) async throws {
+        do {
+            try await composeIndividually(main: main, externalAudio: externalAudio, outputURL: outputURL)
+        } catch {
+            guard shouldRetryWithConsolidatedMedia(error) else {
+                throw error
+            }
+            let joinedMain = try consolidate(main, label: "main")
+
+            let joinedAudio: ConsolidatedInput?
+            if let externalAudio {
+                joinedAudio = try consolidate(externalAudio, label: "audio")
+            } else {
+                joinedAudio = nil
+            }
+            guard joinedMain != nil || joinedAudio != nil else { throw error }
+
+            defer {
+                if let joinedMain {
+                    try? FileManager.default.removeItem(at: joinedMain.temporaryURL)
+                }
+                if let joinedAudio {
+                    try? FileManager.default.removeItem(at: joinedAudio.temporaryURL)
+                }
+            }
+            try await composeIndividually(
+                main: joinedMain.map { [$0.segment] } ?? main,
+                externalAudio: joinedAudio.map { [$0.segment] } ?? externalAudio,
+                outputURL: outputURL
+            )
+        }
+    }
+
+    private func composeIndividually(
+        main: [DownloadedSegment],
+        externalAudio: [DownloadedSegment]?,
+        outputURL: URL
+    ) async throws {
         guard !main.contains(where: { $0.source.hasDiscontinuity }),
               !(externalAudio?.contains(where: { $0.source.hasDiscontinuity }) ?? false) else {
             throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
@@ -83,6 +120,102 @@ final class MP4Composer: @unchecked Sendable {
         try await export(composition, to: outputURL)
     }
 
+    private struct ConsolidatedInput {
+        let segment: DownloadedSegment
+        let temporaryURL: URL
+    }
+
+    private func shouldRetryWithConsolidatedMedia(_ error: Error) -> Bool {
+        guard let hlsError = error as? HLSError else { return true }
+        switch hlsError {
+        case .mediaOpenFailed, .exportFailed, .noPlayableTracks:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func consolidate(_ segments: [DownloadedSegment], label: String) throws -> ConsolidatedInput? {
+        let ordered = segments.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        guard ordered.count > 1, let first = ordered.first,
+              ordered.allSatisfy({ $0.container == first.container }) else {
+            return nil
+        }
+
+        if first.container == .isoBaseMedia {
+            guard first.source.initializationMap != nil,
+                  first.initializationDataLength > 0,
+                  ordered.allSatisfy({
+                      $0.source.initializationMap == first.source.initializationMap
+                          && $0.initializationDataLength == first.initializationDataLength
+                  }) else {
+                return nil
+            }
+        }
+
+        let directory = first.fileURL.deletingLastPathComponent()
+        let temporaryURL = directory.appendingPathComponent(
+            "\(label)-joined-\(UUID().uuidString).\(first.container.fileExtension)",
+            isDirectory: false
+        )
+        guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
+            throw HLSError.network("連結用ファイルを作成できません")
+        }
+
+        do {
+            let handle = try FileHandle(forWritingTo: temporaryURL)
+            defer { try? handle.close() }
+
+            var totalBytes = 0
+            for (index, segment) in ordered.enumerated() {
+                try Task.checkCancellation()
+                let data = try Data(contentsOf: segment.fileURL, options: .mappedIfSafe)
+                let skipCount: Int
+                if first.container == .isoBaseMedia, index > 0 {
+                    skipCount = segment.initializationDataLength
+                } else if index > 0,
+                          [.aac, .mp3, .ac3, .eac3].contains(first.container) {
+                    skipCount = MediaPayloadInspector.leadingID3Length(
+                        [UInt8](data.prefix(262_144))
+                    ) ?? 0
+                } else {
+                    skipCount = 0
+                }
+                guard skipCount <= data.count else {
+                    throw HLSError.invalidPlaylist("断片の初期化データ長が不正です")
+                }
+                let chunk = skipCount == 0 ? data : Data(data.dropFirst(skipCount))
+                try handle.write(contentsOf: chunk)
+                totalBytes += chunk.count
+            }
+
+            let duration = ordered.reduce(0.0) { $0 + $1.source.duration }
+            let source = MediaSegment(
+                ordinal: 0,
+                mediaSequence: first.source.mediaSequence,
+                duration: duration,
+                url: first.source.url,
+                byteRange: nil,
+                encryption: nil,
+                initializationMap: nil,
+                hasDiscontinuity: false
+            )
+            return ConsolidatedInput(
+                segment: DownloadedSegment(
+                    source: source,
+                    fileURL: temporaryURL,
+                    container: first.container,
+                    byteCount: totalBytes,
+                    initializationDataLength: 0
+                ),
+                temporaryURL: temporaryURL
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            throw error
+        }
+    }
+
     private func append(
         _ segments: [DownloadedSegment],
         videoDestination: AVMutableCompositionTrack,
@@ -102,88 +235,101 @@ final class MP4Composer: @unchecked Sendable {
 
         for segment in segments.sorted(by: { $0.source.ordinal < $1.source.ordinal }) {
             try Task.checkCancellation()
-            let asset = preciseAsset(for: segment.fileURL)
-            let assetDuration = try await asset.load(.duration)
-            let declaredDuration = CMTime(seconds: segment.source.duration, preferredTimescale: 1_000_000)
-            let advance = isPositiveNumeric(declaredDuration) ? declaredDuration : assetDuration
-            guard isPositiveNumeric(advance) else {
-                throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の長さを取得できません")
-            }
+            do {
+                let asset = localAsset(for: segment.fileURL)
+                let declaredDuration = CMTime(
+                    seconds: segment.source.duration,
+                    preferredTimescale: 1_000_000
+                )
+                let advance: CMTime
+                if isPositiveNumeric(declaredDuration) {
+                    advance = declaredDuration
+                } else {
+                    advance = try await asset.load(.duration)
+                }
+                guard isPositiveNumeric(advance) else {
+                    throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の長さを取得できません")
+                }
 
-            let sourceVideo: AVAssetTrack?
-            if includeVideo {
-                sourceVideo = try await asset.loadTracks(withMediaType: .video).first
-            } else {
-                sourceVideo = nil
-            }
-            let sourceAudio: AVAssetTrack?
-            if includeAudio {
-                sourceAudio = try await asset.loadTracks(withMediaType: .audio).first
-            } else {
-                sourceAudio = nil
-            }
-            let videoRange: CMTimeRange?
-            if let sourceVideo {
-                videoRange = try await sourceVideo.load(.timeRange)
-            } else {
-                videoRange = nil
-            }
-            let audioRange: CMTimeRange?
-            if let sourceAudio {
-                audioRange = try await sourceAudio.load(.timeRange)
-            } else {
-                audioRange = nil
-            }
-            if requiresVideo && sourceVideo == nil {
-                throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)に映像トラックがありません")
-            }
-            if requiresAudio && sourceAudio == nil {
-                throw HLSError.invalidPlaylist("音声断片\(segment.source.ordinal + 1)に音声トラックがありません")
-            }
-            if includeVideo {
-                let isPresent = sourceVideo != nil
-                if let expectedVideoPresence, expectedVideoPresence != isPresent {
-                    throw HLSError.invalidPlaylist("途中で映像トラック構成が変わっています")
+                let sourceVideo: AVAssetTrack?
+                if includeVideo {
+                    sourceVideo = try await asset.loadTracks(withMediaType: .video).first
+                } else {
+                    sourceVideo = nil
                 }
-                expectedVideoPresence = isPresent
-            }
-            if includeAudio {
-                let isPresent = sourceAudio != nil
-                if let expectedAudioPresence, expectedAudioPresence != isPresent {
-                    throw HLSError.invalidPlaylist("途中で音声トラック構成が変わっています")
+                let sourceAudio: AVAssetTrack?
+                if includeAudio {
+                    sourceAudio = try await asset.loadTracks(withMediaType: .audio).first
+                } else {
+                    sourceAudio = nil
                 }
-                expectedAudioPresence = isPresent
-            }
-            let commonStart = earliestStart(videoRange, audioRange)
+                let videoRange: CMTimeRange?
+                if let sourceVideo {
+                    videoRange = try await sourceVideo.load(.timeRange)
+                } else {
+                    videoRange = nil
+                }
+                let audioRange: CMTimeRange?
+                if let sourceAudio {
+                    audioRange = try await sourceAudio.load(.timeRange)
+                } else {
+                    audioRange = nil
+                }
+                if requiresVideo && sourceVideo == nil {
+                    throw mediaProblem(for: segment, detail: "映像トラックがありません")
+                }
+                if requiresAudio && sourceAudio == nil {
+                    throw mediaProblem(for: segment, detail: "音声トラックがありません")
+                }
+                if includeVideo {
+                    let isPresent = sourceVideo != nil
+                    if let expectedVideoPresence, expectedVideoPresence != isPresent {
+                        throw mediaProblem(for: segment, detail: "途中で映像トラック構成が変わっています")
+                    }
+                    expectedVideoPresence = isPresent
+                }
+                if includeAudio {
+                    let isPresent = sourceAudio != nil
+                    if let expectedAudioPresence, expectedAudioPresence != isPresent {
+                        throw mediaProblem(for: segment, detail: "途中で音声トラック構成が変わっています")
+                    }
+                    expectedAudioPresence = isPresent
+                }
+                let commonStart = earliestStart(videoRange, audioRange)
 
-            if let sourceVideo, let videoRange {
-                let offset = nonnegativeDifference(videoRange.start, commonStart)
-                let availableDuration = CMTimeSubtract(advance, offset)
-                guard isPositiveNumeric(availableDuration), isPositiveNumeric(videoRange.duration) else {
-                    throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の映像時間が不正です")
+                if let sourceVideo, let videoRange {
+                    let offset = nonnegativeDifference(videoRange.start, commonStart)
+                    let availableDuration = CMTimeSubtract(advance, offset)
+                    guard isPositiveNumeric(availableDuration), isPositiveNumeric(videoRange.duration) else {
+                        throw mediaProblem(for: segment, detail: "映像トラックの時間情報が不正です")
+                    }
+                    let range = clipped(videoRange, maximumDuration: availableDuration)
+                    try videoDestination.insertTimeRange(range, of: sourceVideo, at: CMTimeAdd(timeline, offset))
+                    if !appliedVideoTransform {
+                        videoDestination.preferredTransform = try await sourceVideo.load(.preferredTransform)
+                        appliedVideoTransform = true
+                    }
+                    hasVideo = true
                 }
-                let range = clipped(videoRange, maximumDuration: availableDuration)
-                try videoDestination.insertTimeRange(range, of: sourceVideo, at: CMTimeAdd(timeline, offset))
-                if !appliedVideoTransform {
-                    videoDestination.preferredTransform = try await sourceVideo.load(.preferredTransform)
-                    appliedVideoTransform = true
-                }
-                hasVideo = true
-            }
 
-            if let sourceAudio, let audioRange {
-                let offset = nonnegativeDifference(audioRange.start, commonStart)
-                let availableDuration = CMTimeSubtract(advance, offset)
-                guard isPositiveNumeric(availableDuration), isPositiveNumeric(audioRange.duration) else {
-                    throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の音声時間が不正です")
+                if let sourceAudio, let audioRange {
+                    let offset = nonnegativeDifference(audioRange.start, commonStart)
+                    let availableDuration = CMTimeSubtract(advance, offset)
+                    guard isPositiveNumeric(availableDuration), isPositiveNumeric(audioRange.duration) else {
+                        throw mediaProblem(for: segment, detail: "音声トラックの時間情報が不正です")
+                    }
+                    let range = clipped(audioRange, maximumDuration: availableDuration)
+                    try audioDestination.insertTimeRange(range, of: sourceAudio, at: CMTimeAdd(timeline, offset))
+                    hasAudio = true
                 }
-                let range = clipped(audioRange, maximumDuration: availableDuration)
-                try audioDestination.insertTimeRange(range, of: sourceAudio, at: CMTimeAdd(timeline, offset))
-                hasAudio = true
-            }
 
-            if isPositiveNumeric(advance) {
                 timeline = CMTimeAdd(timeline, advance)
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                throw error
+            } catch {
+                throw mediaOpenError(for: segment, error: error)
             }
         }
         return (hasVideo, hasAudio, timeline)
@@ -195,21 +341,52 @@ final class MP4Composer: @unchecked Sendable {
     ) async throws -> CMTime? {
         for mediaType in preferredMediaTypes {
             for segment in segments.prefix(3) {
-                let asset = preciseAsset(for: segment.fileURL)
-                if let track = try await asset.loadTracks(withMediaType: mediaType).first {
-                    let range = try await track.load(.timeRange)
-                    return range.start
+                do {
+                    let asset = localAsset(for: segment.fileURL)
+                    if let track = try await asset.loadTracks(withMediaType: mediaType).first {
+                        let range = try await track.load(.timeRange)
+                        return range.start
+                    }
+                } catch is CancellationError {
+                    throw HLSError.cancelled
+                } catch let error as HLSError {
+                    throw error
+                } catch {
+                    throw mediaOpenError(for: segment, error: error)
                 }
             }
         }
         return nil
     }
 
-    private func preciseAsset(for url: URL) -> AVURLAsset {
-        AVURLAsset(
-            url: url,
-            options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+    private func localAsset(for url: URL) -> AVURLAsset {
+        AVURLAsset(url: url)
+    }
+
+    private func mediaOpenError(for segment: DownloadedSegment, error: Error) -> HLSError {
+        mediaProblem(for: segment, detail: diagnosticDescription(error))
+    }
+
+    private func mediaProblem(for segment: DownloadedSegment, detail: String) -> HLSError {
+        HLSError.mediaOpenFailed(
+            stream: segment.fileURL.lastPathComponent.hasPrefix("audio-") ? "音声" : "映像",
+            number: segment.source.ordinal + 1,
+            container: segment.container.rawValue,
+            byteCount: segment.byteCount,
+            detail: detail
         )
+    }
+
+    private func diagnosticDescription(_ error: Error) -> String {
+        let nsError = error as NSError
+        var parts = ["\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)"]
+        if let reason = nsError.localizedFailureReason, reason != nsError.localizedDescription {
+            parts.append(reason)
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("underlying \(underlying.domain) \(underlying.code)")
+        }
+        return parts.joined(separator: " / ")
     }
 
     private func clipped(_ range: CMTimeRange, maximumDuration: CMTime) -> CMTimeRange {
