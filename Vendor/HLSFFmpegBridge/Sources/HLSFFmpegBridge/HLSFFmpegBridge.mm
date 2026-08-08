@@ -1,16 +1,17 @@
 #include "HLSFFmpegBridge.h"
 
 #include <ffmpegkit/ffmpegkit_wrapper.h>
+#include <atomic>
+#include <new>
 #include <pthread.h>
 #include <stdlib.h>
-#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
 typedef struct {
     FFmpegSessionHandle handle;
-    atomic_int cancel_requested;
-    atomic_int execution_finished;
+    std::atomic<int> cancel_requested{0};
+    std::atomic<int> execution_finished{0};
 } HLSFFmpegRemuxSession;
 
 static void hls_ffmpeg_initialize(void) {
@@ -109,14 +110,12 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         return NULL;
     }
 
-    HLSFFmpegRemuxSession *session = calloc(1, sizeof(HLSFFmpegRemuxSession));
+    HLSFFmpegRemuxSession *session = new (std::nothrow) HLSFFmpegRemuxSession();
     if (session == NULL) {
         ffmpeg_kit_handle_release(handle);
         return NULL;
     }
     session->handle = handle;
-    atomic_init(&session->cancel_requested, 0);
-    atomic_init(&session->execution_finished, 0);
     return session;
 }
 
@@ -137,13 +136,13 @@ int64_t hls_ffmpeg_remux_session_execute(
         );
         return -1;
     }
-    if (atomic_load(&session->cancel_requested)) {
+    if (session->cancel_requested.load(std::memory_order_acquire)) {
         hls_copy_diagnostic_tail(
             "FFmpeg session was cancelled before execution.",
             diagnostic_buffer,
             diagnostic_buffer_size
         );
-        atomic_store(&session->execution_finished, 1);
+        session->execution_finished.store(1, std::memory_order_release);
         return 255;
     }
 
@@ -156,16 +155,16 @@ int64_t hls_ffmpeg_remux_session_execute(
             ffmpeg_kit_free(logs);
         }
     }
-    atomic_store(&session->execution_finished, 1);
+    session->execution_finished.store(1, std::memory_order_release);
     return return_code;
 }
 
 void hls_ffmpeg_remux_session_cancel(HLSFFmpegRemuxSessionHandle session_handle) {
     HLSFFmpegRemuxSession *session = session_handle;
     if (session != NULL && session->handle != NULL) {
-        atomic_store(&session->cancel_requested, 1);
+        session->cancel_requested.store(1, std::memory_order_release);
         for (int attempt = 0; attempt < 250; attempt++) {
-            if (atomic_load(&session->execution_finished)) {
+            if (session->execution_finished.load(std::memory_order_acquire)) {
                 return;
             }
             FFmpegKitSessionState state = ffmpeg_kit_session_get_state(session->handle);
@@ -192,5 +191,5 @@ void hls_ffmpeg_remux_session_destroy(HLSFFmpegRemuxSessionHandle session_handle
         ffmpeg_kit_handle_release(session->handle);
         session->handle = NULL;
     }
-    free(session);
+    delete session;
 }
