@@ -37,5 +37,13 @@ final class URIResolverTests: XCTestCase {
         XCTAssertEqual(resolved.primary.query, "child=1")
         XCTAssertNil(resolved.sameOriginQueryFallback)
     }
-}
 
+    func testDecodesJavaScriptAndHTMLEscapes() throws {
+        let raw = #"https:\/\/a.example\/v.m3u8?token\u003Dabc\u0026part\u003D1&amp;next=2"#
+        let resolved = try URIResolver.resolve(raw, relativeTo: base)
+        XCTAssertEqual(
+            resolved.primary.absoluteString,
+            "https://a.example/v.m3u8?token=abc&part=1&next=2"
+        )
+    }
+}

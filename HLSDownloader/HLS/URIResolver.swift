@@ -54,8 +54,16 @@ enum URIResolver {
         value
             .replacingOccurrences(of: "\\/", with: "/")
             .replacingOccurrences(of: "\\u002F", with: "/", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\u0026", with: "&", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\u003A", with: ":", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\u003F", with: "?", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\u003D", with: "=", options: .caseInsensitive)
             .replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
             .replacingOccurrences(of: "&#38;", with: "&", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#x26;", with: "&", options: .caseInsensitive)
+            .replacingOccurrences(of: "&quot;", with: "\"", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#34;", with: "\"", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#x22;", with: "\"", options: .caseInsensitive)
     }
 
     private static func isSameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {

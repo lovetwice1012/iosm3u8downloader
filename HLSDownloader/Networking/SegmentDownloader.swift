@@ -138,11 +138,12 @@ final class SegmentDownloader: Sendable {
         referer: URL
     ) async throws -> DownloadedSegment {
         try Task.checkCancellation()
-        var data = try await client.fetch(
+        let response = try await client.fetch(
             segment.url,
             referer: referer,
             byteRange: segment.byteRange
-        ).data
+        )
+        var data = response.data
 
         if let encryption = segment.encryption {
             guard let key = keyData[encryption.keyURL.primary] else { throw HLSError.invalidAESKey }
@@ -150,7 +151,7 @@ final class SegmentDownloader: Sendable {
             data = try AES128CBCDecryptor.decrypt(data, key: key, iv: iv)
         }
 
-        let fileExtension = preferredExtension(for: segment)
+        let fileExtension = preferredExtension(for: segment, mimeType: response.mimeType, data: data)
         let name = String(format: "%@-%06d.%@", prefix, segment.ordinal, fileExtension)
         let destination = directory.appendingPathComponent(name, isDirectory: false)
 
@@ -165,10 +166,60 @@ final class SegmentDownloader: Sendable {
         return DownloadedSegment(source: segment, fileURL: destination)
     }
 
-    private func preferredExtension(for segment: MediaSegment) -> String {
+    private func preferredExtension(for segment: MediaSegment, mimeType: String?, data: Data) -> String {
         if segment.initializationMap != nil { return "mp4" }
         let pathExtension = segment.url.primary.pathExtension.lowercased()
         let supported = ["ts", "mp4", "m4s", "aac", "ac3", "ec3", "mp3", "mov"]
-        return supported.contains(pathExtension) ? pathExtension : "ts"
+        if supported.contains(pathExtension) { return pathExtension }
+
+        switch mimeType?.lowercased() ?? "" {
+        case "video/mp2t": return "ts"
+        case "video/mp4", "audio/mp4", "video/iso.segment": return "mp4"
+        case "audio/aac": return "aac"
+        case "audio/mpeg": return "mp3"
+        case "audio/ac3": return "ac3"
+        case "audio/eac3": return "ec3"
+        default: break
+        }
+
+        let bytes = [UInt8](data.prefix(4_096))
+        if bytes.count >= 189, bytes[0] == 0x47, bytes[188] == 0x47 { return "ts" }
+        if bytes.count >= 8 {
+            let box = String(bytes: bytes[4..<8], encoding: .ascii)
+            if box == "ftyp" || box == "styp" || box == "moof" { return "mp4" }
+        }
+        if let audioExtension = detectedAudioExtension(in: bytes, at: 0) {
+            return audioExtension
+        }
+        if let id3AudioExtension = detectedAudioExtensionAfterID3(in: bytes) {
+            return id3AudioExtension
+        }
+        return "bin"
+    }
+
+    private func detectedAudioExtension(in bytes: [UInt8], at offset: Int) -> String? {
+        guard offset >= 0, offset + 1 < bytes.count else { return nil }
+        if bytes[offset] == 0xff, bytes[offset + 1] & 0xf6 == 0xf0 { return "aac" }
+        if bytes[offset] == 0x0b, bytes[offset + 1] == 0x77 { return "ac3" }
+        if bytes[offset] == 0xff, bytes[offset + 1] & 0xe0 == 0xe0 { return "mp3" }
+        return nil
+    }
+
+    private func detectedAudioExtensionAfterID3(in bytes: [UInt8]) -> String? {
+        guard bytes.count >= 10,
+              bytes[0] == 0x49,
+              bytes[1] == 0x44,
+              bytes[2] == 0x33,
+              bytes[6...9].allSatisfy({ $0 & 0x80 == 0 }) else {
+            return nil
+        }
+
+        let tagSize = (Int(bytes[6]) << 21)
+            | (Int(bytes[7]) << 14)
+            | (Int(bytes[8]) << 7)
+            | Int(bytes[9])
+        let hasFooter = bytes[3] == 4 && bytes[5] & 0x10 != 0
+        let frameOffset = 10 + tagSize + (hasFooter ? 10 : 0)
+        return detectedAudioExtension(in: bytes, at: frameOffset)
     }
 }

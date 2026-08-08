@@ -4,6 +4,7 @@ struct HTTPPayload: Sendable {
     let data: Data
     let effectiveURL: URL
     let statusCode: Int
+    let mimeType: String?
 }
 
 final class HTTPClient: @unchecked Sendable {
@@ -60,7 +61,8 @@ final class HTTPClient: @unchecked Sendable {
                     request.setValue(referer, forHTTPHeaderField: "Referer")
                 }
                 if let byteRange {
-                    request.setValue("bytes=\(byteRange.offset)-\(byteRange.upperBound)", forHTTPHeaderField: "Range")
+                    let upperBound = try checkedUpperBound(byteRange)
+                    request.setValue("bytes=\(byteRange.offset)-\(upperBound)", forHTTPHeaderField: "Range")
                 }
 
                 let (rawData, response) = try await session.data(for: request)
@@ -80,20 +82,34 @@ final class HTTPClient: @unchecked Sendable {
                 }
 
                 let data: Data
-                if let byteRange, http.statusCode == 200 {
-                    guard byteRange.offset <= Int64(Int.max),
-                          byteRange.length <= Int64(Int.max),
-                          byteRange.offset + byteRange.length <= Int64(rawData.count) else {
+                if let byteRange {
+                    if http.statusCode == 200 {
+                        let (endOffset, overflow) = byteRange.offset.addingReportingOverflow(byteRange.length)
+                        guard !overflow,
+                              byteRange.offset <= Int64(Int.max),
+                              byteRange.length <= Int64(Int.max),
+                              endOffset <= Int64(rawData.count) else {
+                            throw HLSError.byteRangeInvalid
+                        }
+                        let start = Int(byteRange.offset)
+                        let end = start + Int(byteRange.length)
+                        data = rawData.subdata(in: start..<end)
+                    } else if http.statusCode == 206 {
+                        try validatePartialResponse(http, dataCount: rawData.count, expected: byteRange)
+                        data = rawData
+                    } else {
                         throw HLSError.byteRangeInvalid
                     }
-                    let start = Int(byteRange.offset)
-                    let end = start + Int(byteRange.length)
-                    data = rawData.subdata(in: start..<end)
                 } else {
                     data = rawData
                 }
 
-                return HTTPPayload(data: data, effectiveURL: effectiveURL, statusCode: http.statusCode)
+                return HTTPPayload(
+                    data: data,
+                    effectiveURL: effectiveURL,
+                    statusCode: http.statusCode,
+                    mimeType: http.mimeType
+                )
             } catch is CancellationError {
                 throw HLSError.cancelled
             } catch {
@@ -134,11 +150,50 @@ final class HTTPClient: @unchecked Sendable {
         try await Task.sleep(nanoseconds: nanoseconds)
     }
 
+    private func checkedUpperBound(_ range: ByteRange) throws -> Int64 {
+        guard range.offset >= 0, range.length > 0 else { throw HLSError.byteRangeInvalid }
+        let (endOffset, overflow) = range.offset.addingReportingOverflow(range.length)
+        guard !overflow, endOffset > range.offset else { throw HLSError.byteRangeInvalid }
+        return endOffset - 1
+    }
+
+    private func validatePartialResponse(
+        _ response: HTTPURLResponse,
+        dataCount: Int,
+        expected: ByteRange
+    ) throws {
+        guard let expectedLength = Int(exactly: expected.length),
+              dataCount == expectedLength,
+              let contentRange = response.value(forHTTPHeaderField: "Content-Range")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              contentRange.lowercased().hasPrefix("bytes ") else {
+            throw HLSError.byteRangeInvalid
+        }
+
+        let value = contentRange.dropFirst(6)
+        let rangeAndTotal = value.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard rangeAndTotal.count == 2 else { throw HLSError.byteRangeInvalid }
+        let bounds = rangeAndTotal[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let expectedUpperBound = try checkedUpperBound(expected)
+        guard bounds.count == 2,
+              let start = Int64(bounds[0]),
+              let end = Int64(bounds[1]),
+              start == expected.offset,
+              end == expectedUpperBound else {
+            throw HLSError.byteRangeInvalid
+        }
+        if rangeAndTotal[1] != "*" {
+            guard let total = Int64(rangeAndTotal[1]), total > end else {
+                throw HLSError.byteRangeInvalid
+            }
+        }
+    }
+
     private func safeReferer(_ referer: URL?, target: URL) -> String? {
         guard let referer,
               let refererScheme = referer.scheme?.lowercased(),
-              target.scheme?.lowercased() != nil,
-              !(refererScheme == "https" && target.scheme?.lowercased() == "http"),
+              let targetScheme = target.scheme?.lowercased(),
+              !(refererScheme == "https" && targetScheme == "http"),
               var components = URLComponents(url: referer, resolvingAgainstBaseURL: false) else {
             return nil
         }

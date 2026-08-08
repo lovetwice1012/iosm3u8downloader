@@ -20,6 +20,7 @@ final class DownloadPlanBuilder: Sendable {
             ) {
             case .media(let media):
                 guard media.hasEndList else { throw HLSError.livePlaylistUnsupported }
+                try validateForDownload(media)
                 let audio = try await loadAudio(selectedAudio, referer: requestReferer)
                 return DownloadPlan(sourceURL: initialDocument.effectiveURL, main: media, audio: audio)
 
@@ -47,6 +48,7 @@ final class DownloadPlanBuilder: Sendable {
             ) {
             case .media(let media):
                 guard media.hasEndList else { throw HLSError.livePlaylistUnsupported }
+                try validateForDownload(media)
                 return media
             case .master(let master):
                 document = try await resolver.load(selectVariant(master.variants).url, referer: referer)
@@ -70,5 +72,11 @@ final class DownloadPlanBuilder: Sendable {
                 return left > right
             }
             .first
+    }
+
+    private func validateForDownload(_ playlist: MediaPlaylist) throws {
+        if playlist.segments.contains(where: \.hasDiscontinuity) {
+            throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
+        }
     }
 }

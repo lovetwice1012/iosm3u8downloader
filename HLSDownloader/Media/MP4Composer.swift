@@ -1,12 +1,24 @@
 import AVFoundation
 import Foundation
 
+private final class ExportSessionBox: @unchecked Sendable {
+    let session: AVAssetExportSession
+
+    init(_ session: AVAssetExportSession) {
+        self.session = session
+    }
+}
+
 final class MP4Composer: @unchecked Sendable {
     func compose(
         main: [DownloadedSegment],
         externalAudio: [DownloadedSegment]?,
         outputURL: URL
     ) async throws {
+        guard !main.contains(where: { $0.source.hasDiscontinuity }),
+              !(externalAudio?.contains(where: { $0.source.hasDiscontinuity }) ?? false) else {
+            throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
+        }
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(
             withMediaType: .video,
@@ -22,8 +34,11 @@ final class MP4Composer: @unchecked Sendable {
             in: main,
             preferredMediaTypes: externalAudio == nil ? [.video, .audio] : [.video]
         ) ?? .zero
-        let audioOrigin = try await externalAudio.flatMap { segments in
-            try await firstTrackStart(in: segments, preferredMediaTypes: [.audio])
+        let audioOrigin: CMTime?
+        if let externalAudio {
+            audioOrigin = try await firstTrackStart(in: externalAudio, preferredMediaTypes: [.audio])
+        } else {
+            audioOrigin = nil
         }
         let commonOrigin = earliestTime(mainOrigin, audioOrigin)
         let mainOffset = nonnegativeDifference(mainOrigin, commonOrigin)
@@ -34,6 +49,8 @@ final class MP4Composer: @unchecked Sendable {
             audioDestination: audioTrack,
             includeVideo: true,
             includeAudio: externalAudio == nil,
+            requiresVideo: externalAudio != nil,
+            requiresAudio: false,
             initialTimeline: mainOffset
         )
 
@@ -45,6 +62,8 @@ final class MP4Composer: @unchecked Sendable {
                 audioDestination: audioTrack,
                 includeVideo: false,
                 includeAudio: true,
+                requiresVideo: false,
+                requiresAudio: true,
                 initialTimeline: nonnegativeDifference(audioOrigin ?? commonOrigin, commonOrigin)
             )
             hasAudio = audioResult.hasAudio
@@ -70,19 +89,26 @@ final class MP4Composer: @unchecked Sendable {
         audioDestination: AVMutableCompositionTrack,
         includeVideo: Bool,
         includeAudio: Bool,
+        requiresVideo: Bool,
+        requiresAudio: Bool,
         initialTimeline: CMTime
     ) async throws -> (hasVideo: Bool, hasAudio: Bool, endTime: CMTime) {
         var timeline = initialTimeline
         var hasVideo = false
         var hasAudio = false
         var appliedVideoTransform = false
+        var expectedVideoPresence: Bool?
+        var expectedAudioPresence: Bool?
 
         for segment in segments.sorted(by: { $0.source.ordinal < $1.source.ordinal }) {
             try Task.checkCancellation()
             let asset = preciseAsset(for: segment.fileURL)
             let assetDuration = try await asset.load(.duration)
-            let declaredDuration = CMTime(seconds: segment.source.duration, preferredTimescale: 600)
+            let declaredDuration = CMTime(seconds: segment.source.duration, preferredTimescale: 1_000_000)
             let advance = isPositiveNumeric(declaredDuration) ? declaredDuration : assetDuration
+            guard isPositiveNumeric(advance) else {
+                throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の長さを取得できません")
+            }
 
             let sourceVideo: AVAssetTrack?
             if includeVideo {
@@ -108,11 +134,34 @@ final class MP4Composer: @unchecked Sendable {
             } else {
                 audioRange = nil
             }
+            if requiresVideo && sourceVideo == nil {
+                throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)に映像トラックがありません")
+            }
+            if requiresAudio && sourceAudio == nil {
+                throw HLSError.invalidPlaylist("音声断片\(segment.source.ordinal + 1)に音声トラックがありません")
+            }
+            if includeVideo {
+                let isPresent = sourceVideo != nil
+                if let expectedVideoPresence, expectedVideoPresence != isPresent {
+                    throw HLSError.invalidPlaylist("途中で映像トラック構成が変わっています")
+                }
+                expectedVideoPresence = isPresent
+            }
+            if includeAudio {
+                let isPresent = sourceAudio != nil
+                if let expectedAudioPresence, expectedAudioPresence != isPresent {
+                    throw HLSError.invalidPlaylist("途中で音声トラック構成が変わっています")
+                }
+                expectedAudioPresence = isPresent
+            }
             let commonStart = earliestStart(videoRange, audioRange)
 
             if let sourceVideo, let videoRange {
                 let offset = nonnegativeDifference(videoRange.start, commonStart)
                 let availableDuration = CMTimeSubtract(advance, offset)
+                guard isPositiveNumeric(availableDuration), isPositiveNumeric(videoRange.duration) else {
+                    throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の映像時間が不正です")
+                }
                 let range = clipped(videoRange, maximumDuration: availableDuration)
                 try videoDestination.insertTimeRange(range, of: sourceVideo, at: CMTimeAdd(timeline, offset))
                 if !appliedVideoTransform {
@@ -125,6 +174,9 @@ final class MP4Composer: @unchecked Sendable {
             if let sourceAudio, let audioRange {
                 let offset = nonnegativeDifference(audioRange.start, commonStart)
                 let availableDuration = CMTimeSubtract(advance, offset)
+                guard isPositiveNumeric(availableDuration), isPositiveNumeric(audioRange.duration) else {
+                    throw HLSError.invalidPlaylist("断片\(segment.source.ordinal + 1)の音声時間が不正です")
+                }
                 let range = clipped(audioRange, maximumDuration: availableDuration)
                 try audioDestination.insertTimeRange(range, of: sourceAudio, at: CMTimeAdd(timeline, offset))
                 hasAudio = true
@@ -145,7 +197,8 @@ final class MP4Composer: @unchecked Sendable {
             for segment in segments.prefix(3) {
                 let asset = preciseAsset(for: segment.fileURL)
                 if let track = try await asset.loadTracks(withMediaType: mediaType).first {
-                    return try await track.load(.timeRange).start
+                    let range = try await track.load(.timeRange)
+                    return range.start
                 }
             }
         }
@@ -232,17 +285,18 @@ final class MP4Composer: @unchecked Sendable {
     }
 
     private func run(_ exporter: AVAssetExportSession) async throws {
+        let box = ExportSessionBox(exporter)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                exporter.exportAsynchronously {
-                    switch exporter.status {
+                box.session.exportAsynchronously {
+                    switch box.session.status {
                     case .completed:
                         continuation.resume()
                     case .cancelled:
                         continuation.resume(throwing: HLSError.cancelled)
                     case .failed:
                         continuation.resume(
-                            throwing: HLSError.exportFailed(exporter.error?.localizedDescription ?? "AVFoundationエラー")
+                            throwing: HLSError.exportFailed(box.session.error?.localizedDescription ?? "AVFoundationエラー")
                         )
                     default:
                         continuation.resume(throwing: HLSError.exportFailed("予期しない終了状態です"))
@@ -250,7 +304,7 @@ final class MP4Composer: @unchecked Sendable {
                 }
             }
         } onCancel: {
-            exporter.cancelExport()
+            box.session.cancelExport()
         }
     }
 }

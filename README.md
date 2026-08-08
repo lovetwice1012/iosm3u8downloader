@@ -48,7 +48,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。`_CodeSignature` �
 - FairPlay、`SAMPLE-AES`、非identity key format
 - Safari等のログインCookieを必要とするページ
 - `#EXT-X-GAP` を含むplaylist
-- AVFoundationがMP4へ出力できないコーデックや特殊なdiscontinuity
+- `#EXT-X-DISCONTINUITY` を含むplaylist
+- AVFoundationがMP4へ出力できないコーデック
 
 ダウンロードとMP4化は現在foreground処理です。長い動画では完了までアプリを前面に置いてください。途中でキャンセルすると、そのジョブの一時断片と未完成MP4を削除します。
 

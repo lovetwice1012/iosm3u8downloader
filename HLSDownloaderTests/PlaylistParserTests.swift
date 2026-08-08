@@ -66,5 +66,63 @@ final class PlaylistParserTests: XCTestCase {
             try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
         )
     }
-}
 
+    func testRejectsSegmentWithoutEXTINF() {
+        let text = """
+        #EXTM3U
+        segment.ts
+        #EXT-X-ENDLIST
+        """
+
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
+        )
+    }
+
+    func testRejectsImplicitByteRangeAfterDifferentResource() {
+        let text = """
+        #EXTM3U
+        #EXT-X-BYTERANGE:100@0
+        #EXTINF:4,
+        media.bin
+        #EXTINF:4,
+        other.ts
+        #EXT-X-BYTERANGE:100
+        #EXTINF:4,
+        media.bin
+        #EXT-X-ENDLIST
+        """
+
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
+        )
+    }
+
+    func testRejectsMapByteRangeWithoutOffset() {
+        let text = """
+        #EXTM3U
+        #EXT-X-MAP:URI="media.mp4",BYTERANGE="100"
+        #EXTINF:4,
+        media.m4s
+        #EXT-X-ENDLIST
+        """
+
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
+        )
+    }
+
+    func testRejectsIFrameOnlyPlaylist() {
+        let text = """
+        #EXTM3U
+        #EXT-X-I-FRAMES-ONLY
+        #EXTINF:4,
+        iframe.ts
+        #EXT-X-ENDLIST
+        """
+
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
+        )
+    }
+}

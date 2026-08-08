@@ -1,6 +1,6 @@
 import Foundation
 
-struct FileStore: Sendable {
+struct FileStore {
     private let fileManager = FileManager.default
 
     func makeJobDirectory() throws -> URL {
@@ -62,4 +62,3 @@ struct FileStore: Sendable {
         return value.isEmpty ? "video" : String(value.prefix(60))
     }
 }
-

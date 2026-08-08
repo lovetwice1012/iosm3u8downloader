@@ -50,8 +50,6 @@ struct URLCandidates: Hashable, Sendable {
 struct ByteRange: Hashable, Sendable {
     let offset: Int64
     let length: Int64
-
-    var upperBound: Int64 { offset + length - 1 }
 }
 
 struct EncryptionDescriptor: Hashable, Sendable {

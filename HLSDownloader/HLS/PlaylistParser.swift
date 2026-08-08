@@ -11,6 +11,9 @@ enum PlaylistParser {
         guard normalized.hasPrefix("#EXTM3U") else {
             throw HLSError.invalidPlaylist("#EXTM3U がありません")
         }
+        if normalized.components(separatedBy: .newlines).contains("#EXT-X-I-FRAMES-ONLY") {
+            throw HLSError.invalidPlaylist("I-frame専用playlistは通常の動画として保存できません")
+        }
 
         if normalized.contains("#EXT-X-STREAM-INF:") {
             return .master(try parseMaster(text: normalized, effectiveURL: effectiveURL))
@@ -94,10 +97,16 @@ enum PlaylistParser {
             guard !line.isEmpty else { continue }
 
             if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
-                mediaSequence = UInt64(value(afterColonIn: line)) ?? 0
+                guard let parsedSequence = UInt64(value(afterColonIn: line)) else {
+                    throw HLSError.invalidPlaylist("MEDIA-SEQUENCEが不正です")
+                }
+                mediaSequence = parsedSequence
             } else if line.hasPrefix("#EXTINF:") {
                 let value = value(afterColonIn: line).split(separator: ",", maxSplits: 1).first.map(String.init) ?? "0"
-                pendingDuration = Double(value)
+                guard let duration = Double(value), duration.isFinite, duration >= 0 else {
+                    throw HLSError.invalidPlaylist("EXTINFの長さが不正です")
+                }
+                pendingDuration = duration
             } else if line.hasPrefix("#EXT-X-BYTERANGE:") {
                 pendingByteRange = try parseByteRangeSpec(value(afterColonIn: line))
             } else if line.hasPrefix("#EXT-X-KEY:") {
@@ -129,6 +138,9 @@ enum PlaylistParser {
                 hasEndList = true
             } else if !line.hasPrefix("#") {
                 if pendingGap { throw HLSError.gapUnsupported }
+                guard let duration = pendingDuration else {
+                    throw HLSError.invalidPlaylist("メディア断片の前にEXTINFがありません")
+                }
                 let candidates = try URIResolver.resolve(line, relativeTo: effectiveURL)
                 let range: ByteRange?
                 if let pendingByteRange {
@@ -149,11 +161,15 @@ enum PlaylistParser {
                     previousByteRange = nil
                 }
 
+                let (segmentSequence, sequenceOverflow) = mediaSequence.addingReportingOverflow(UInt64(segments.count))
+                guard !sequenceOverflow else {
+                    throw HLSError.invalidPlaylist("MEDIA-SEQUENCEが範囲外です")
+                }
                 segments.append(
                     MediaSegment(
                         ordinal: segments.count,
-                        mediaSequence: mediaSequence + UInt64(segments.count),
-                        duration: pendingDuration ?? 0,
+                        mediaSequence: segmentSequence,
+                        duration: duration,
                         url: candidates,
                         byteRange: range,
                         encryption: currentEncryption,
@@ -204,7 +220,7 @@ enum PlaylistParser {
     private static func parseIV(_ string: String) throws -> Data {
         var hex = string.lowercased()
         if hex.hasPrefix("0x") { hex.removeFirst(2) }
-        guard hex.count <= 32, hex.allSatisfy({ $0.isHexDigit }) else {
+        guard !hex.isEmpty, hex.count <= 32, hex.allSatisfy({ $0.isHexDigit }) else {
             throw HLSError.invalidPlaylist("AES IVが不正です")
         }
         hex = String(repeating: "0", count: 32 - hex.count) + hex
@@ -223,8 +239,10 @@ enum PlaylistParser {
 
     private static func parseByteRangeSpec(_ value: String) throws -> (length: Int64, offset: Int64?) {
         let unquoted = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        let parts = unquoted.split(separator: "@", maxSplits: 1).map(String.init)
-        guard let length = Int64(parts[0]), length > 0 else {
+        let parts = unquoted
+            .split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
+            .map(String.init)
+        guard let first = parts.first, let length = Int64(first), length > 0 else {
             throw HLSError.byteRangeInvalid
         }
         let offset = parts.count == 2 ? Int64(parts[1]) : nil

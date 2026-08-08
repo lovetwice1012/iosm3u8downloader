@@ -69,6 +69,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            VALIDATE_PRODUCT=NO \
             DEVELOPMENT_TEAM=""
 
       - name: Package re-signable unsigned IPA
@@ -80,6 +83,7 @@ jobs:
           rm -rf Payload artifacts
           mkdir -p Payload artifacts
           cp -R "$APP_PATH" Payload/HLSDownloader.app
+          codesign --remove-signature Payload/HLSDownloader.app 2>/dev/null || true
           rm -rf Payload/HLSDownloader.app/_CodeSignature
           rm -f Payload/HLSDownloader.app/embedded.mobileprovision
 
@@ -87,10 +91,16 @@ jobs:
             echo "Expected an unsigned app, but codesign verification succeeded."
             exit 1
           fi
+          lipo -info Payload/HLSDownloader.app/HLSDownloader | grep -q "arm64"
 
-          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+          /usr/bin/ditto -c -k --keepParent \
             Payload artifacts/HLSDownloader-unsigned.ipa
           unzip -l artifacts/HLSDownloader-unsigned.ipa
+          if unzip -Z1 artifacts/HLSDownloader-unsigned.ipa | grep -q '^__MACOSX/'; then
+            echo "Unexpected macOS metadata was packaged in the IPA."
+            exit 1
+          fi
+          shasum -a 256 artifacts/HLSDownloader-unsigned.ipa
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v6
@@ -99,4 +109,3 @@ jobs:
           path: artifacts/HLSDownloader-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
-
