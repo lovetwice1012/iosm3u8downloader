@@ -9,14 +9,25 @@ private struct RemuxExecutionResult: Sendable {
 private final class RemuxSessionBox: @unchecked Sendable {
     let handle: UnsafeMutableRawPointer
 
-    init?(inputURL: URL, outputURL: URL, preserveTimestamps: Bool) {
-        let created = inputURL.path.withCString { inputPath in
-            outputURL.path.withCString { outputPath in
-                hls_ffmpeg_remux_session_create(
-                    inputPath,
-                    outputPath,
-                    preserveTimestamps ? 1 : 0
-                )
+    init?(inputURL: URL, audioInputURL: URL?, outputURL: URL) {
+        let created: UnsafeMutableRawPointer?
+        if let audioInputURL {
+            created = inputURL.path.withCString { inputPath in
+                audioInputURL.path.withCString { audioInputPath in
+                    outputURL.path.withCString { outputPath in
+                        hls_ffmpeg_remux_session_create(
+                            inputPath,
+                            audioInputPath,
+                            outputPath
+                        )
+                    }
+                }
+            }
+        } else {
+            created = inputURL.path.withCString { inputPath in
+                outputURL.path.withCString { outputPath in
+                    hls_ffmpeg_remux_session_create(inputPath, nil, outputPath)
+                }
             }
         }
         guard let created else { return nil }
@@ -48,21 +59,27 @@ private final class RemuxSessionBox: @unchecked Sendable {
 final class TransportStreamRemuxer: @unchecked Sendable {
     func remux(
         inputURL: URL,
-        outputURL: URL,
-        preserveTimestamps: Bool = false
+        audioInputURL: URL? = nil,
+        outputURL: URL
     ) async throws {
-        guard inputURL.isFileURL, outputURL.isFileURL else {
+        guard inputURL.isFileURL,
+              audioInputURL?.isFileURL ?? true,
+              outputURL.isFileURL else {
             throw HLSError.remuxFailed("ローカルファイルのパスが不正です")
         }
         guard FileManager.default.fileExists(atPath: inputURL.path) else {
             throw HLSError.remuxFailed("MPEG-TS入力ファイルがありません")
         }
+        if let audioInputURL,
+           !FileManager.default.fileExists(atPath: audioInputURL.path) {
+            throw HLSError.remuxFailed("MPEG-TS音声入力ファイルがありません")
+        }
 
         try? FileManager.default.removeItem(at: outputURL)
         guard let session = RemuxSessionBox(
             inputURL: inputURL,
-            outputURL: outputURL,
-            preserveTimestamps: preserveTimestamps
+            audioInputURL: audioInputURL,
+            outputURL: outputURL
         ) else {
             throw HLSError.remuxFailed("変換処理を開始できません")
         }

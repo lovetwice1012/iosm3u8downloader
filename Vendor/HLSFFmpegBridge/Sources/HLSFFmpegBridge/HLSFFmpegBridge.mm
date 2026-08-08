@@ -49,8 +49,8 @@ static void hls_copy_diagnostic_tail(
 
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
     const char *input_path,
-    const char *output_path,
-    int preserve_timestamps
+    const char *audio_input_path,
+    const char *output_path
 ) {
     if (input_path == NULL || output_path == NULL) {
         return NULL;
@@ -74,29 +74,33 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         "-movflags", "+faststart",
         output_path
     };
-    const char *preserved_arguments[] = {
+    const char *combined_arguments[] = {
         "-hide_banner",
         "-nostdin",
         "-loglevel", "warning",
         "-y",
         "-copyts",
         "-fflags", "+genpts",
+        "-f", "mpegts",
         "-i", input_path,
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
+        "-fflags", "+genpts",
+        "-f", "mpegts",
+        "-i", audio_input_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-sn",
         "-dn",
         "-c", "copy",
-        "-avoid_negative_ts", "disabled",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         output_path
     };
 
     const char **arguments;
     int argument_count;
-    if (preserve_timestamps) {
-        arguments = preserved_arguments;
-        argument_count = (int)(sizeof(preserved_arguments) / sizeof(preserved_arguments[0]));
+    if (audio_input_path != NULL) {
+        arguments = combined_arguments;
+        argument_count = (int)(sizeof(combined_arguments) / sizeof(combined_arguments[0]));
     } else {
         arguments = normalized_arguments;
         argument_count = (int)(sizeof(normalized_arguments) / sizeof(normalized_arguments[0]));

@@ -12,8 +12,8 @@ typedef void *HLSFFmpegRemuxSessionHandle;
 
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
     const char *input_path,
-    const char *output_path,
-    int preserve_timestamps
+    const char *audio_input_path,
+    const char *output_path
 );
 
 int64_t hls_ffmpeg_remux_session_execute(

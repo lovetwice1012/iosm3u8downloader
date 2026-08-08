@@ -21,22 +21,24 @@ final class MP4Composer: @unchecked Sendable {
               !(externalAudio?.contains(where: { $0.source.hasDiscontinuity }) ?? false) else {
             throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
         }
-        let preserveSeparateTransportTimeline: Bool
-        if let externalAudio {
-            preserveSeparateTransportTimeline = !main.isEmpty
-                && !externalAudio.isEmpty
-                && main.allSatisfy { $0.container == .transportStream }
-                && externalAudio.allSatisfy { $0.container == .transportStream }
-        } else {
-            preserveSeparateTransportTimeline = false
+        if let externalAudio,
+           !main.isEmpty,
+           !externalAudio.isEmpty,
+           main.allSatisfy({ $0.container == .transportStream }),
+           externalAudio.allSatisfy({ $0.container == .transportStream }) {
+            try await composeSeparateTransportStreams(
+                main: main,
+                audio: externalAudio,
+                outputURL: outputURL
+            )
+            return
         }
 
         let preparedMain = try await prepareTransportStream(
             main,
             label: "main",
             requiresVideo: externalAudio != nil,
-            requiresAudio: false,
-            preserveTimeline: preserveSeparateTransportTimeline
+            requiresAudio: false
         )
         var preparedAudio: PreparedStream?
         defer {
@@ -48,8 +50,7 @@ final class MP4Composer: @unchecked Sendable {
                 externalAudio,
                 label: "audio",
                 requiresVideo: false,
-                requiresAudio: true,
-                preserveTimeline: preserveSeparateTransportTimeline
+                requiresAudio: true
             )
         } else {
             preparedAudio = nil
@@ -80,6 +81,11 @@ final class MP4Composer: @unchecked Sendable {
                 throw error
             }
             let joinedMain = try consolidate(main, label: "main")
+            defer {
+                if let joinedMain {
+                    try? FileManager.default.removeItem(at: joinedMain.temporaryURL)
+                }
+            }
 
             let joinedAudio: ConsolidatedInput?
             if let externalAudio {
@@ -87,16 +93,12 @@ final class MP4Composer: @unchecked Sendable {
             } else {
                 joinedAudio = nil
             }
-            guard joinedMain != nil || joinedAudio != nil else { throw error }
-
             defer {
-                if let joinedMain {
-                    try? FileManager.default.removeItem(at: joinedMain.temporaryURL)
-                }
                 if let joinedAudio {
                     try? FileManager.default.removeItem(at: joinedAudio.temporaryURL)
                 }
             }
+            guard joinedMain != nil || joinedAudio != nil else { throw error }
             try await composeIndividually(
                 main: joinedMain.map { [$0.segment] } ?? main,
                 externalAudio: joinedAudio.map { [$0.segment] } ?? externalAudio,
@@ -117,12 +119,51 @@ final class MP4Composer: @unchecked Sendable {
         }
     }
 
+    private func composeSeparateTransportStreams(
+        main: [DownloadedSegment],
+        audio: [DownloadedSegment],
+        outputURL: URL
+    ) async throws {
+        let orderedMain = main.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        let orderedAudio = audio.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        let joinedMain = try consolidate(orderedMain, label: "main-ts")
+        defer {
+            if let joinedMain {
+                try? FileManager.default.removeItem(at: joinedMain.temporaryURL)
+            }
+        }
+        let joinedAudio = try consolidate(orderedAudio, label: "audio-ts")
+        defer {
+            if let joinedAudio {
+                try? FileManager.default.removeItem(at: joinedAudio.temporaryURL)
+            }
+        }
+        let mainInput = joinedMain?.segment ?? orderedMain[0]
+        let audioInput = joinedAudio?.segment ?? orderedAudio[0]
+        let remuxedURL = mainInput.fileURL.deletingLastPathComponent().appendingPathComponent(
+            "combined-remuxed-\(UUID().uuidString).mp4",
+            isDirectory: false
+        )
+        defer { try? FileManager.default.removeItem(at: remuxedURL) }
+
+        try await transportStreamRemuxer.remux(
+            inputURL: mainInput.fileURL,
+            audioInputURL: audioInput.fileURL,
+            outputURL: remuxedURL
+        )
+        try await validateRemuxedAsset(
+            at: remuxedURL,
+            requiresVideo: true,
+            requiresAudio: true
+        )
+        try installRemuxedOutput(remuxedURL, at: outputURL)
+    }
+
     private func prepareTransportStream(
         _ segments: [DownloadedSegment],
         label: String,
         requiresVideo: Bool,
-        requiresAudio: Bool,
-        preserveTimeline: Bool
+        requiresAudio: Bool
     ) async throws -> PreparedStream {
         let ordered = segments.sorted(by: { $0.source.ordinal < $1.source.ordinal })
         guard !ordered.isEmpty,
@@ -151,8 +192,7 @@ final class MP4Composer: @unchecked Sendable {
         do {
             try await transportStreamRemuxer.remux(
                 inputURL: inputSegment.fileURL,
-                outputURL: outputURL,
-                preserveTimestamps: preserveTimeline
+                outputURL: outputURL
             )
             try await validateRemuxedAsset(
                 at: outputURL,
