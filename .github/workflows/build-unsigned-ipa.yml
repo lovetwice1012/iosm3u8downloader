@@ -112,6 +112,22 @@ jobs:
           fi
           lipo -info Payload/HLSDownloader.app/HLSDownloader | grep -q "arm64"
           lipo -info Payload/HLSDownloader.app/Frameworks/ffmpegkit.framework/ffmpegkit | grep -q "arm64"
+          if ! otool -L Payload/HLSDownloader.app/HLSDownloader \
+            | grep -Fq '@rpath/ffmpegkit.framework/ffmpegkit'; then
+            echo "The app does not link the bundled ffmpegkit framework through @rpath."
+            exit 1
+          fi
+          if ! otool -l Payload/HLSDownloader.app/HLSDownloader | awk '
+            $1 == "cmd" && $2 == "LC_RPATH" { inspecting = 1; next }
+            inspecting && $1 == "path" {
+              if ($2 == "@executable_path/Frameworks") found = 1
+              inspecting = 0
+            }
+            END { exit(found ? 0 : 1) }
+          '; then
+            echo "The app is missing LC_RPATH @executable_path/Frameworks."
+            exit 1
+          fi
           otool -L Payload/HLSDownloader.app/Frameworks/ffmpegkit.framework/ffmpegkit
 
           /usr/bin/ditto -c -k --keepParent \
