@@ -1,0 +1,497 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B10000000000000000000001 /* HLSDownloaderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* HLSDownloaderApp.swift */; };
+		B10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* ContentView.swift */; };
+		B10000000000000000000003 /* DownloadViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* DownloadViewModel.swift */; };
+		B10000000000000000000004 /* DownloadModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DownloadModels.swift */; };
+		B10000000000000000000005 /* AttributeListParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* AttributeListParser.swift */; };
+		B10000000000000000000006 /* URIResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* URIResolver.swift */; };
+		B10000000000000000000007 /* PlaylistParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* PlaylistParser.swift */; };
+		B10000000000000000000008 /* SourceResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* SourceResolver.swift */; };
+		B10000000000000000000009 /* DownloadPlanBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* DownloadPlanBuilder.swift */; };
+		B1000000000000000000000A /* HLSDownloadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* HLSDownloadService.swift */; };
+		B1000000000000000000000B /* HTTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* HTTPClient.swift */; };
+		B1000000000000000000000C /* SegmentDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* SegmentDownloader.swift */; };
+		B1000000000000000000000D /* AES128CBCDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* AES128CBCDecryptor.swift */; };
+		B1000000000000000000000E /* MP4Composer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* MP4Composer.swift */; };
+		B1000000000000000000000F /* FileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000F /* FileStore.swift */; };
+		B10000000000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* Assets.xcassets */; };
+		B10000000000000000000011 /* AttributeListParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* AttributeListParserTests.swift */; };
+		B10000000000000000000012 /* URIResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* URIResolverTests.swift */; };
+		B10000000000000000000013 /* PlaylistParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* PlaylistParserTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C30000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = C10000000000000000000003 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C10000000000000000000001;
+			remoteInfo = HLSDownloader;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000001 /* HLSDownloaderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/HLSDownloaderApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/ContentView.swift; sourceTree = "<group>"; };
+		A10000000000000000000003 /* DownloadViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Features/DownloadViewModel.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* DownloadModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Domain/DownloadModels.swift; sourceTree = "<group>"; };
+		A10000000000000000000005 /* AttributeListParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/AttributeListParser.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* URIResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/URIResolver.swift; sourceTree = "<group>"; };
+		A10000000000000000000007 /* PlaylistParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/PlaylistParser.swift; sourceTree = "<group>"; };
+		A10000000000000000000008 /* SourceResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/SourceResolver.swift; sourceTree = "<group>"; };
+		A10000000000000000000009 /* DownloadPlanBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/DownloadPlanBuilder.swift; sourceTree = "<group>"; };
+		A1000000000000000000000A /* HLSDownloadService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/HLSDownloadService.swift; sourceTree = "<group>"; };
+		A1000000000000000000000B /* HTTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Networking/HTTPClient.swift; sourceTree = "<group>"; };
+		A1000000000000000000000C /* SegmentDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Networking/SegmentDownloader.swift; sourceTree = "<group>"; };
+		A1000000000000000000000D /* AES128CBCDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Crypto/AES128CBCDecryptor.swift; sourceTree = "<group>"; };
+		A1000000000000000000000E /* MP4Composer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Media/MP4Composer.swift; sourceTree = "<group>"; };
+		A1000000000000000000000F /* FileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Persistence/FileStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000010 /* HLSDownloader-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Crypto/HLSDownloader-Bridging-Header.h; sourceTree = "<group>"; };
+		A10000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Resources/Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Resources/Assets.xcassets; sourceTree = "<group>"; };
+		A10000000000000000000013 /* HLSDownloader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HLSDownloader.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000014 /* HLSDownloaderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HLSDownloaderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000015 /* AttributeListParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttributeListParserTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000016 /* URIResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URIResolverTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000017 /* PlaylistParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistParserTests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D10000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		E10000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				E10000000000000000000002 /* HLSDownloader */,
+				E10000000000000000000003 /* HLSDownloaderTests */,
+				E10000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E10000000000000000000002 /* HLSDownloader */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000001 /* HLSDownloaderApp.swift */,
+				A10000000000000000000002 /* ContentView.swift */,
+				A10000000000000000000003 /* DownloadViewModel.swift */,
+				A10000000000000000000004 /* DownloadModels.swift */,
+				A10000000000000000000005 /* AttributeListParser.swift */,
+				A10000000000000000000006 /* URIResolver.swift */,
+				A10000000000000000000007 /* PlaylistParser.swift */,
+				A10000000000000000000008 /* SourceResolver.swift */,
+				A10000000000000000000009 /* DownloadPlanBuilder.swift */,
+				A1000000000000000000000A /* HLSDownloadService.swift */,
+				A1000000000000000000000B /* HTTPClient.swift */,
+				A1000000000000000000000C /* SegmentDownloader.swift */,
+				A1000000000000000000000D /* AES128CBCDecryptor.swift */,
+				A1000000000000000000000E /* MP4Composer.swift */,
+				A1000000000000000000000F /* FileStore.swift */,
+				A10000000000000000000010 /* HLSDownloader-Bridging-Header.h */,
+				A10000000000000000000011 /* Info.plist */,
+				A10000000000000000000012 /* Assets.xcassets */,
+			);
+			path = HLSDownloader;
+			sourceTree = "<group>";
+		};
+		E10000000000000000000003 /* HLSDownloaderTests */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000015 /* AttributeListParserTests.swift */,
+				A10000000000000000000016 /* URIResolverTests.swift */,
+				A10000000000000000000017 /* PlaylistParserTests.swift */,
+			);
+			path = HLSDownloaderTests;
+			sourceTree = "<group>";
+		};
+		E10000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000013 /* HLSDownloader.app */,
+				A10000000000000000000014 /* HLSDownloaderTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		C10000000000000000000001 /* HLSDownloader */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F20000000000000000000002 /* Build configuration list for PBXNativeTarget "HLSDownloader" */;
+			buildPhases = (
+				D10000000000000000000001 /* Sources */,
+				D10000000000000000000002 /* Frameworks */,
+				D10000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = HLSDownloader;
+			productName = HLSDownloader;
+			productReference = A10000000000000000000013 /* HLSDownloader.app */;
+			productType = "com.apple.product-type.application";
+		};
+		C10000000000000000000002 /* HLSDownloaderTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F20000000000000000000003 /* Build configuration list for PBXNativeTarget "HLSDownloaderTests" */;
+			buildPhases = (
+				D10000000000000000000004 /* Sources */,
+				D10000000000000000000005 /* Frameworks */,
+				D10000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C20000000000000000000001 /* PBXTargetDependency */,
+			);
+			name = HLSDownloaderTests;
+			productName = HLSDownloaderTests;
+			productReference = A10000000000000000000014 /* HLSDownloaderTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		C10000000000000000000003 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					C10000000000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					C10000000000000000000002 = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = C10000000000000000000001;
+					};
+				};
+			};
+			buildConfigurationList = F20000000000000000000001 /* Build configuration list for PBXProject "HLSDownloader" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				ja,
+			);
+			mainGroup = E10000000000000000000001;
+			productRefGroup = E10000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C10000000000000000000001 /* HLSDownloader */,
+				C10000000000000000000002 /* HLSDownloaderTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D10000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000010 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		D10000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000001 /* HLSDownloaderApp.swift in Sources */,
+				B10000000000000000000002 /* ContentView.swift in Sources */,
+				B10000000000000000000003 /* DownloadViewModel.swift in Sources */,
+				B10000000000000000000004 /* DownloadModels.swift in Sources */,
+				B10000000000000000000005 /* AttributeListParser.swift in Sources */,
+				B10000000000000000000006 /* URIResolver.swift in Sources */,
+				B10000000000000000000007 /* PlaylistParser.swift in Sources */,
+				B10000000000000000000008 /* SourceResolver.swift in Sources */,
+				B10000000000000000000009 /* DownloadPlanBuilder.swift in Sources */,
+				B1000000000000000000000A /* HLSDownloadService.swift in Sources */,
+				B1000000000000000000000B /* HTTPClient.swift in Sources */,
+				B1000000000000000000000C /* SegmentDownloader.swift in Sources */,
+				B1000000000000000000000D /* AES128CBCDecryptor.swift in Sources */,
+				B1000000000000000000000E /* MP4Composer.swift in Sources */,
+				B1000000000000000000000F /* FileStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D10000000000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000000000000000000011 /* AttributeListParserTests.swift in Sources */,
+				B10000000000000000000012 /* URIResolverTests.swift in Sources */,
+				B10000000000000000000013 /* PlaylistParserTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C20000000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C10000000000000000000001 /* HLSDownloader */;
+			targetProxy = C30000000000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		F10000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		F10000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F10000000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = HLSDownloader/Resources/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.HLSDownloader;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = HLSDownloader/Crypto/HLSDownloader-Bridging-Header.h;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F10000000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = HLSDownloader/Resources/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.HLSDownloader;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = HLSDownloader/Crypto/HLSDownloader-Bridging-Header.h;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		F10000000000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.HLSDownloaderTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/HLSDownloader.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HLSDownloader";
+			};
+			name = Debug;
+		};
+		F10000000000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.HLSDownloaderTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/HLSDownloader.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HLSDownloader";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F20000000000000000000001 /* Build configuration list for PBXProject "HLSDownloader" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000001 /* Debug */,
+				F10000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F20000000000000000000002 /* Build configuration list for PBXNativeTarget "HLSDownloader" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000003 /* Debug */,
+				F10000000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F20000000000000000000003 /* Build configuration list for PBXNativeTarget "HLSDownloaderTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F10000000000000000000005 /* Debug */,
+				F10000000000000000000006 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = C10000000000000000000003 /* Project object */;
+}
