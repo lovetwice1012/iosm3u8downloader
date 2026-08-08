@@ -74,19 +74,66 @@ final class TransportStreamRemuxerTests: XCTestCase {
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         let videoTrack = try XCTUnwrap(videoTracks.first)
         let audioTrack = try XCTUnwrap(audioTracks.first)
-        let videoStart = CMTimeGetSeconds(try await firstPresentedTime(in: videoTrack))
-        let audioStart = CMTimeGetSeconds(try await firstPresentedTime(in: audioTrack))
+        let sampleTimes = try firstSamplePresentationTimes(
+            in: asset,
+            videoTrack: videoTrack,
+            audioTrack: audioTrack
+        )
+        let videoStart = CMTimeGetSeconds(sampleTimes.video)
+        let audioStart = CMTimeGetSeconds(sampleTimes.audio)
 
-        XCTAssertLessThan(abs(videoStart), 0.2)
-        XCTAssertGreaterThan(audioStart - videoStart, 0.7)
-        XCTAssertLessThan(audioStart - videoStart, 1.2)
+        XCTAssertLessThan(abs(videoStart), 0.2, "video start: \(videoStart)")
+        XCTAssertGreaterThan(
+            audioStart - videoStart,
+            0.7,
+            "video start: \(videoStart), audio start: \(audioStart)"
+        )
+        XCTAssertLessThan(
+            audioStart - videoStart,
+            1.2,
+            "video start: \(videoStart), audio start: \(audioStart)"
+        )
     }
 
-    private func firstPresentedTime(in track: AVAssetTrack) async throws -> CMTime {
-        // AVAssetTrack.timeRange includes an initial empty edit and therefore starts at zero.
-        // The first non-empty segment is the point at which this track is actually presented.
-        let segments = try await track.load(.segments)
-        return try XCTUnwrap(segments.first(where: { !$0.isEmpty })).timeMapping.target.start
+    private enum SampleReadError: Error {
+        case cannotAddOutput
+        case cannotStartReading
+        case noSample
+        case invalidPresentationTime
+    }
+
+    private func firstSamplePresentationTimes(
+        in asset: AVAsset,
+        videoTrack: AVAssetTrack,
+        audioTrack: AVAssetTrack
+    ) throws -> (video: CMTime, audio: CMTime) {
+        let reader = try AVAssetReader(asset: asset)
+        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+        videoOutput.alwaysCopiesSampleData = false
+        audioOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput), reader.canAdd(audioOutput) else {
+            throw SampleReadError.cannotAddOutput
+        }
+        reader.add(videoOutput)
+        reader.add(audioOutput)
+        guard reader.startReading() else {
+            if let error = reader.error { throw error }
+            throw SampleReadError.cannotStartReading
+        }
+        defer { reader.cancelReading() }
+        guard let videoSample = videoOutput.copyNextSampleBuffer(),
+              let audioSample = audioOutput.copyNextSampleBuffer() else {
+            if let error = reader.error { throw error }
+            throw SampleReadError.noSample
+        }
+        let videoTime = CMSampleBufferGetPresentationTimeStamp(videoSample)
+        let audioTime = CMSampleBufferGetPresentationTimeStamp(audioSample)
+        guard videoTime.isValid, videoTime.isNumeric,
+              audioTime.isValid, audioTime.isNumeric else {
+            throw SampleReadError.invalidPresentationTime
+        }
+        return (videoTime, audioTime)
     }
 
     private func fixture(named name: String) throws -> URL {
