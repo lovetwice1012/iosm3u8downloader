@@ -127,8 +127,8 @@ final class TransportStreamRemuxerTests: XCTestCase {
             if let error = reader.error { throw error }
             throw SampleReadError.noSample
         }
-        let videoTime = CMSampleBufferGetPresentationTimeStamp(videoSample)
-        let audioTime = CMSampleBufferGetPresentationTimeStamp(audioSample)
+        let videoTime = CMSampleBufferGetOutputPresentationTimeStamp(videoSample)
+        let audioTime = CMSampleBufferGetOutputPresentationTimeStamp(audioSample)
         guard videoTime.isValid, videoTime.isNumeric,
               audioTime.isValid, audioTime.isNumeric else {
             throw SampleReadError.invalidPresentationTime
