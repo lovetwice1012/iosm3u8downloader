@@ -124,7 +124,7 @@ int64_t hls_ffmpeg_remux_session_execute(
     char *diagnostic_buffer,
     size_t diagnostic_buffer_size
 ) {
-    HLSFFmpegRemuxSession *session = session_handle;
+    HLSFFmpegRemuxSession *session = static_cast<HLSFFmpegRemuxSession *>(session_handle);
     if (diagnostic_buffer != NULL && diagnostic_buffer_size > 0) {
         diagnostic_buffer[0] = '\0';
     }
@@ -160,7 +160,7 @@ int64_t hls_ffmpeg_remux_session_execute(
 }
 
 void hls_ffmpeg_remux_session_cancel(HLSFFmpegRemuxSessionHandle session_handle) {
-    HLSFFmpegRemuxSession *session = session_handle;
+    HLSFFmpegRemuxSession *session = static_cast<HLSFFmpegRemuxSession *>(session_handle);
     if (session != NULL && session->handle != NULL) {
         session->cancel_requested.store(1, std::memory_order_release);
         for (int attempt = 0; attempt < 250; attempt++) {
@@ -183,7 +183,7 @@ void hls_ffmpeg_remux_session_cancel(HLSFFmpegRemuxSessionHandle session_handle)
 }
 
 void hls_ffmpeg_remux_session_destroy(HLSFFmpegRemuxSessionHandle session_handle) {
-    HLSFFmpegRemuxSession *session = session_handle;
+    HLSFFmpegRemuxSession *session = static_cast<HLSFFmpegRemuxSession *>(session_handle);
     if (session == NULL) {
         return;
     }
