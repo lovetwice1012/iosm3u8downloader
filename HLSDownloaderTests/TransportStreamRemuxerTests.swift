@@ -122,28 +122,39 @@ final class TransportStreamRemuxerTests: XCTestCase {
             guard let media = trackChildren.first(where: { $0.type == "mdia" }) else { continue }
             let mediaChildren = try mp4Boxes(in: data, range: media.payload)
             guard let handlerBox = mediaChildren.first(where: { $0.type == "hdlr" }) else { continue }
+            guard handlerBox.payload.count >= 12 else {
+                throw MP4InspectionError.malformed("truncated hdlr box")
+            }
             let handler = try fourCC(in: data, at: handlerBox.payload.lowerBound + 8)
             guard handler == "vide" || handler == "soun" else { continue }
 
-            var emptyDuration: UInt64 = 0
-            if let editContainer = trackChildren.first(where: { $0.type == "edts" }) {
-                let editChildren = try mp4Boxes(in: data, range: editContainer.payload)
-                if let editList = editChildren.first(where: { $0.type == "elst" }) {
-                    emptyDuration = try initialEmptyEditDuration(in: data, editList: editList)
-                }
+            guard let editContainer = trackChildren.first(where: { $0.type == "edts" }) else {
+                throw MP4InspectionError.malformed("edts box not found for \(handler)")
             }
+            let editChildren = try mp4Boxes(in: data, range: editContainer.payload)
+            guard let editList = editChildren.first(where: { $0.type == "elst" }) else {
+                throw MP4InspectionError.malformed("elst box not found for \(handler)")
+            }
+            let emptyDuration = try initialEmptyEditDuration(in: data, editList: editList)
             result[handler] = Double(emptyDuration) / Double(timescale)
         }
         return result
     }
 
     private func movieTimescale(in data: Data, header: MP4Box) throws -> UInt32 {
+        guard !header.payload.isEmpty else {
+            throw MP4InspectionError.malformed("truncated mvhd box")
+        }
         let version = try byte(in: data, at: header.payload.lowerBound)
         let offset: Int
         switch version {
         case 0: offset = header.payload.lowerBound + 12
         case 1: offset = header.payload.lowerBound + 20
         default: throw MP4InspectionError.malformed("unsupported mvhd version")
+        }
+        guard offset >= header.payload.lowerBound,
+              header.payload.upperBound - offset >= 4 else {
+            throw MP4InspectionError.malformed("truncated mvhd timescale")
         }
         let timescale = try uint32(in: data, at: offset)
         guard timescale > 0 else {
@@ -153,23 +164,44 @@ final class TransportStreamRemuxerTests: XCTestCase {
     }
 
     private func initialEmptyEditDuration(in data: Data, editList: MP4Box) throws -> UInt64 {
+        guard editList.payload.count >= 8 else {
+            throw MP4InspectionError.malformed("truncated elst header")
+        }
         let version = try byte(in: data, at: editList.payload.lowerBound)
         let entryCount = try uint32(in: data, at: editList.payload.lowerBound + 4)
-        guard entryCount > 0 else { return 0 }
+        guard entryCount > 0 else {
+            throw MP4InspectionError.malformed("elst has no entries")
+        }
         let entryOffset = editList.payload.lowerBound + 8
+        let entrySize: Int
         let duration: UInt64
         let mediaTime: Int64
         switch version {
         case 0:
+            entrySize = 12
+            guard editList.payload.upperBound - entryOffset >= entrySize else {
+                throw MP4InspectionError.malformed("truncated version 0 elst entry")
+            }
             duration = UInt64(try uint32(in: data, at: entryOffset))
             mediaTime = Int64(Int32(bitPattern: try uint32(in: data, at: entryOffset + 4)))
         case 1:
+            entrySize = 20
+            guard editList.payload.upperBound - entryOffset >= entrySize else {
+                throw MP4InspectionError.malformed("truncated version 1 elst entry")
+            }
             duration = try uint64(in: data, at: entryOffset)
             mediaTime = Int64(bitPattern: try uint64(in: data, at: entryOffset + 8))
         default:
             throw MP4InspectionError.malformed("unsupported elst version")
         }
-        return mediaTime == -1 ? duration : 0
+        let declaredBytes = UInt64(entryCount) * UInt64(entrySize)
+        guard declaredBytes <= UInt64(editList.payload.upperBound - entryOffset) else {
+            throw MP4InspectionError.malformed("truncated elst entries")
+        }
+        guard mediaTime == -1 else {
+            throw MP4InspectionError.malformed("first elst entry is not empty")
+        }
+        return duration
     }
 
     private func mp4Boxes(in data: Data, range: Range<Int>) throws -> [MP4Box] {
@@ -189,6 +221,9 @@ final class TransportStreamRemuxerTests: XCTestCase {
             let boxSize: UInt64
             if size32 == 1 {
                 headerSize = 16
+                guard remaining >= headerSize else {
+                    throw MP4InspectionError.malformed("truncated extended-size \(type) box")
+                }
                 boxSize = try uint64(in: data, at: offset + 8)
             } else if size32 == 0 {
                 headerSize = 8
