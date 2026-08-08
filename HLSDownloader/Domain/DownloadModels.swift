@@ -162,6 +162,7 @@ enum HLSError: LocalizedError, Sendable {
     case byteRangeInvalid
     case invalidMediaPayload(stream: String, number: Int, mimeType: String?, byteCount: Int, signature: String)
     case mediaOpenFailed(stream: String, number: Int, container: String, byteCount: Int, detail: String)
+    case remuxFailed(String)
     case noPlayableTracks
     case mp4ExportUnsupported
     case exportFailed(String)
@@ -198,6 +199,8 @@ enum HLSError: LocalizedError, Sendable {
             return "\(stream)断片\(number)がメディアデータではありません（Content-Type: \(type)、\(byteCount) bytes、先頭: \(signature)）。署名URLの期限やログイン状態を確認してください。"
         case .mediaOpenFailed(let stream, let number, let container, let byteCount, let detail):
             return "\(stream)断片\(number)を開けません（\(container)、\(byteCount) bytes）。\(detail)"
+        case .remuxFailed(let detail):
+            return "MPEG-TSをMP4へ変換できませんでした: \(detail)"
         case .noPlayableTracks:
             return "結合できる映像または音声トラックがありません。"
         case .mp4ExportUnsupported:

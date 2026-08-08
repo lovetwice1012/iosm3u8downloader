@@ -197,6 +197,16 @@ final class MediaPayloadInspectorTests: XCTestCase {
 
 private final class URLProtocolStub: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    nonisolated(unsafe) static var deliveryDelay: TimeInterval = 0
+    nonisolated(unsafe) static var onStart: (() -> Void)?
+    nonisolated(unsafe) static var onFinish: (() -> Void)?
+
+    static func reset() {
+        handler = nil
+        deliveryDelay = 0
+        onStart = nil
+        onFinish = nil
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -206,13 +216,26 @@ private final class URLProtocolStub: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
-        do {
-            let (response, data) = try handler(request)
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        } catch {
-            client?.urlProtocol(self, didFailWithError: error)
+        Self.onStart?()
+        let deliver = { [weak self] in
+            defer { Self.onFinish?() }
+            guard let self else { return }
+            do {
+                let (response, data) = try handler(self.request)
+                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                self.client?.urlProtocol(self, didLoad: data)
+                self.client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                self.client?.urlProtocol(self, didFailWithError: error)
+            }
+        }
+        if Self.deliveryDelay > 0 {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + Self.deliveryDelay,
+                execute: DispatchWorkItem(block: deliver)
+            )
+        } else {
+            deliver()
         }
     }
 
@@ -221,7 +244,7 @@ private final class URLProtocolStub: URLProtocol {
 
 final class SourceResolverFallbackTests: XCTestCase {
     override func tearDown() {
-        URLProtocolStub.handler = nil
+        URLProtocolStub.reset()
         super.tearDown()
     }
 
@@ -255,7 +278,7 @@ final class SourceResolverFallbackTests: XCTestCase {
 
 final class SegmentDownloaderFallbackTests: XCTestCase {
     override func tearDown() {
-        URLProtocolStub.handler = nil
+        URLProtocolStub.reset()
         super.tearDown()
     }
 
@@ -369,5 +392,106 @@ final class SegmentDownloaderFallbackTests: XCTestCase {
             data[offset + 3] = 0x10
         }
         return data
+    }
+}
+
+private final class RequestConcurrencyCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeRequests = 0
+    private var highestActiveRequests = 0
+
+    func started() {
+        lock.lock()
+        activeRequests += 1
+        highestActiveRequests = max(highestActiveRequests, activeRequests)
+        lock.unlock()
+    }
+
+    func finished() {
+        lock.lock()
+        activeRequests -= 1
+        lock.unlock()
+    }
+
+    func maximum() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return highestActiveRequests
+    }
+}
+
+final class SegmentDownloaderConcurrencyTests: XCTestCase {
+    override func tearDown() {
+        URLProtocolStub.reset()
+        super.tearDown()
+    }
+
+    func testDownloadsSegmentsConcurrentlyAndReturnsPlaylistOrder() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let downloader = SegmentDownloader(
+            client: HTTPClient(configuration: configuration),
+            maximumConcurrentDownloads: 3
+        )
+        let counter = RequestConcurrencyCounter()
+        URLProtocolStub.deliveryDelay = 0.1
+        URLProtocolStub.onStart = { counter.started() }
+        URLProtocolStub.onFinish = { counter.finished() }
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "video/mp2t"]
+            )!
+            var data = Data(repeating: 0, count: 188 * 3)
+            for offset in stride(from: 0, to: data.count, by: 188) {
+                data[offset] = 0x47
+                data[offset + 3] = 0x10
+            }
+            return (response, data)
+        }
+
+        let base = URL(string: "https://cdn.example/parallel/index.m3u8")!
+        let segments = (0..<6).map { ordinal in
+            MediaSegment(
+                ordinal: ordinal,
+                mediaSequence: UInt64(ordinal),
+                duration: 1,
+                url: URLCandidates(
+                    primary: URL(string: "https://cdn.example/parallel/\(ordinal).ts")!,
+                    sameOriginQueryFallback: nil
+                ),
+                byteRange: nil,
+                encryption: nil,
+                initializationMap: nil,
+                hasDiscontinuity: false
+            )
+        }
+        let playlist = MediaPlaylist(
+            effectiveURL: base,
+            requestReferer: base,
+            segments: segments,
+            hasEndList: true
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SegmentDownloaderConcurrencyTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let result = try await downloader.download(
+            playlist: playlist,
+            prefix: "main",
+            directory: directory,
+            completedBefore: 0,
+            totalSegments: segments.count,
+            progress: { _ in }
+        )
+
+        XCTAssertGreaterThan(counter.maximum(), 1)
+        XCTAssertLessThanOrEqual(counter.maximum(), 3)
+        XCTAssertEqual(result.map(\.source.ordinal), Array(0..<6))
     }
 }

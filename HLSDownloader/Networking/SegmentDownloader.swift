@@ -2,13 +2,42 @@ import Foundation
 
 typealias ProgressHandler = @Sendable (DownloadProgress) async -> Void
 
+private actor DownloadPermitPool {
+    private var availablePermits: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) {
+        availablePermits = max(1, limit)
+    }
+
+    func acquire() async {
+        if availablePermits > 0 {
+            availablePermits -= 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            availablePermits += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 final class SegmentDownloader: Sendable {
     private let client: HTTPClient
     private let maximumConcurrentDownloads: Int
+    private let permitPool: DownloadPermitPool
 
-    init(client: HTTPClient, maximumConcurrentDownloads: Int = 4) {
+    init(client: HTTPClient, maximumConcurrentDownloads: Int = 6) {
         self.client = client
         self.maximumConcurrentDownloads = max(1, maximumConcurrentDownloads)
+        permitPool = DownloadPermitPool(limit: max(1, maximumConcurrentDownloads))
     }
 
     func download(
@@ -36,7 +65,7 @@ final class SegmentDownloader: Sendable {
                 let segment = segments[index]
                 nextIndex += 1
                 group.addTask { [self] in
-                    let downloaded = try await downloadSegment(
+                    let downloaded = try await downloadSegmentWithPermit(
                         segment,
                         prefix: prefix,
                         directory: directory,
@@ -51,20 +80,12 @@ final class SegmentDownloader: Sendable {
             while let (index, downloaded) = try await group.next() {
                 results[index] = downloaded
                 completedHere += 1
-                await progress(
-                    DownloadProgress(
-                        phase: .downloading,
-                        completedItems: completedBefore + completedHere,
-                        totalItems: totalSegments
-                    )
-                )
-
                 if nextIndex < segments.count {
                     let newIndex = nextIndex
                     let segment = segments[newIndex]
                     nextIndex += 1
                     group.addTask { [self] in
-                        let next = try await downloadSegment(
+                        let next = try await downloadSegmentWithPermit(
                             segment,
                             prefix: prefix,
                             directory: directory,
@@ -75,12 +96,45 @@ final class SegmentDownloader: Sendable {
                         return (newIndex, next)
                     }
                 }
+                await progress(
+                    DownloadProgress(
+                        phase: .downloading,
+                        completedItems: completedBefore + completedHere,
+                        totalItems: totalSegments
+                    )
+                )
             }
         }
 
         return try results.map {
             guard let value = $0 else { throw HLSError.network("断片の保存結果が不足しています") }
             return value
+        }
+    }
+
+    private func downloadSegmentWithPermit(
+        _ segment: MediaSegment,
+        prefix: String,
+        directory: URL,
+        keyData: [URL: Data],
+        mapData: [InitializationMap: Data],
+        referer: URL
+    ) async throws -> DownloadedSegment {
+        await permitPool.acquire()
+        do {
+            let result = try await downloadSegment(
+                segment,
+                prefix: prefix,
+                directory: directory,
+                keyData: keyData,
+                mapData: mapData,
+                referer: referer
+            )
+            await permitPool.release()
+            return result
+        } catch {
+            await permitPool.release()
+            throw error
         }
     }
 
@@ -196,9 +250,15 @@ final class SegmentDownloader: Sendable {
             stream: prefix == "audio" ? "音声" : "映像"
         )
         let initializationData = segment.initializationMap.flatMap { mapData[$0] }
-        var finalData = Data(capacity: (initializationData?.count ?? 0) + mediaData.count)
-        if let initializationData { finalData.append(initializationData) }
-        finalData.append(mediaData)
+        let finalData: Data
+        if let initializationData {
+            var combined = Data(capacity: initializationData.count + mediaData.count)
+            combined.append(initializationData)
+            combined.append(mediaData)
+            finalData = combined
+        } else {
+            finalData = mediaData
+        }
 
         guard let finalContainer = MediaPayloadInspector.detect(finalData, mimeType: response.mimeType),
               finalContainer == mediaContainer else {

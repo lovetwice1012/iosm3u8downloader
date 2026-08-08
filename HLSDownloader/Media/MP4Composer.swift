@@ -10,7 +10,65 @@ private final class ExportSessionBox: @unchecked Sendable {
 }
 
 final class MP4Composer: @unchecked Sendable {
+    private let transportStreamRemuxer = TransportStreamRemuxer()
+
     func compose(
+        main: [DownloadedSegment],
+        externalAudio: [DownloadedSegment]?,
+        outputURL: URL
+    ) async throws {
+        guard !main.contains(where: { $0.source.hasDiscontinuity }),
+              !(externalAudio?.contains(where: { $0.source.hasDiscontinuity }) ?? false) else {
+            throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
+        }
+        let preserveSeparateTransportTimeline: Bool
+        if let externalAudio {
+            preserveSeparateTransportTimeline = !main.isEmpty
+                && !externalAudio.isEmpty
+                && main.allSatisfy { $0.container == .transportStream }
+                && externalAudio.allSatisfy { $0.container == .transportStream }
+        } else {
+            preserveSeparateTransportTimeline = false
+        }
+
+        let preparedMain = try await prepareTransportStream(
+            main,
+            label: "main",
+            requiresVideo: externalAudio != nil,
+            requiresAudio: false,
+            preserveTimeline: preserveSeparateTransportTimeline
+        )
+        var preparedAudio: PreparedStream?
+        defer {
+            preparedMain.removeTemporaryFiles()
+            preparedAudio?.removeTemporaryFiles()
+        }
+        if let externalAudio {
+            preparedAudio = try await prepareTransportStream(
+                externalAudio,
+                label: "audio",
+                requiresVideo: false,
+                requiresAudio: true,
+                preserveTimeline: preserveSeparateTransportTimeline
+            )
+        } else {
+            preparedAudio = nil
+        }
+
+        if preparedMain.wasRemuxed, externalAudio == nil,
+           let remuxed = preparedMain.segments.first {
+            try installRemuxedOutput(remuxed.fileURL, at: outputURL)
+            return
+        }
+
+        try await composeWithConsolidationFallback(
+            main: preparedMain.segments,
+            externalAudio: preparedAudio?.segments,
+            outputURL: outputURL
+        )
+    }
+
+    private func composeWithConsolidationFallback(
         main: [DownloadedSegment],
         externalAudio: [DownloadedSegment]?,
         outputURL: URL
@@ -44,6 +102,138 @@ final class MP4Composer: @unchecked Sendable {
                 externalAudio: joinedAudio.map { [$0.segment] } ?? externalAudio,
                 outputURL: outputURL
             )
+        }
+    }
+
+    private struct PreparedStream {
+        let segments: [DownloadedSegment]
+        let temporaryURLs: [URL]
+        let wasRemuxed: Bool
+
+        func removeTemporaryFiles() {
+            for url in temporaryURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private func prepareTransportStream(
+        _ segments: [DownloadedSegment],
+        label: String,
+        requiresVideo: Bool,
+        requiresAudio: Bool,
+        preserveTimeline: Bool
+    ) async throws -> PreparedStream {
+        let ordered = segments.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        guard !ordered.isEmpty,
+              ordered.allSatisfy({ $0.container == .transportStream }) else {
+            return PreparedStream(segments: segments, temporaryURLs: [], wasRemuxed: false)
+        }
+
+        var temporaryURLs: [URL] = []
+        let inputSegment: DownloadedSegment
+        if ordered.count > 1 {
+            guard let joined = try consolidate(ordered, label: "\(label)-ts") else {
+                return PreparedStream(segments: segments, temporaryURLs: [], wasRemuxed: false)
+            }
+            inputSegment = joined.segment
+            temporaryURLs.append(joined.temporaryURL)
+        } else {
+            inputSegment = ordered[0]
+        }
+
+        let outputURL = inputSegment.fileURL.deletingLastPathComponent().appendingPathComponent(
+            "\(label)-remuxed-\(UUID().uuidString).mp4",
+            isDirectory: false
+        )
+        temporaryURLs.append(outputURL)
+
+        do {
+            try await transportStreamRemuxer.remux(
+                inputURL: inputSegment.fileURL,
+                outputURL: outputURL,
+                preserveTimestamps: preserveTimeline
+            )
+            try await validateRemuxedAsset(
+                at: outputURL,
+                requiresVideo: requiresVideo,
+                requiresAudio: requiresAudio
+            )
+            let values = try outputURL.resourceValues(forKeys: [.fileSizeKey])
+            let first = ordered[0]
+            let source = MediaSegment(
+                ordinal: 0,
+                mediaSequence: first.source.mediaSequence,
+                duration: ordered.reduce(0.0) { $0 + $1.source.duration },
+                url: first.source.url,
+                byteRange: nil,
+                encryption: nil,
+                initializationMap: nil,
+                hasDiscontinuity: false
+            )
+            let remuxed = DownloadedSegment(
+                source: source,
+                fileURL: outputURL,
+                container: .isoBaseMedia,
+                byteCount: values.fileSize ?? 0,
+                initializationDataLength: 0
+            )
+            return PreparedStream(
+                segments: [remuxed],
+                temporaryURLs: temporaryURLs,
+                wasRemuxed: true
+            )
+        } catch {
+            for url in temporaryURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+            throw error
+        }
+    }
+
+    private func validateRemuxedAsset(
+        at url: URL,
+        requiresVideo: Bool,
+        requiresAudio: Bool
+    ) async throws {
+        do {
+            let asset = localAsset(for: url)
+            async let videoTracks = asset.loadTracks(withMediaType: .video)
+            async let audioTracks = asset.loadTracks(withMediaType: .audio)
+            async let isPlayable = asset.load(.isPlayable)
+            let (video, audio, playable) = try await (videoTracks, audioTracks, isPlayable)
+            guard playable else {
+                throw HLSError.remuxFailed("変換後のMP4をこの端末で再生できません")
+            }
+            guard !video.isEmpty || !audio.isEmpty else {
+                throw HLSError.noPlayableTracks
+            }
+            guard !requiresVideo || !video.isEmpty else {
+                throw HLSError.remuxFailed("変換後のMP4に映像トラックがありません")
+            }
+            guard !requiresAudio || !audio.isEmpty else {
+                throw HLSError.remuxFailed("変換後のMP4に音声トラックがありません")
+            }
+            let duration = try await asset.load(.duration)
+            guard isPositiveNumeric(duration) else {
+                throw HLSError.remuxFailed("変換後のMP4の長さを取得できません")
+            }
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            throw error
+        } catch {
+            throw HLSError.remuxFailed(diagnosticDescription(error))
+        }
+    }
+
+    private func installRemuxedOutput(_ sourceURL: URL, at outputURL: URL) throws {
+        do {
+            try? FileManager.default.removeItem(at: outputURL)
+            try FileManager.default.moveItem(at: sourceURL, to: outputURL)
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw HLSError.exportFailed(error.localizedDescription)
         }
     }
 

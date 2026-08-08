@@ -21,6 +21,8 @@ jobs:
 
       - name: Show Xcode environment
         run: |
+          test "$(uname -m)" = "arm64"
+          uname -a
           xcodebuild -version
           xcodebuild -showsdks
 
@@ -79,10 +81,17 @@ jobs:
         run: |
           APP_PATH="build/device/Build/Products/Release-iphoneos/HLSDownloader.app"
           test -f "$APP_PATH/HLSDownloader"
+          test -f "$APP_PATH/Frameworks/ffmpegkit.framework/ffmpegkit"
+          test -f "$APP_PATH/ThirdPartyNotices.txt"
 
           rm -rf Payload artifacts
           mkdir -p Payload artifacts
           cp -R "$APP_PATH" Payload/HLSDownloader.app
+
+          while IFS= read -r -d '' FRAMEWORK; do
+            codesign --remove-signature "$FRAMEWORK" 2>/dev/null || true
+            rm -rf "$FRAMEWORK/_CodeSignature"
+          done < <(find Payload/HLSDownloader.app/Frameworks -type d -name '*.framework' -print0)
           codesign --remove-signature Payload/HLSDownloader.app 2>/dev/null || true
           rm -rf Payload/HLSDownloader.app/_CodeSignature
           rm -f Payload/HLSDownloader.app/embedded.mobileprovision
@@ -91,7 +100,19 @@ jobs:
             echo "Expected an unsigned app, but codesign verification succeeded."
             exit 1
           fi
+          while IFS= read -r -d '' FRAMEWORK; do
+            if codesign --verify "$FRAMEWORK" 2>/dev/null; then
+              echo "Expected an unsigned framework, but codesign verification succeeded: $FRAMEWORK"
+              exit 1
+            fi
+          done < <(find Payload/HLSDownloader.app/Frameworks -type d -name '*.framework' -print0)
+          if find Payload/HLSDownloader.app -type d -name _CodeSignature | grep -q .; then
+            echo "A code signature directory remains in the packaged app."
+            exit 1
+          fi
           lipo -info Payload/HLSDownloader.app/HLSDownloader | grep -q "arm64"
+          lipo -info Payload/HLSDownloader.app/Frameworks/ffmpegkit.framework/ffmpegkit | grep -q "arm64"
+          otool -L Payload/HLSDownloader.app/Frameworks/ffmpegkit.framework/ffmpegkit
 
           /usr/bin/ditto -c -k --keepParent \
             Payload artifacts/HLSDownloader-unsigned.ipa

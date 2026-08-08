@@ -1,5 +1,27 @@
 import Foundation
 
+private actor SegmentProgressTracker {
+    private var completedItems = 0
+    private let totalItems: Int
+    private let progress: ProgressHandler
+
+    init(totalItems: Int, progress: @escaping ProgressHandler) {
+        self.totalItems = totalItems
+        self.progress = progress
+    }
+
+    func segmentCompleted() async {
+        completedItems += 1
+        await progress(
+            DownloadProgress(
+                phase: .downloading,
+                completedItems: completedItems,
+                totalItems: totalItems
+            )
+        )
+    }
+}
+
 final class HLSDownloadService: @unchecked Sendable {
     private let sourceResolver: SourceResolver
     private let planBuilder: DownloadPlanBuilder
@@ -28,26 +50,41 @@ final class HLSDownloadService: @unchecked Sendable {
             await progress(
                 DownloadProgress(phase: .downloading, completedItems: 0, totalItems: plan.segmentCount)
             )
-            let main = try await segmentDownloader.download(
-                playlist: plan.main,
-                prefix: "main",
-                directory: jobDirectory,
-                completedBefore: 0,
-                totalSegments: plan.segmentCount,
+            let progressTracker = SegmentProgressTracker(
+                totalItems: plan.segmentCount,
                 progress: progress
             )
-
+            let main: [DownloadedSegment]
             let audio: [DownloadedSegment]?
             if let audioPlaylist = plan.audio {
-                audio = try await segmentDownloader.download(
+                async let mainDownload = segmentDownloader.download(
+                    playlist: plan.main,
+                    prefix: "main",
+                    directory: jobDirectory,
+                    completedBefore: 0,
+                    totalSegments: plan.segmentCount,
+                    progress: { _ in await progressTracker.segmentCompleted() }
+                )
+                async let audioDownload = segmentDownloader.download(
                     playlist: audioPlaylist,
                     prefix: "audio",
                     directory: jobDirectory,
-                    completedBefore: plan.main.segments.count,
+                    completedBefore: 0,
                     totalSegments: plan.segmentCount,
-                    progress: progress
+                    progress: { _ in await progressTracker.segmentCompleted() }
                 )
+                let downloads = try await (mainDownload, audioDownload)
+                main = downloads.0
+                audio = downloads.1
             } else {
+                main = try await segmentDownloader.download(
+                    playlist: plan.main,
+                    prefix: "main",
+                    directory: jobDirectory,
+                    completedBefore: 0,
+                    totalSegments: plan.segmentCount,
+                    progress: { _ in await progressTracker.segmentCompleted() }
+                )
                 audio = nil
             }
 
@@ -76,4 +113,3 @@ final class HLSDownloadService: @unchecked Sendable {
         }
     }
 }
-

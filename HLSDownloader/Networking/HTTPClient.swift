@@ -17,6 +17,11 @@ final class HTTPClient: @unchecked Sendable {
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieAcceptPolicy = .always
         configuration.httpShouldSetCookies = true
+        configuration.httpMaximumConnectionsPerHost = max(
+            configuration.httpMaximumConnectionsPerHost,
+            6
+        )
+        configuration.httpShouldUsePipelining = true
         configuration.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0",
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.6"

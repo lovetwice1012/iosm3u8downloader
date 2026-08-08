@@ -9,11 +9,12 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
 - 最高帯域variantと既定audio renditionの自動選択
 - MPEG-TS、fMP4 + `EXT-X-MAP`、`EXT-X-BYTERANGE`
-- 最大4並列の断片ダウンロードと一時的な通信エラーの再試行
+- 映像・別音声をまたいだ最大6並列の断片ダウンロードと一時的な通信エラーの再試行
 - HTTP 200のログインHTML・JSON等を断片として誤保存しない内容検査
 - 署名queryなし候補がエラーページを返した場合の同一origin query付き候補への再試行
 - identity `AES-128`（AES-CBC、鍵ローテーション、明示IV/sequence IV）
-- AVFoundationによるMP4作成と、断片単体を開けない場合のplaylist単位連結再試行
+- MPEG-TSはFFmpegKit/FFmpegで再圧縮せずMP4へremuxし、fMP4等はAVFoundationで結合
+- 断片単体を開けない場合のplaylist単位連結再試行
 - 完成MP4の共有・「ファイル」への保存
 
 ## GitHub Actionsで未署名IPAを作る
@@ -33,7 +34,7 @@ CODE_SIGNING_REQUIRED=NO
 AD_HOC_CODE_SIGNING_ALLOWED=NO
 ```
 
-IPA内は標準の `Payload/HLSDownloader.app` 構造です。`_CodeSignature` と `embedded.mobileprovision` がないことをCIで確認してからartifact化するため、後段の個人署名でBundle ID、署名、Provisioning Profileを付けられます。
+IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と内包する動的frameworkの署名、`_CodeSignature`、`embedded.mobileprovision` がないことをCIで確認してからartifact化するため、後段の個人署名でBundle ID、署名、Provisioning Profileを付けられます。
 
 未署名IPA自体は通常の非脱獄iPhoneへ直接インストールできません。利用する個人署名環境で再署名してからインストールしてください。本プロジェクトにはApp Groups、Push、iCloudなど個人署名を複雑にするentitlementを設定していません。
 
@@ -41,7 +42,7 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。`_CodeSignature` �
 
 - `#EXT-X-ENDLIST` を含む終了済みVOD
 - 認証なし、またはURL内の署名queryだけで取得できるHTTP(S)
-- H.264/HEVC + AACなど、端末のAVFoundationが読み込み・MP4出力できるコーデック
+- H.264/HEVC + AACなど、MP4へ格納でき、端末が再生できるコーデック
 - 選択した1つの映像variantと、それに対応する既定音声の全断片
 
 次の形式は、壊れた出力を作らずエラーとして終了します。
@@ -62,6 +63,10 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。`_CodeSignature` �
 - 個人利用でHTTPやLAN上のHLSも扱えるようATSを許可しています。HTTPSだけに限定する場合は `Info.plist` の `NSAllowsArbitraryLoads` を削除してください。
 - 自分が保存する権利を持つコンテンツ、または明示的に許可されたコンテンツだけに使用してください。DRMの回避機能はありません。
 
+## FFmpegとオープンソースライセンス
+
+MPEG-TSをMP4へ詰め替えるため、FFmpegKit Extended / FFmpeg 8.1.2のLGPLビルドを動的frameworkとして使用します。映像・音声は `-c copy` でstream copyし、再エンコードしません。バイナリは `v0.10.5-ios` のURLとSHA-256をSwift Packageで固定しています。正確なsource、checksum、同梱ライブラリのライセンス本文は [`ThirdPartyNotices.txt`](HLSDownloader/Resources/ThirdPartyNotices.txt) に収録しています。
+
 ## プロジェクト構成
 
 ```text
@@ -73,9 +78,10 @@ HLSDownloader/
   HLS/            URL検出、playlist解析、download plan
   Networking/     HTTP retry、Range、並列segment取得
   Crypto/         CommonCrypto AES-128/CBC
-  Media/          AVMutableComposition + MP4 export
+  Media/          MPEG-TS remux + AVMutableComposition + MP4 export
   Persistence/    job cache and Exports folder
 HLSDownloaderTests/
+Vendor/HLSFFmpegBridge/  pinned binary package + C shim
 .github/workflows/build-unsigned-ipa.yml
 ```
 

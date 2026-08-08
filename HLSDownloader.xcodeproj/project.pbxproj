@@ -26,6 +26,13 @@
 		B10000000000000000000011 /* AttributeListParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* AttributeListParserTests.swift */; };
 		B10000000000000000000012 /* URIResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* URIResolverTests.swift */; };
 		B10000000000000000000013 /* PlaylistParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* PlaylistParserTests.swift */; };
+		B10000000000000000000014 /* TransportStreamRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* TransportStreamRemuxer.swift */; };
+		B10000000000000000000015 /* TransportStreamRemuxerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* TransportStreamRemuxerTests.swift */; };
+		B10000000000000000000016 /* ThirdPartyNotices.txt in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001A /* ThirdPartyNotices.txt */; };
+		B10000000000000000000017 /* sample-h264-aac.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* sample-h264-aac.ts */; };
+		B10000000000000000000018 /* sample-h264-video-offset.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001C /* sample-h264-video-offset.ts */; };
+		B10000000000000000000019 /* sample-aac-audio-offset.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001D /* sample-aac-audio-offset.ts */; };
+		B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */ = {isa = PBXBuildFile; productRef = G20000000000000000000001 /* HLSFFmpegBridge */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -62,6 +69,12 @@
 		A10000000000000000000015 /* AttributeListParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttributeListParserTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000016 /* URIResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URIResolverTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* PlaylistParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaylistParserTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000018 /* TransportStreamRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Media/TransportStreamRemuxer.swift; sourceTree = "<group>"; };
+		A10000000000000000000019 /* TransportStreamRemuxerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportStreamRemuxerTests.swift; sourceTree = "<group>"; };
+		A1000000000000000000001A /* ThirdPartyNotices.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = Resources/ThirdPartyNotices.txt; sourceTree = "<group>"; };
+		A1000000000000000000001B /* sample-h264-aac.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-h264-aac.ts"; sourceTree = "<group>"; };
+		A1000000000000000000001C /* sample-h264-video-offset.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-h264-video-offset.ts"; sourceTree = "<group>"; };
+		A1000000000000000000001D /* sample-aac-audio-offset.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-aac-audio-offset.ts"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -69,6 +82,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -108,10 +122,12 @@
 				A1000000000000000000000C /* SegmentDownloader.swift */,
 				A1000000000000000000000D /* AES128CBCDecryptor.swift */,
 				A1000000000000000000000E /* MP4Composer.swift */,
+				A10000000000000000000018 /* TransportStreamRemuxer.swift */,
 				A1000000000000000000000F /* FileStore.swift */,
 				A10000000000000000000010 /* HLSDownloader-Bridging-Header.h */,
 				A10000000000000000000011 /* Info.plist */,
 				A10000000000000000000012 /* Assets.xcassets */,
+				A1000000000000000000001A /* ThirdPartyNotices.txt */,
 			);
 			path = HLSDownloader;
 			sourceTree = "<group>";
@@ -122,8 +138,20 @@
 				A10000000000000000000015 /* AttributeListParserTests.swift */,
 				A10000000000000000000016 /* URIResolverTests.swift */,
 				A10000000000000000000017 /* PlaylistParserTests.swift */,
+				A10000000000000000000019 /* TransportStreamRemuxerTests.swift */,
+				E10000000000000000000005 /* Fixtures */,
 			);
 			path = HLSDownloaderTests;
+			sourceTree = "<group>";
+		};
+		E10000000000000000000005 /* Fixtures */ = {
+			isa = PBXGroup;
+			children = (
+				A1000000000000000000001B /* sample-h264-aac.ts */,
+				A1000000000000000000001C /* sample-h264-video-offset.ts */,
+				A1000000000000000000001D /* sample-aac-audio-offset.ts */,
+			);
+			path = Fixtures;
 			sourceTree = "<group>";
 		};
 		E10000000000000000000004 /* Products */ = {
@@ -151,6 +179,9 @@
 			dependencies = (
 			);
 			name = HLSDownloader;
+			packageProductDependencies = (
+				G20000000000000000000001 /* HLSFFmpegBridge */,
+			);
 			productName = HLSDownloader;
 			productReference = A10000000000000000000013 /* HLSDownloader.app */;
 			productType = "com.apple.product-type.application";
@@ -203,6 +234,9 @@
 			);
 			mainGroup = E10000000000000000000001;
 			productRefGroup = E10000000000000000000004 /* Products */;
+			packageReferences = (
+				G10000000000000000000001 /* XCLocalSwiftPackageReference "Vendor/HLSFFmpegBridge" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -218,6 +252,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B10000000000000000000010 /* Assets.xcassets in Resources */,
+				B10000000000000000000016 /* ThirdPartyNotices.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -225,6 +260,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B10000000000000000000017 /* sample-h264-aac.ts in Resources */,
+				B10000000000000000000018 /* sample-h264-video-offset.ts in Resources */,
+				B10000000000000000000019 /* sample-aac-audio-offset.ts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -249,6 +287,7 @@
 				B1000000000000000000000C /* SegmentDownloader.swift in Sources */,
 				B1000000000000000000000D /* AES128CBCDecryptor.swift in Sources */,
 				B1000000000000000000000E /* MP4Composer.swift in Sources */,
+				B10000000000000000000014 /* TransportStreamRemuxer.swift in Sources */,
 				B1000000000000000000000F /* FileStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -260,6 +299,7 @@
 				B10000000000000000000011 /* AttributeListParserTests.swift in Sources */,
 				B10000000000000000000012 /* URIResolverTests.swift in Sources */,
 				B10000000000000000000013 /* PlaylistParserTests.swift in Sources */,
+				B10000000000000000000015 /* TransportStreamRemuxerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -272,6 +312,21 @@
 			targetProxy = C30000000000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		G10000000000000000000001 /* XCLocalSwiftPackageReference "Vendor/HLSFFmpegBridge" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Vendor/HLSFFmpegBridge;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		G20000000000000000000001 /* HLSFFmpegBridge */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = G10000000000000000000001 /* XCLocalSwiftPackageReference "Vendor/HLSFFmpegBridge" */;
+			productName = HLSFFmpegBridge;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		F10000000000000000000001 /* Debug */ = {

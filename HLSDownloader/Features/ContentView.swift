@@ -148,6 +148,9 @@ struct ContentView: View {
             Text("保存する権利または許可のあるコンテンツにだけ使用してください。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+            Text("MPEG-TSのMP4化にはFFmpegKit / FFmpeg（LGPL-3.0）を使用します。[ライセンス](https://github.com/lovetwice1012/iosm3u8downloader/blob/main/HLSDownloader/Resources/ThirdPartyNotices.txt)")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
         }
         .font(.subheadline)
         .cardStyle()
@@ -165,4 +168,3 @@ private extension View {
 #Preview {
     ContentView()
 }
-
