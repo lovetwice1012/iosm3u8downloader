@@ -198,10 +198,7 @@ final class TransportStreamRemuxerTests: XCTestCase {
         guard declaredBytes <= UInt64(editList.payload.upperBound - entryOffset) else {
             throw MP4InspectionError.malformed("truncated elst entries")
         }
-        guard mediaTime == -1 else {
-            throw MP4InspectionError.malformed("first elst entry is not empty")
-        }
-        return duration
+        return mediaTime == -1 ? duration : 0
     }
 
     private func mp4Boxes(in data: Data, range: Range<Int>) throws -> [MP4Box] {

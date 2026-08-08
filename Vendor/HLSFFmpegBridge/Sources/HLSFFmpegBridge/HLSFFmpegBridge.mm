@@ -80,9 +80,11 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         "-loglevel", "warning",
         "-y",
         "-copyts",
+        "-start_at_zero",
         "-fflags", "+genpts",
         "-f", "mpegts",
         "-i", input_path,
+        "-isync", "0",
         "-fflags", "+genpts",
         "-f", "mpegts",
         "-i", audio_input_path,
@@ -91,7 +93,6 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         "-sn",
         "-dn",
         "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         output_path
     };
