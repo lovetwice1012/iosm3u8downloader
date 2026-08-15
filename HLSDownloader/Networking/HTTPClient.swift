@@ -576,9 +576,9 @@ final class HTTPClient: @unchecked Sendable {
             let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedName.isEmpty,
                   trimmedName.utf8.count <= 64,
-                  trimmedName.unicodeScalars.allSatisfy {
+                  trimmedName.unicodeScalars.allSatisfy({
                       tokenCharacters.contains($0)
-                  },
+                  }),
                   !forbidden.contains(trimmedName.lowercased()),
                   value.utf8.count <= 8_192,
                   !value.contains("\r"),
