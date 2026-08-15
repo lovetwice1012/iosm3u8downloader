@@ -2,6 +2,10 @@ import Foundation
 
 protocol HLSDownloadServicing: Sendable {
     func discover(input: String) async throws -> HLSDiscoveryResult
+    @MainActor
+    func preparePlaybackCapture(input: String) async throws -> PlaybackCaptureSession
+    @MainActor
+    func finishPlaybackCapture(_ session: PlaybackCaptureSession) async -> [HLSCandidate]
     func download(
         candidate: HLSCandidate,
         progress: @escaping ProgressHandler
@@ -104,10 +108,46 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         diagnostics.renderedText()
     }
 
+    @MainActor
+    func preparePlaybackCapture(input: String) async throws -> PlaybackCaptureSession {
+        let url = try URIResolver.normalizeInput(input)
+        guard url.host != nil, url.user == nil, url.password == nil else {
+            throw HLSError.invalidURL
+        }
+        diagnostics.record(
+            "playback",
+            "interactive inspection preparing \(DiagnosticPrivacy.urlSummary(url))"
+        )
+        let session = PlaybackCaptureSession(
+            url: url,
+            seedCookies: client.cookies(for: url),
+            diagnosticSink: diagnostics.sink
+        )
+        await session.start()
+        return session
+    }
+
+    @MainActor
+    func finishPlaybackCapture(_ session: PlaybackCaptureSession) async -> [HLSCandidate] {
+        let inspection = await session.snapshotAndStop()
+        let candidates = sourceResolver.importDynamicInspection(
+            inspection,
+            rootURL: session.rootURL
+        )
+        diagnostics.record(
+            "playback",
+            "interactive inspection finished references=\(inspection.media.count) candidates=\(candidates.count)"
+        )
+        return candidates
+    }
+
     func download(input: String, progress: @escaping ProgressHandler) async throws -> DownloadResult {
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
         let document = try await sourceResolver.resolve(input: input)
-        return try await download(document: document, progress: progress)
+        return try await downloadWithBackgroundExecution(
+            document: document,
+            progress: progress
+        )
     }
 
     func download(
@@ -137,7 +177,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             )
             throw error
         }
-        return try await download(document: document, progress: progress)
+        return try await downloadWithBackgroundExecution(
+            document: document,
+            progress: progress
+        )
     }
 
     func thumbnailData(for candidate: HLSCandidate) async -> Data? {
@@ -161,6 +204,25 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             return payload.data
         } catch {
             return nil
+        }
+    }
+
+    private func downloadWithBackgroundExecution(
+        document: PlaylistDocument,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        try await BackgroundExecutionCoordinator.shared.run(
+            title: "HLS動画を保存",
+            subtitle: "ダウンロードを準備中",
+            diagnosticSink: diagnostics.sink
+        ) { [self] backgroundProgress in
+            await backgroundProgress.report(
+                DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
+            )
+            return try await download(document: document) { update in
+                await backgroundProgress.report(update)
+                await progress(update)
+            }
         }
     }
 

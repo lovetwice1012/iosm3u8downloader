@@ -432,6 +432,56 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.candidates.first?.requestReferer, pageURL)
     }
 
+    func testInteractiveInspectionImportsCookiesAndBlocksPrivateTargetsFromPublicPage() throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let resolver = SourceResolver(client: client)
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let publicManifest = try XCTUnwrap(
+            URL(string: "https://cdn.example/runtime/master.m3u8?token=secret")
+        )
+        let privateManifest = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:8080/private/master.m3u8")
+        )
+        let cookie = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "playback",
+                .value: "private-value",
+                .domain: "cdn.example",
+                .path: "/"
+            ])
+        )
+        let inspection = DynamicPageInspection(
+            media: [
+                DynamicMediaReference(
+                    url: privateManifest,
+                    pageURL: rootURL,
+                    title: nil,
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime
+                ),
+                DynamicMediaReference(
+                    url: publicManifest,
+                    pageURL: rootURL,
+                    title: "Playback candidate",
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime
+                )
+            ],
+            cookies: [cookie]
+        )
+
+        let candidates = resolver.importDynamicInspection(inspection, rootURL: rootURL)
+
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.playlistURL, publicManifest)
+        XCTAssertEqual(candidates.first?.requestReferer, rootURL)
+        XCTAssertEqual(client.cookies(for: publicManifest).map(\.name), ["playback"])
+    }
+
     func testDoesNotAutomaticallyFetchPrivateIframeFromPublicPage() async throws {
         let recorder = DiscoveryRequestRecorder()
         let resolver = makeResolver()

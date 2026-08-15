@@ -126,6 +126,28 @@ final class SourceResolver: Sendable {
         return try await load(first.request, referer: first.requestReferer)
     }
 
+    func importDynamicInspection(
+        _ inspection: DynamicPageInspection,
+        rootURL: URL
+    ) -> [HLSCandidate] {
+        client.storeCookies(inspection.cookies)
+        var discovered = Set<String>()
+        var accepted = Set<String>()
+        var results: [HLSCandidate] = []
+        appendDynamicCandidates(
+            inspection,
+            rootURL: rootURL,
+            discovered: &discovered,
+            accepted: &accepted,
+            results: &results
+        )
+        log(
+            "playback",
+            "interactive inspection imported references=\(inspection.media.count) candidates=\(results.count) cookies=\(inspection.cookies.count)"
+        )
+        return results
+    }
+
     func load(_ candidates: URLCandidates, referer: URL?) async throws -> PlaylistDocument {
         var lastError: Error = HLSError.invalidPlaylist("リンク先がm3u8ではありません")
         for candidate in candidates.all {
@@ -427,7 +449,14 @@ final class SourceResolver: Sendable {
     ) {
         for reference in inspection.media where results.count < maximumResults {
             guard discovered.count < maximumCandidateReferences else { break }
-            guard isSafeAutomaticURL(reference.url) else { continue }
+            guard isSafeAutomaticURL(reference.url),
+                  AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: reference.url
+                  ) else {
+                log("security", "dynamic candidate blocked by private-network policy")
+                continue
+            }
             let pageURL = isSafeAutomaticURL(reference.pageURL) ? reference.pageURL : rootURL
             let attemptKey = candidateKey(url: reference.url, referer: pageURL)
             _ = discovered.insert(attemptKey)

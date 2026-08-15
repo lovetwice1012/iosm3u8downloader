@@ -35,6 +35,8 @@
 		B1000000000000000000001A /* HTMLMediaExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001E /* HTMLMediaExtractor.swift */; };
 		B1000000000000000000001B /* WebPageInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001F /* WebPageInspector.swift */; };
 		B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000020 /* HTMLDiscoveryTests.swift */; };
+		B1000000000000000000001D /* BackgroundExecutionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */; };
+		B1000000000000000000001E /* BackgroundExecutionCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */; };
 		B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */ = {isa = PBXBuildFile; productRef = G20000000000000000000001 /* HLSFFmpegBridge */; };
 /* End PBXBuildFile section */
 
@@ -81,6 +83,8 @@
 		A1000000000000000000001E /* HTMLMediaExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/HTMLMediaExtractor.swift; sourceTree = "<group>"; };
 		A1000000000000000000001F /* WebPageInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/WebPageInspector.swift; sourceTree = "<group>"; };
 		A10000000000000000000020 /* HTMLDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLDiscoveryTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Background/BackgroundExecutionCoordinator.swift; sourceTree = "<group>"; };
+		A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundExecutionCoordinatorTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -124,6 +128,7 @@
 				A10000000000000000000008 /* SourceResolver.swift */,
 				A1000000000000000000001E /* HTMLMediaExtractor.swift */,
 				A1000000000000000000001F /* WebPageInspector.swift */,
+				A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */,
 				A10000000000000000000009 /* DownloadPlanBuilder.swift */,
 				A1000000000000000000000A /* HLSDownloadService.swift */,
 				A1000000000000000000000B /* HTTPClient.swift */,
@@ -148,6 +153,7 @@
 				A10000000000000000000017 /* PlaylistParserTests.swift */,
 				A10000000000000000000019 /* TransportStreamRemuxerTests.swift */,
 				A10000000000000000000020 /* HTMLDiscoveryTests.swift */,
+				A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */,
 				E10000000000000000000005 /* Fixtures */,
 			);
 			path = HLSDownloaderTests;
@@ -292,6 +298,7 @@
 				B10000000000000000000008 /* SourceResolver.swift in Sources */,
 				B1000000000000000000001A /* HTMLMediaExtractor.swift in Sources */,
 				B1000000000000000000001B /* WebPageInspector.swift in Sources */,
+				B1000000000000000000001D /* BackgroundExecutionCoordinator.swift in Sources */,
 				B10000000000000000000009 /* DownloadPlanBuilder.swift in Sources */,
 				B1000000000000000000000A /* HLSDownloadService.swift in Sources */,
 				B1000000000000000000000B /* HTTPClient.swift in Sources */,
@@ -312,6 +319,7 @@
 				B10000000000000000000013 /* PlaylistParserTests.swift in Sources */,
 				B10000000000000000000015 /* TransportStreamRemuxerTests.swift in Sources */,
 				B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */,
+				B1000000000000000000001E /* BackgroundExecutionCoordinatorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

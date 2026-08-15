@@ -26,6 +26,10 @@ final class DownloadViewModel: ObservableObject {
     @Published private(set) var diagnosticLog = ""
     @Published private(set) var isCancelling = false
     @Published private(set) var isOperationActive = false
+    @Published private(set) var playbackCaptureSession: PlaybackCaptureSession?
+    @Published private(set) var isPlaybackCapturePresented = false
+    @Published private(set) var isPreparingPlaybackCapture = false
+    @Published private(set) var isFinalizingPlaybackCapture = false
     @Published var errorMessage: String?
 
     private let service: any HLSDownloadServicing
@@ -34,6 +38,7 @@ final class DownloadViewModel: ObservableObject {
     private var diagnosticSessionID: UUID?
     private var cancellingOperationIDs = Set<UUID>()
     private var discoveredInput: String?
+    private var playbackCaptureInput: String?
     private var attemptedThumbnailIDs = Set<UUID>()
     private var thumbnailIDsInFlight = Set<UUID>()
 
@@ -46,7 +51,11 @@ final class DownloadViewModel: ObservableObject {
     }
 
     var isBusy: Bool {
-        isOperationActive || isCancelling
+        isOperationActive
+            || isCancelling
+            || playbackCaptureSession != nil
+            || isPreparingPlaybackCapture
+            || isFinalizingPlaybackCapture
     }
 
     var canStart: Bool {
@@ -106,6 +115,59 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
+    func startPlaybackCapture() {
+        guard canStart else { return }
+        task?.cancel()
+        outputURL = nil
+        downloadedSegmentCount = 0
+        errorMessage = nil
+        service.resetDiagnosticLog()
+        diagnosticLog = service.diagnosticLogText()
+
+        let input = inputURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let operationID = UUID()
+        let diagnosticSessionID = UUID()
+        self.operationID = operationID
+        self.diagnosticSessionID = diagnosticSessionID
+        isOperationActive = true
+        isPreparingPlaybackCapture = true
+        progress = DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
+
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let session = try await service.preparePlaybackCapture(input: input)
+                if !Task.isCancelled, isCurrentOperation(operationID, input: input) {
+                    playbackCaptureSession = session
+                    playbackCaptureInput = input
+                    discoveredInput = input
+                    isPlaybackCapturePresented = true
+                    progress = DownloadProgress(phase: .idle, completedItems: 0, totalItems: 0)
+                } else {
+                    _ = await service.finishPlaybackCapture(session)
+                }
+            } catch {
+                if self.operationID == operationID { handle(error) }
+            }
+
+            isPreparingPlaybackCapture = false
+            if self.diagnosticSessionID == diagnosticSessionID { refreshDiagnosticLog() }
+            finishOperation(operationID)
+        }
+    }
+
+    func finishPlaybackCapture() {
+        finishPlaybackCapture(mergingResults: true)
+    }
+
+    func playbackCaptureDidEnterBackground() {
+        if playbackCaptureSession != nil {
+            finishPlaybackCapture()
+        } else if isPreparingPlaybackCapture {
+            cancelActiveOperation()
+        }
+    }
+
     func download(_ candidate: HLSCandidate) {
         guard !isBusy, candidates.contains(where: { $0.id == candidate.id }) else { return }
         task?.cancel()
@@ -157,6 +219,7 @@ final class DownloadViewModel: ObservableObject {
     }
 
     func cancel() {
+        guard !isFinalizingPlaybackCapture else { return }
         cancelActiveOperation()
         refreshDiagnosticLog()
     }
@@ -195,6 +258,83 @@ final class DownloadViewModel: ObservableObject {
             isCancelling = !cancellingOperationIDs.isEmpty
         }
         isOperationActive = false
+    }
+
+    private func finishPlaybackCapture(mergingResults: Bool) {
+        guard !isFinalizingPlaybackCapture,
+              let session = playbackCaptureSession else {
+            return
+        }
+
+        isFinalizingPlaybackCapture = true
+        errorMessage = nil
+        let captureInput = playbackCaptureInput
+        let operationID = UUID()
+        let diagnosticSessionID = self.diagnosticSessionID ?? UUID()
+        self.operationID = operationID
+        self.diagnosticSessionID = diagnosticSessionID
+        isOperationActive = true
+
+        task = Task { [weak self] in
+            guard let self else { return }
+            let capturedCandidates = await service.finishPlaybackCapture(session)
+            let inputStillMatches = captureInput == inputURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if mergingResults, inputStillMatches {
+                mergeCandidates(capturedCandidates)
+                if capturedCandidates.isEmpty, candidates.isEmpty {
+                    errorMessage = "再生通信からHLS候補を検出できませんでした。動画を再生してから、もう一度お試しください。"
+                }
+            }
+
+            if playbackCaptureSession === session {
+                playbackCaptureSession = nil
+                playbackCaptureInput = nil
+                isPlaybackCapturePresented = false
+            }
+            isFinalizingPlaybackCapture = false
+            progress = DownloadProgress(phase: .idle, completedItems: 0, totalItems: 0)
+            if self.diagnosticSessionID == diagnosticSessionID { refreshDiagnosticLog() }
+            finishOperation(operationID)
+        }
+    }
+
+    private func mergeCandidates(_ newCandidates: [HLSCandidate]) {
+        for candidate in newCandidates {
+            let identity = candidateIdentity(candidate)
+            if let index = candidates.firstIndex(where: { candidateIdentity($0) == identity }) {
+                let existing = candidates[index]
+                candidates[index] = HLSCandidate(
+                    id: existing.id,
+                    request: existing.request.sameOriginQueryFallback != nil
+                        ? existing.request : candidate.request,
+                    requestReferer: existing.requestReferer ?? candidate.requestReferer,
+                    document: existing.document ?? candidate.document,
+                    pageURL: existing.pageURL,
+                    title: existing.title ?? candidate.title,
+                    thumbnailURL: existing.thumbnailURL ?? candidate.thumbnailURL,
+                    iframeDepth: min(existing.iframeDepth, candidate.iframeDepth),
+                    origin: existing.origin
+                )
+            } else {
+                candidates.append(candidate)
+            }
+        }
+    }
+
+    private func candidateIdentity(_ candidate: HLSCandidate) -> String {
+        canonicalURL(candidate.playlistURL)
+            + "\n"
+            + canonicalURL(candidate.requestReferer ?? candidate.pageURL)
+    }
+
+    private func canonicalURL(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        components.fragment = nil
+        return components.string ?? url.absoluteString
     }
 
     private func cancelActiveOperation() {

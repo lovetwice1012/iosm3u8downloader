@@ -8,6 +8,7 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - `video` / `source`タグ、data属性、ページ内プレイヤー設定からm3u8候補を抽出
 - `iframe` / `srcdoc`を最大3階層まで探索し、候補ごとの検出元Refererを維持
 - WebKitでJavaScript実行後のDOM変更、`fetch` / XHR、resource timingを全frameから監視
+- **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS候補を追加
 - HTML入力では候補URL・検出元・サムネイルを一覧表示し、選択した候補だけを検証して保存
 - playlistごとの実URL（リダイレクト後）を基準にした相対URL補完
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
@@ -54,14 +55,13 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 
 - 終端のないlive/event playlist
 - FairPlay、`SAMPLE-AES`、非identity key format
-- Safari等のログインCookieを必要とするページ
-- 再生ボタン等のユーザー操作後にだけURLを生成するページ
+- Safari等、別アプリのログインCookieだけを必要とするページ（αブラウザ内でログインできるページは、その非永続セッションのCookieを選択後のダウンロードへ引き継ぎます）
 - Worker / Service Worker内だけでHLS URLを生成し、ページ側へURLを公開しないプレイヤー
 - `#EXT-X-GAP` を含むplaylist
 - `#EXT-X-DISCONTINUITY` を含むplaylist
 - AVFoundationがMP4へ出力できないコーデック
 
-ダウンロードとMP4化は現在foreground処理です。長い動画では完了までアプリを前面に置いてください。途中でキャンセルすると、そのジョブの一時断片と未完成MP4を削除します。
+再生通信の解析用ブラウザはforeground専用です。解析中にアプリをbackgroundへ移すと、その時点までの候補とCookieを確定して解析を終了します。候補を選んだ後のダウンロードとMP4化は、iOS 26以降ではジョブごとの一意なidentifierでContinued Processing Taskを動的に登録・要求し、システムが受理した場合はbackgroundでも継続します。個人再署名でBundle IDが変更されてbackground task identifierが一致しない場合、またはiOS 17〜25では、`beginBackgroundTask`による短時間の完了猶予へ自動的にフォールバックします。システムのリソース制約、Live Activityからの取消、Appスイッチャーでの強制終了では中断されます。途中でキャンセルすると、そのジョブの一時断片と未完成MP4を削除します。
 
 候補が不足する場合や取得に失敗した場合は、画面下部の「診断ログ」を更新してコピーまたは共有できます。静的HTML、iframe、WebKit動的監視、playlist検証、ダウンロード、MP4結合の各段階と件数・失敗分類を記録します。URLは実URLの代わりに実行中だけ有効な識別子と形状情報を残し、query値、Cookie、Referer、HTML本文、タイトルは記録しません。
 
@@ -69,10 +69,17 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 
 - 署名queryや鍵URLを画面・ログへ出しません。
 - 動的プレイヤー解析は非永続WebKitセッションで行い、その解析中に得たCookieは対象ジョブの通信だけに使用します。
+- αブラウザの候補表示ではURLのhost、pathの深さ、拡張子だけを示し、path・query内の署名値そのものは表示しません。
 - 公開ページからlocalhost・LANへのiframe、サムネイル、リダイレクトは自動追跡しません。
 - queryの自動引き継ぎは、通常のRFC URL解決がHTTPエラーになった場合に使う「同一origin限定」の候補です。別CDNへtokenを転送しません。
 - 個人利用でHTTPやLAN上のHLSも扱えるようATSを許可しています。HTTPSだけに限定する場合は `Info.plist` の `NSAllowsArbitraryLoads` を削除してください。
 - 自分が保存する権利を持つコンテンツ、または明示的に許可されたコンテンツだけに使用してください。DRMの回避機能はありません。
+
+### ローカルVPN / 独自CAについて
+
+ローカルVPN targetはこの個人署名向けIPAには含めていません。`NEPacketTunnelProvider`にはProvisioning Profileで許可されたNetwork Extension entitlementが必要で、無料のPersonal Team署名では有効化できないためです。端末へ独自ルートCAを導入して「完全な信頼」を有効化し、MITM proxyへ通信を通せば、証明書pinningのない通常TLSは技術的には復号できます。ただし、CAの導入だけでは通信はproxyへ流れず、pinning・独自TLS・QUIC等では失敗します。端末全体の通信を扱うVPN/MITMを、動作しない状態や秘密鍵管理が不十分な状態で同梱することはしていません。
+
+iOS 17以降のWebKitには、特定の`WKWebsiteDataStore`だけをHTTP CONNECT proxyへ通すAPIがあります。将来の高度解析を追加する場合は、端末全体のVPNではなくαブラウザ限定の明示的なdebug modeとして分離する方針です。
 
 ## FFmpegとオープンソースライセンス
 

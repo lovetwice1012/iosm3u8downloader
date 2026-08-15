@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+
 jobs:
   build:
     name: Build and package unsigned IPA
@@ -22,6 +25,7 @@ jobs:
       - name: Show Xcode environment
         run: |
           test "$(uname -m)" = "arm64"
+          xcodebuild -version | grep -F "Xcode 26.3"
           uname -a
           xcodebuild -version
           xcodebuild -showsdks
@@ -50,6 +54,10 @@ jobs:
           test -f "$APP_PATH/HLSDownloader"
           test -f "$APP_PATH/Frameworks/ffmpegkit.framework/ffmpegkit"
           test -f "$APP_PATH/ThirdPartyNotices.txt"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BGTaskSchedulerPermittedIdentifiers:0' "$APP_PATH/Info.plist")" = \
+            'com.example.HLSDownloader.continued-download.*'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes:0' "$APP_PATH/Info.plist")" = \
+            'processing'
 
           rm -rf Payload artifacts
           mkdir -p Payload artifacts

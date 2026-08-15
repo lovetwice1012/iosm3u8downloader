@@ -1,7 +1,9 @@
 import Foundation
 import SwiftUI
+import WebKit
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = DownloadViewModel()
     @State private var diagnosticLogExpanded = false
     @FocusState private var urlFieldFocused: Bool
@@ -39,6 +41,30 @@ struct ContentView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("HLS Downloader")
         }
+        .fullScreenCover(
+            isPresented: playbackCapturePresentation,
+            onDismiss: { viewModel.finishPlaybackCapture() }
+        ) {
+            if let session = viewModel.playbackCaptureSession {
+                PlaybackCaptureBrowser(session: session, viewModel: viewModel)
+            } else {
+                ProgressView("再生解析を準備中…")
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background {
+                viewModel.playbackCaptureDidEnterBackground()
+            }
+        }
+    }
+
+    private var playbackCapturePresentation: Binding<Bool> {
+        Binding(
+            get: { viewModel.isPlaybackCapturePresented },
+            set: { isPresented in
+                if !isPresented { viewModel.finishPlaybackCapture() }
+            }
+        )
     }
 
     private var introduction: some View {
@@ -87,6 +113,22 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!viewModel.canStart)
             }
+
+            Divider()
+
+            Button {
+                urlFieldFocused = false
+                viewModel.startPlaybackCapture()
+            } label: {
+                Label("再生しながら解析（アルファ）", systemImage: "waveform.path.ecg.rectangle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!viewModel.canStart)
+
+            Text("ページをアプリ内で開き、実際に再生操作をしてHLS通信を検出します。検出後に解析を終了すると候補一覧へ追加します。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
         .cardStyle()
     }
@@ -102,7 +144,7 @@ struct ContentView: View {
                     .monospacedDigit()
             }
 
-            Text("保存する動画を選んでください。クエリ値は画面上では伏せていますが、ダウンロード時には元のURLを使用します。")
+            Text("保存する動画を選んでください。URLのパスとクエリ値は画面上では伏せていますが、ダウンロード時には元のURLを使用します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
@@ -193,7 +235,7 @@ struct ContentView: View {
     private var progressCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(viewModel.isCancelling ? "キャンセル処理中" : viewModel.progress.phase.title)
+                Text(progressTitle)
                     .font(.headline)
                 Spacer()
                 if viewModel.progress.totalItems > 0 {
@@ -212,7 +254,7 @@ struct ContentView: View {
                 ProgressView()
             }
 
-            if !viewModel.isCancelling {
+            if !viewModel.isCancelling && !viewModel.isFinalizingPlaybackCapture {
                 Button("キャンセル", role: .destructive) {
                     viewModel.cancel()
                 }
@@ -220,6 +262,13 @@ struct ContentView: View {
             }
         }
         .cardStyle()
+    }
+
+    private var progressTitle: String {
+        if viewModel.isCancelling { return "キャンセル処理中" }
+        if viewModel.isPreparingPlaybackCapture { return "再生解析を準備中" }
+        if viewModel.isFinalizingPlaybackCapture { return "検出結果を確定中" }
+        return viewModel.progress.phase.title
     }
 
     private func errorCard(_ message: String) -> some View {
@@ -308,7 +357,10 @@ struct ContentView: View {
             Label("対応範囲", systemImage: "info.circle")
                 .font(.headline)
             Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128に対応します。")
-            Text("再生操作をしないとURLが生成されないサイト、Safariのログイン状態、Worker内だけの通信、ライブ配信、FairPlay/SAMPLE-AESには対応できない場合があります。")
+            Text("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。Safariのログイン状態、Worker内だけの通信、ライブ配信、FairPlay/SAMPLE-AESには対応できない場合があります。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("再生解析は前面表示中だけ動作します。候補選択後の保存はiOS 26でバックグラウンド継続を要求し、利用できない署名・OSでは短時間の完了猶予へ切り替わります。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Text("保存する権利または許可のあるコンテンツにだけ使用してください。")
@@ -323,16 +375,141 @@ struct ContentView: View {
     }
 
     private func displayURL(_ url: URL) -> String {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return url.absoluteString
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let rawScheme = components?.scheme?.lowercased() ?? ""
+        let scheme = ["http", "https"].contains(rawScheme) ? rawScheme : "other"
+        let rawHost = components?.host ?? "unknown-host"
+        let host = rawHost.contains(":") ? "[\(rawHost)]" : rawHost
+        let port = components?.port.map { ":\($0)" } ?? ""
+        let pathDepth = url.path.split(separator: "/").count
+        let extensionClass: String
+        switch url.pathExtension.lowercased() {
+        case "m3u8": extensionClass = "m3u8"
+        case "": extensionClass = "なし"
+        default: extensionClass = "その他"
         }
-        let hadQuery = components.percentEncodedQuery != nil
-        components.user = nil
-        components.password = nil
-        components.fragment = nil
-        components.percentEncodedQuery = nil
-        return (components.string ?? url.absoluteString) + (hadQuery ? "?…" : "")
+        let queryClass = components?.percentEncodedQuery == nil ? "なし" : "あり"
+        return "\(scheme)://\(host)\(port)/…（path \(pathDepth)階層・ext \(extensionClass)・query \(queryClass)）"
     }
+}
+
+private struct PlaybackCaptureBrowser: View {
+    @ObservedObject var session: PlaybackCaptureSession
+    @ObservedObject var viewModel: DownloadViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            PlaybackCaptureWebView(webView: session.webView)
+                .allowsHitTesting(!viewModel.isFinalizingPlaybackCapture)
+                .overlay {
+                    if viewModel.isFinalizingPlaybackCapture {
+                        ZStack {
+                            Color.black.opacity(0.28)
+                            ProgressView("検出結果を確定中…")
+                                .padding(18)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                        }
+                    }
+                }
+            Divider()
+            controls
+        }
+        .background(Color(.systemBackground))
+        .interactiveDismissDisabled()
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Label("再生解析", systemImage: "waveform.path.ecg.rectangle")
+                    .font(.headline)
+                Text("ALPHA")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.orange)
+                Spacer()
+                Text("HLS候補 \(session.references.count)件")
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("ページ内の再生ボタンを押して動画を少し再生してください。候補が増えたら「解析を終了」を押します。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if let host = session.currentURL?.host {
+                Text("表示中: \(host)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 12) {
+            Button {
+                session.goBack()
+            } label: {
+                Image(systemName: "chevron.backward")
+                    .frame(width: 28, height: 28)
+            }
+            .disabled(!session.canGoBack || viewModel.isFinalizingPlaybackCapture)
+            .accessibilityLabel("戻る")
+
+            Button {
+                session.goForward()
+            } label: {
+                Image(systemName: "chevron.forward")
+                    .frame(width: 28, height: 28)
+            }
+            .disabled(!session.canGoForward || viewModel.isFinalizingPlaybackCapture)
+            .accessibilityLabel("進む")
+
+            Button {
+                session.reload()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 28, height: 28)
+            }
+            .disabled(viewModel.isFinalizingPlaybackCapture)
+            .accessibilityLabel("再読み込み")
+
+            Spacer()
+
+            Button {
+                viewModel.finishPlaybackCapture()
+            } label: {
+                if viewModel.isFinalizingPlaybackCapture {
+                    ProgressView()
+                        .frame(minWidth: 108)
+                } else {
+                    Label("解析を終了", systemImage: "checkmark.circle.fill")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.isFinalizingPlaybackCapture)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+}
+
+private struct PlaybackCaptureWebView: UIViewRepresentable {
+    let webView: WKWebView
+
+    func makeUIView(context: Context) -> WKWebView {
+        webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
 private extension View {

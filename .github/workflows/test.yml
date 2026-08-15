@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+
 jobs:
   test:
     name: Run iOS Simulator tests
@@ -22,6 +25,7 @@ jobs:
       - name: Show Xcode environment
         run: |
           test "$(uname -m)" = "arm64"
+          xcodebuild -version | grep -F "Xcode 26.3"
           uname -a
           xcodebuild -version
           xcodebuild -showsdks
