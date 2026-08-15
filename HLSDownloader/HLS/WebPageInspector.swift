@@ -295,9 +295,12 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
 
         let frameURL = trustedFrameURL(from: message.frameInfo) ?? rootURL
         guard let url = resolvedWebURL(rawURL, relativeTo: frameURL) else { return }
-        let thumbnailURL = (body["poster"] as? String).flatMap {
-            guard $0.utf8.count <= Self.maximumURLLength else { return nil }
-            return resolvedWebURL($0, relativeTo: frameURL)
+        let thumbnailURL: URL?
+        if let rawPoster = body["poster"] as? String,
+           rawPoster.utf8.count <= Self.maximumURLLength {
+            thumbnailURL = resolvedWebURL(rawPoster, relativeTo: frameURL)
+        } else {
+            thumbnailURL = nil
         }
         let title = limitedText(body["title"] as? String, maximumLength: 256)
         let origin: HLSCandidateOrigin
