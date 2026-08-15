@@ -35,6 +35,51 @@ struct DownloadResult: Sendable {
     let segmentCount: Int
 }
 
+struct PlaylistDocument: Sendable {
+    let text: String
+    let effectiveURL: URL
+    let referer: URL?
+}
+
+enum HLSCandidateOrigin: String, Hashable, Sendable {
+    case direct
+    case video
+    case source
+    case inlineScript
+    case iframe
+    case runtime
+
+    var title: String {
+        switch self {
+        case .direct: return "m3u8直接リンク"
+        case .video: return "videoタグ"
+        case .source: return "sourceタグ"
+        case .inlineScript: return "ページ内データ"
+        case .iframe: return "iframeリンク"
+        case .runtime: return "プレイヤー通信"
+        }
+    }
+}
+
+struct HLSCandidate: Identifiable, Sendable {
+    let id: UUID
+    let request: URLCandidates
+    let requestReferer: URL?
+    let document: PlaylistDocument?
+    let pageURL: URL
+    let title: String?
+    let thumbnailURL: URL?
+    let iframeDepth: Int
+    let origin: HLSCandidateOrigin
+
+    var playlistURL: URL { document?.effectiveURL ?? request.primary }
+}
+
+struct HLSDiscoveryResult: Sendable {
+    let candidates: [HLSCandidate]
+    let isDirectPlaylist: Bool
+}
+
 struct URLCandidates: Hashable, Sendable {
     let primary: URL
     let sameOriginQueryFallback: URL?
@@ -153,6 +198,7 @@ enum HLSError: LocalizedError, Sendable {
     case network(String)
     case httpStatus(Int, String)
     case noPlaylistFound
+    case htmlTooLarge
     case invalidPlaylist(String)
     case livePlaylistUnsupported
     case drmUnsupported(String)
@@ -180,6 +226,8 @@ enum HLSError: LocalizedError, Sendable {
             return "\(host) が HTTP \(status) を返しました。URLの期限や認証を確認してください。"
         case .noPlaylistFound:
             return "ページ内に利用できるm3u8を見つけられませんでした。m3u8のURLを直接貼ってください。"
+        case .htmlTooLarge:
+            return "HTMLが大きすぎるため安全に解析できませんでした。m3u8のURLを直接貼ってください。"
         case .invalidPlaylist(let detail):
             return "HLSプレイリストを解析できません: \(detail)"
         case .livePlaylistUnsupported:

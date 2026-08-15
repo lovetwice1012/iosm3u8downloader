@@ -1,5 +1,26 @@
 import Foundation
 
+final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let sourceURL = response.url,
+              let targetURL = request.url,
+              AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                from: sourceURL,
+                to: targetURL
+              ) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+}
+
 struct HTTPPayload: Sendable {
     let data: Data
     let effectiveURL: URL
@@ -8,7 +29,13 @@ struct HTTPPayload: Sendable {
 }
 
 final class HTTPClient: @unchecked Sendable {
+    static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0"
+
     private let session: URLSession
+    private let redirectDelegate: HTTPRedirectDelegate
+    private let cookieStorage: HTTPCookieStorage?
+    private let importedCookieLock = NSLock()
+    private var importedCookies: [HTTPCookie] = []
 
     init(configuration: URLSessionConfiguration = .default) {
         configuration.timeoutIntervalForRequest = 30
@@ -23,10 +50,35 @@ final class HTTPClient: @unchecked Sendable {
         )
         configuration.httpShouldUsePipelining = true
         configuration.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0",
+            "User-Agent": Self.userAgent,
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.6"
         ]
-        session = URLSession(configuration: configuration)
+        cookieStorage = configuration.httpCookieStorage
+        let redirectDelegate = HTTPRedirectDelegate()
+        self.redirectDelegate = redirectDelegate
+        session = URLSession(
+            configuration: configuration,
+            delegate: redirectDelegate,
+            delegateQueue: nil
+        )
+    }
+
+    func cookies(for url: URL) -> [HTTPCookie] {
+        let stored = cookieStorage?.cookies(for: url) ?? []
+        importedCookieLock.lock()
+        let imported = importedCookies.filter { cookie($0, matches: url) }
+        importedCookieLock.unlock()
+
+        var seen = Set<String>()
+        return (imported + stored).filter {
+            seen.insert("\($0.name)\n\($0.domain)\n\($0.path)").inserted
+        }
+    }
+
+    func storeCookies(_ cookies: [HTTPCookie]) {
+        importedCookieLock.lock()
+        importedCookies = cookies.filter { $0.expiresDate.map { $0 > Date() } ?? true }
+        importedCookieLock.unlock()
     }
 
     func fetch(
@@ -63,6 +115,9 @@ final class HTTPClient: @unchecked Sendable {
                 request.setValue("*/*", forHTTPHeaderField: "Accept")
                 if let referer = safeReferer(referer, target: url) {
                     request.setValue(referer, forHTTPHeaderField: "Referer")
+                }
+                if let cookieHeader = importedCookieHeader(for: url) {
+                    request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
                 }
                 if let byteRange {
                     let upperBound = try checkedUpperBound(byteRange)
@@ -108,6 +163,75 @@ final class HTTPClient: @unchecked Sendable {
                     data = rawData
                 }
 
+                return HTTPPayload(
+                    data: data,
+                    effectiveURL: effectiveURL,
+                    statusCode: http.statusCode,
+                    mimeType: http.mimeType
+                )
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch {
+                lastError = error
+                if attempt < 2, shouldRetry(error: error) {
+                    try await backoff(attempt: attempt)
+                    continue
+                }
+                throw error
+            }
+        }
+
+        if let hlsError = lastError as? HLSError { throw hlsError }
+        throw HLSError.network(lastError?.localizedDescription ?? "不明なエラー")
+    }
+
+    func fetchLimited(
+        _ url: URL,
+        referer: URL? = nil,
+        maximumBytes: Int
+    ) async throws -> HTTPPayload {
+        guard maximumBytes > 0 else { throw HLSError.network("応答サイズの上限が不正です") }
+        var lastError: Error?
+
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "GET"
+                request.setValue("image/avif,image/webp,image/*,*/*;q=0.5", forHTTPHeaderField: "Accept")
+                if let referer = safeReferer(referer, target: url) {
+                    request.setValue(referer, forHTTPHeaderField: "Referer")
+                }
+                if let cookieHeader = importedCookieHeader(for: url) {
+                    request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+                }
+
+                let (bytes, response) = try await session.bytes(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw HLSError.network("HTTPレスポンスを受信できませんでした")
+                }
+                let effectiveURL = http.url ?? url
+                guard (200...299).contains(http.statusCode) else {
+                    let error = HLSError.httpStatus(http.statusCode, effectiveURL.host ?? "サーバー")
+                    if shouldRetry(status: http.statusCode), attempt < 2 {
+                        lastError = error
+                        try await backoff(attempt: attempt)
+                        continue
+                    }
+                    throw error
+                }
+                if http.expectedContentLength > Int64(maximumBytes) {
+                    throw HLSError.network("画像が大きすぎます")
+                }
+
+                var data = Data()
+                data.reserveCapacity(min(maximumBytes, max(Int(http.expectedContentLength), 0)))
+                for try await byte in bytes {
+                    guard data.count < maximumBytes else {
+                        throw HLSError.network("画像が大きすぎます")
+                    }
+                    data.append(byte)
+                }
                 return HTTPPayload(
                     data: data,
                     effectiveURL: effectiveURL,
@@ -225,5 +349,38 @@ final class HTTPClient: @unchecked Sendable {
         case "http": return 80
         default: return nil
         }
+    }
+
+    private func importedCookieHeader(for url: URL) -> String? {
+        importedCookieLock.lock()
+        let matching = importedCookies.filter { cookie($0, matches: url) }
+        importedCookieLock.unlock()
+        guard !matching.isEmpty else { return nil }
+        return HTTPCookie.requestHeaderFields(with: matching)["Cookie"]
+    }
+
+    private func cookie(_ cookie: HTTPCookie, matches url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        let rawCookieDomain = cookie.domain.lowercased()
+        let isDomainCookie = rawCookieDomain.hasPrefix(".")
+        let cookieDomain = rawCookieDomain.trimmingCharacters(
+            in: CharacterSet(charactersIn: ".")
+        )
+        guard !cookieDomain.isEmpty else { return false }
+        guard host == cookieDomain || (isDomainCookie && host.hasSuffix(".\(cookieDomain)")) else {
+            return false
+        }
+        if cookie.isSecure, url.scheme?.lowercased() != "https" { return false }
+        if let expires = cookie.expiresDate, expires <= Date() { return false }
+
+        let requestPath = url.path.isEmpty ? "/" : url.path
+        let cookiePath = cookie.path.isEmpty ? "/" : cookie.path
+        guard requestPath.hasPrefix(cookiePath) else { return false }
+        if requestPath.count > cookiePath.count,
+           !cookiePath.hasSuffix("/"),
+           requestPath.dropFirst(cookiePath.count).first != "/" {
+            return false
+        }
+        return true
     }
 }

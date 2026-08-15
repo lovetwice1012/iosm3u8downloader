@@ -38,6 +38,19 @@ final class URIResolverTests: XCTestCase {
         XCTAssertNil(resolved.sameOriginQueryFallback)
     }
 
+    func testCanResolveHTMLResourceWithoutInheritingPageQuery() throws {
+        let resolved = try URIResolver.resolve(
+            "frame/player.html",
+            relativeTo: base,
+            queryFallbackSource: nil
+        )
+        XCTAssertEqual(
+            resolved.primary.absoluteString,
+            "https://a.example/x/y/frame/player.html"
+        )
+        XCTAssertNil(resolved.sameOriginQueryFallback)
+    }
+
     func testDecodesJavaScriptAndHTMLEscapes() throws {
         let raw = #"https:\/\/a.example\/v.m3u8?token\u003Dabc\u0026part\u003D1&amp;next=2"#
         let resolved = try URIResolver.resolve(raw, relativeTo: base)
@@ -45,5 +58,12 @@ final class URIResolverTests: XCTestCase {
             resolved.primary.absoluteString,
             "https://a.example/v.m3u8?token=abc&part=1&next=2"
         )
+    }
+
+    func testDecodesEscapedPathPunctuationUsedByPlayerConfigs() throws {
+        let raw = #"https:\x2f\x2fcdn\u002Eexample\x2fmaster\u002Em3u8"#
+        let resolved = try URIResolver.resolve(raw, relativeTo: base)
+
+        XCTAssertEqual(resolved.primary.absoluteString, "https://cdn.example/master.m3u8")
     }
 }

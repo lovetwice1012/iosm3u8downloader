@@ -32,6 +32,9 @@
 		B10000000000000000000017 /* sample-h264-aac.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* sample-h264-aac.ts */; };
 		B10000000000000000000018 /* sample-h264-video-offset.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001C /* sample-h264-video-offset.ts */; };
 		B10000000000000000000019 /* sample-aac-audio-offset.ts in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001D /* sample-aac-audio-offset.ts */; };
+		B1000000000000000000001A /* HTMLMediaExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001E /* HTMLMediaExtractor.swift */; };
+		B1000000000000000000001B /* WebPageInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001F /* WebPageInspector.swift */; };
+		B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000020 /* HTMLDiscoveryTests.swift */; };
 		B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */ = {isa = PBXBuildFile; productRef = G20000000000000000000001 /* HLSFFmpegBridge */; };
 /* End PBXBuildFile section */
 
@@ -75,6 +78,9 @@
 		A1000000000000000000001B /* sample-h264-aac.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-h264-aac.ts"; sourceTree = "<group>"; };
 		A1000000000000000000001C /* sample-h264-video-offset.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-h264-video-offset.ts"; sourceTree = "<group>"; };
 		A1000000000000000000001D /* sample-aac-audio-offset.ts */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sample-aac-audio-offset.ts"; sourceTree = "<group>"; };
+		A1000000000000000000001E /* HTMLMediaExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/HTMLMediaExtractor.swift; sourceTree = "<group>"; };
+		A1000000000000000000001F /* WebPageInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLS/WebPageInspector.swift; sourceTree = "<group>"; };
+		A10000000000000000000020 /* HTMLDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLDiscoveryTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -116,6 +122,8 @@
 				A10000000000000000000006 /* URIResolver.swift */,
 				A10000000000000000000007 /* PlaylistParser.swift */,
 				A10000000000000000000008 /* SourceResolver.swift */,
+				A1000000000000000000001E /* HTMLMediaExtractor.swift */,
+				A1000000000000000000001F /* WebPageInspector.swift */,
 				A10000000000000000000009 /* DownloadPlanBuilder.swift */,
 				A1000000000000000000000A /* HLSDownloadService.swift */,
 				A1000000000000000000000B /* HTTPClient.swift */,
@@ -139,6 +147,7 @@
 				A10000000000000000000016 /* URIResolverTests.swift */,
 				A10000000000000000000017 /* PlaylistParserTests.swift */,
 				A10000000000000000000019 /* TransportStreamRemuxerTests.swift */,
+				A10000000000000000000020 /* HTMLDiscoveryTests.swift */,
 				E10000000000000000000005 /* Fixtures */,
 			);
 			path = HLSDownloaderTests;
@@ -281,6 +290,8 @@
 				B10000000000000000000006 /* URIResolver.swift in Sources */,
 				B10000000000000000000007 /* PlaylistParser.swift in Sources */,
 				B10000000000000000000008 /* SourceResolver.swift in Sources */,
+				B1000000000000000000001A /* HTMLMediaExtractor.swift in Sources */,
+				B1000000000000000000001B /* WebPageInspector.swift in Sources */,
 				B10000000000000000000009 /* DownloadPlanBuilder.swift in Sources */,
 				B1000000000000000000000A /* HLSDownloadService.swift in Sources */,
 				B1000000000000000000000B /* HTTPClient.swift in Sources */,
@@ -300,6 +311,7 @@
 				B10000000000000000000012 /* URIResolverTests.swift in Sources */,
 				B10000000000000000000013 /* PlaylistParserTests.swift in Sources */,
 				B10000000000000000000015 /* TransportStreamRemuxerTests.swift in Sources */,
+				B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

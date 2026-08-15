@@ -1,10 +1,14 @@
 # HLS Downloader for iOS
 
-URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして単一MP4へまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTML内にm3u8 URLが記載されたページも探索します。
+URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして単一MP4へまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
 
 ## 主な機能
 
 - master/media playlistの自動判別
+- `video` / `source`タグ、data属性、ページ内プレイヤー設定からm3u8候補を抽出
+- `iframe` / `srcdoc`を最大3階層まで探索し、候補ごとの検出元Refererを維持
+- WebKitでJavaScript実行後のDOM変更、`fetch` / XHR、resource timingを全frameから監視
+- HTML入力では候補URL・検出元・サムネイルを一覧表示し、選択した候補だけを検証して保存
 - playlistごとの実URL（リダイレクト後）を基準にした相対URL補完
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
 - 最高帯域variantと既定audio renditionの自動選択
@@ -41,7 +45,7 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 ## 対応範囲
 
 - `#EXT-X-ENDLIST` を含む終了済みVOD
-- 認証なし、またはURL内の署名queryだけで取得できるHTTP(S)
+- 認証なし、URL内の署名query、またはページ自身の読み込み中に得られるCookieで取得できるHTTP(S)
 - H.264/HEVC + AACなど、MP4へ格納でき、端末が再生できるコーデック
 - 選択した1つの映像variantと、それに対応する既定音声の全断片
 
@@ -50,6 +54,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 - 終端のないlive/event playlist
 - FairPlay、`SAMPLE-AES`、非identity key format
 - Safari等のログインCookieを必要とするページ
+- 再生ボタン等のユーザー操作後にだけURLを生成するページ
+- Worker / Service Worker内だけでHLS URLを生成し、ページ側へURLを公開しないプレイヤー
 - `#EXT-X-GAP` を含むplaylist
 - `#EXT-X-DISCONTINUITY` を含むplaylist
 - AVFoundationがMP4へ出力できないコーデック
@@ -59,6 +65,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 ## プライバシーと利用条件
 
 - 署名queryや鍵URLを画面・ログへ出しません。
+- 動的プレイヤー解析は非永続WebKitセッションで行い、その解析中に得たCookieは対象ジョブの通信だけに使用します。
+- 公開ページからlocalhost・LANへのiframe、サムネイル、リダイレクトは自動追跡しません。
 - queryの自動引き継ぎは、通常のRFC URL解決がHTTPエラーになった場合に使う「同一origin限定」の候補です。別CDNへtokenを転送しません。
 - 個人利用でHTTPやLAN上のHLSも扱えるようATSを許可しています。HTTPSだけに限定する場合は `Info.plist` の `NSAllowsArbitraryLoads` を削除してください。
 - 自分が保存する権利を持つコンテンツ、または明示的に許可されたコンテンツだけに使用してください。DRMの回避機能はありません。
