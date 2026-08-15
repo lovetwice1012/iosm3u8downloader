@@ -206,6 +206,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             }
             return try await downloadWidevineWithBackgroundExecution(
                 document: document,
+                playbackContext: candidate.widevinePlaybackContext,
                 progress: progress
             )
         }
@@ -260,6 +261,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
     private func downloadWidevineWithBackgroundExecution(
         document: PlaylistDocument,
+        playbackContext: WidevinePlaybackContext?,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         try await BackgroundExecutionCoordinator.shared.run(
@@ -270,7 +272,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             await backgroundProgress.report(
                 DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
             )
-            return try await downloadWidevine(document: document) { update in
+            return try await downloadWidevine(
+                document: document,
+                playbackContext: playbackContext
+            ) { update in
                 await backgroundProgress.report(update)
                 await progress(update)
             }
@@ -279,6 +284,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
     private func downloadWidevine(
         document: PlaylistDocument,
+        playbackContext: WidevinePlaybackContext?,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         guard isDownloadableWidevineDomain(document.effectiveURL) else {
@@ -296,7 +302,14 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         guard manifest.isWidevine else {
             throw HLSError.invalidPlaylist("Widevine ContentProtectionを確認できません")
         }
-        guard let licenseURL = manifest.widevineLicenseURLs.first,
+        // An explicit Widevine Laurl is authoritative. Playback traffic is a
+        // fallback only when it was correlated with an EME message in the same
+        // frame; URL-keyword heuristics are never used to select an endpoint.
+        let observedLicenseURL = playbackContext?.isHighConfidence == true
+            ? playbackContext?.licenseServerURL
+            : nil
+        let licenseURL = manifest.widevineLicenseURLs.first ?? observedLicenseURL
+        guard let licenseURL,
               let scheme = licenseURL.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
               licenseURL.host != nil,
@@ -304,6 +317,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
               licenseURL.password == nil else {
             throw WidevineProcessingError.licenseServerMissing
         }
+        let observedRequestMetadata = playbackContext?.isHighConfidence == true
+            && playbackContext?.licenseServerURL == licenseURL
+            ? playbackContext?.requestMetadata
+            : nil
 
         try Task.checkCancellation()
         await progress(DownloadProgress(phase: .downloading, completedItems: 0, totalItems: 0))
@@ -321,7 +338,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 sourceURL: document.effectiveURL,
                 data: manifestData
             ),
-            licenseConfiguration: WidevineLicenseConfiguration(serverURL: licenseURL),
+            licenseConfiguration: WidevineLicenseConfiguration(
+                serverURL: licenseURL,
+                observedRequestMetadata: observedRequestMetadata
+            ),
             wvdData: wvdData
         )
 

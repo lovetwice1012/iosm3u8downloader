@@ -193,7 +193,7 @@ final class SourceResolver: Sendable {
         )
         log(
             "playback",
-            "interactive inspection imported references=\(inspection.media.count) candidates=\(results.count) cookies=\(inspection.cookies.count)"
+            "interactive inspection imported references=\(inspection.media.count) licenseMetadata=\(inspection.licenseRequests.count) eme=\(inspection.detectedWidevineKeySystem) candidates=\(results.count) cookies=\(inspection.cookies.count)"
         )
         return results
     }
@@ -511,7 +511,10 @@ final class SourceResolver: Sendable {
 
         let dynamic = await dynamicInspection
         try Task.checkCancellation()
-        log("webkit", "inspection returned references=\(dynamic.media.count) cookies=\(dynamic.cookies.count)")
+        log(
+            "webkit",
+            "inspection returned references=\(dynamic.media.count) licenseMetadata=\(dynamic.licenseRequests.count) eme=\(dynamic.detectedWidevineKeySystem) cookies=\(dynamic.cookies.count)"
+        )
         client.storeCookies(dynamic.cookies)
 
         await appendDynamicCandidates(
@@ -537,7 +540,10 @@ final class SourceResolver: Sendable {
         let seedCookies = client.cookies(for: url)
         log("webkit", "inspection start seedCookies=\(seedCookies.count) \(DiagnosticPrivacy.urlSummary(url))")
         let result = await dynamicInspector.inspect(url: url, seedCookies: seedCookies)
-        log("webkit", "inspection finish references=\(result.media.count) cookies=\(result.cookies.count)")
+        log(
+            "webkit",
+            "inspection finish references=\(result.media.count) licenseMetadata=\(result.licenseRequests.count) eme=\(result.detectedWidevineKeySystem) cookies=\(result.cookies.count)"
+        )
         return result
     }
 
@@ -565,7 +571,12 @@ final class SourceResolver: Sendable {
         accepted: inout Set<String>,
         results: inout [HLSCandidate]
     ) async {
-        for reference in inspection.media where results.count < maximumResults {
+        let playbackContexts = widevinePlaybackContexts(
+            in: inspection,
+            rootURL: rootURL
+        )
+        for (referenceIndex, reference) in inspection.media.enumerated()
+            where results.count < maximumResults {
             guard discovered.count < maximumCandidateReferences else { break }
             guard isSafeAutomaticURL(reference.url),
                   AutomaticNavigationPolicy.isAllowedFrameNavigation(
@@ -615,6 +626,7 @@ final class SourceResolver: Sendable {
                         request: validated.request,
                         requestReferer: pageURL,
                         document: validated.document,
+                        widevinePlaybackContext: playbackContexts[referenceIndex],
                         pageURL: pageURL,
                         title: limitedTitle(reference.title),
                         thumbnailURL: thumbnailURL,
@@ -630,6 +642,104 @@ final class SourceResolver: Sendable {
                 }
             }
         }
+    }
+
+    /// Associates observed license traffic with a Widevine MPD conservatively.
+    /// A frame token must match exactly. References without a token may use an
+    /// exact trusted page/depth match plus event proximity; cross-frame global
+    /// fallback is deliberately forbidden. Endpoint URLs are retained in memory, but never written to a
+    /// diagnostic message because their query can contain credentials.
+    private func widevinePlaybackContexts(
+        in inspection: DynamicPageInspection,
+        rootURL: URL
+    ) -> [Int: WidevinePlaybackContext] {
+        let mediaIndices = inspection.media.indices.filter {
+            inspection.media[$0].kind == .widevineDASH
+        }
+        guard !mediaIndices.isEmpty else { return [:] }
+
+        let licenseReferences = inspection.licenseRequests.filter { reference in
+            isSafeAutomaticURL(reference.url)
+                && isSafeAutomaticURL(reference.pageURL)
+                && AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: reference.url
+                )
+                && AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: reference.pageURL
+                )
+        }.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            return canonicalURLKey(lhs.url) < canonicalURLKey(rhs.url)
+        }
+        guard !licenseReferences.isEmpty else { return [:] }
+
+        var contexts: [Int: WidevinePlaybackContext] = [:]
+        var unmatchedMedia = Set(mediaIndices)
+
+        for license in licenseReferences {
+            if let frameToken = license.frameToken {
+                let tokenMatches = unmatchedMedia.filter {
+                    inspection.media[$0].frameToken == frameToken
+                }
+                guard let mediaIndex = nearestPrecedingMediaIndex(
+                    tokenMatches,
+                    media: inspection.media,
+                    licenseSequence: license.sequence
+                ) else {
+                    continue
+                }
+                contexts[mediaIndex] = WidevinePlaybackContext(
+                    reference: license,
+                    detectedWidevineKeySystem: inspection.detectedWidevineKeySystem
+                )
+                unmatchedMedia.remove(mediaIndex)
+                continue
+            }
+
+            let candidates = unmatchedMedia.filter {
+                    let media = inspection.media[$0]
+                    return media.iframeDepth == license.iframeDepth
+                        && canonicalURLKey(media.pageURL) == canonicalURLKey(license.pageURL)
+                }
+
+            guard let mediaIndex = nearestPrecedingMediaIndex(
+                candidates,
+                media: inspection.media,
+                licenseSequence: license.sequence
+            ) else {
+                continue
+            }
+            contexts[mediaIndex] = WidevinePlaybackContext(
+                reference: license,
+                detectedWidevineKeySystem: inspection.detectedWidevineKeySystem
+            )
+            unmatchedMedia.remove(mediaIndex)
+        }
+
+        log(
+            "widevine",
+            "playback context association manifests=\(mediaIndices.count) licenseRequests=\(licenseReferences.count) matched=\(contexts.count) eme=\(inspection.detectedWidevineKeySystem)"
+        )
+        return contexts
+    }
+
+    private func nearestPrecedingMediaIndex(
+        _ indices: [Int],
+        media: [DynamicMediaReference],
+        licenseSequence: Int
+    ) -> Int? {
+        guard !indices.isEmpty else { return nil }
+        let preceding = indices.filter { media[$0].sequence <= licenseSequence }
+        if let nearest = preceding.max(by: { lhs, rhs in
+            media[lhs].sequence < media[rhs].sequence
+        }) {
+            let nearestSequence = media[nearest].sequence
+            let equallyNear = preceding.filter { media[$0].sequence == nearestSequence }
+            return equallyNear.count == 1 ? nearest : nil
+        }
+        return indices.count == 1 ? indices[0] : nil
     }
 
     private func loadWidevineDASH(
@@ -735,6 +845,7 @@ final class SourceResolver: Sendable {
         request: URLCandidates,
         requestReferer: URL?,
         document: PlaylistDocument?,
+        widevinePlaybackContext: WidevinePlaybackContext? = nil,
         pageURL: URL,
         title: String?,
         thumbnailURL: URL?,
@@ -763,6 +874,7 @@ final class SourceResolver: Sendable {
                 request: existing.request.sameOriginQueryFallback != nil ? existing.request : request,
                 requestReferer: existing.requestReferer ?? requestReferer,
                 document: existing.document ?? document,
+                widevinePlaybackContext: existing.widevinePlaybackContext ?? widevinePlaybackContext,
                 pageURL: existing.pageURL,
                 title: existing.title ?? title,
                 thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
@@ -782,6 +894,7 @@ final class SourceResolver: Sendable {
                 request: request,
                 requestReferer: requestReferer,
                 document: document,
+                widevinePlaybackContext: widevinePlaybackContext,
                 pageURL: pageURL,
                 title: title,
                 thumbnailURL: thumbnailURL,

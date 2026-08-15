@@ -15,3 +15,5 @@ xcuserdata/
 *.ipa
 *.app.zip
 
+# Widevine device credentials are imported into the device Keychain at runtime.
+*.wvd

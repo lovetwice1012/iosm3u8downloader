@@ -46,6 +46,185 @@ enum MediaCandidateKind: String, Hashable, Sendable {
     case widevineDASH
 }
 
+/// Non-secret facts observed for a possible Widevine license request.
+///
+/// Header values and request bodies deliberately have no representation here.
+/// Authentication material remains in the live WebKit/cookie session and must
+/// never be copied into diagnostics or a candidate's printable metadata.
+struct WidevineLicenseRequestMetadata: Hashable, Sendable {
+    enum BodyKind: String, Hashable, Sendable {
+        case none
+        case binary
+        case json
+        case formURLEncoded
+        case text
+        case unknown
+    }
+
+    enum Source: String, Hashable, Sendable {
+        case fetch
+        case xmlHttpRequest
+        case emeCorrelatedFetch
+        case emeCorrelatedXMLHttpRequest
+    }
+
+    private static let maximumMethodLength = 16
+    private static let maximumContentTypeLength = 127
+    private static let maximumHeaderNames = 32
+    private static let maximumHeaderNameLength = 64
+    private static let maximumReportedBodyBytes = 16 * 1_024 * 1_024
+
+    let method: String
+    let contentType: String?
+    let headerNames: [String]
+    let bodyKind: BodyKind
+    let bodyByteCount: Int
+    let source: Source
+
+    var isEMECorrelated: Bool {
+        switch source {
+        case .emeCorrelatedFetch, .emeCorrelatedXMLHttpRequest:
+            return true
+        case .fetch, .xmlHttpRequest:
+            return false
+        }
+    }
+
+    init(
+        method: String,
+        contentType: String?,
+        headerNames: [String],
+        bodyKind: BodyKind,
+        bodyByteCount: Int,
+        source: Source
+    ) {
+        self.method = Self.normalizedMethod(method)
+        self.contentType = Self.normalizedContentType(contentType)
+        self.headerNames = Self.normalizedHeaderNames(headerNames)
+        self.bodyKind = bodyKind
+        self.bodyByteCount = min(max(bodyByteCount, 0), Self.maximumReportedBodyBytes)
+        self.source = source
+    }
+
+    private static func normalizedMethod(_ value: String) -> String {
+        let method = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !method.isEmpty,
+              method.count <= maximumMethodLength,
+              method.unicodeScalars.allSatisfy({ scalar in
+                  scalar.value >= 65 && scalar.value <= 90
+              }) else {
+            return "UNKNOWN"
+        }
+        return method
+    }
+
+    private static func normalizedContentType(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let mediaType = value
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        guard !mediaType.isEmpty,
+              mediaType.count <= maximumContentTypeLength,
+              mediaType.unicodeScalars.allSatisfy({ scalar in
+                  CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789!#$&^_.+-/")
+                      .contains(scalar)
+              }) else {
+            return nil
+        }
+        return mediaType
+    }
+
+    private static func normalizedHeaderNames(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            let name = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !name.isEmpty,
+                  name.count <= maximumHeaderNameLength,
+                  name.unicodeScalars.allSatisfy({ scalar in
+                      CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~")
+                          .contains(scalar)
+                  }),
+                  seen.insert(name).inserted else {
+                continue
+            }
+            result.append(name)
+            if result.count == maximumHeaderNames { break }
+        }
+        return result.sorted()
+    }
+}
+
+struct DynamicLicenseReference: Hashable, Sendable {
+    let url: URL
+    let pageURL: URL
+    let iframeDepth: Int
+    let frameToken: String?
+    let metadata: WidevineLicenseRequestMetadata
+    let sequence: Int
+
+    init(
+        url: URL,
+        pageURL: URL,
+        iframeDepth: Int,
+        frameToken: String? = nil,
+        metadata: WidevineLicenseRequestMetadata,
+        sequence: Int
+    ) {
+        self.url = url
+        self.pageURL = pageURL
+        self.iframeDepth = max(iframeDepth, 0)
+        self.frameToken = Self.normalizedFrameToken(frameToken)
+        self.metadata = metadata
+        self.sequence = max(sequence, 0)
+    }
+
+    private static func normalizedFrameToken(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty,
+              token.count <= 64,
+              token.unicodeScalars.allSatisfy({ scalar in
+                  CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+                      .contains(scalar)
+              }) else {
+            return nil
+        }
+        return token
+    }
+}
+
+struct WidevinePlaybackContext: Hashable, Sendable {
+    let licenseServerURL: URL
+    let requestMetadata: WidevineLicenseRequestMetadata
+    let pageURL: URL
+    let iframeDepth: Int
+    let frameToken: String?
+    let sequence: Int
+    let detectedWidevineKeySystem: Bool
+
+    var isHighConfidence: Bool {
+        detectedWidevineKeySystem && requestMetadata.isEMECorrelated
+    }
+
+    /// Captured metadata intentionally excludes authentication values, the
+    /// request body wrapper and the response unwrapping rule. It can identify
+    /// an endpoint but cannot by itself replay a license exchange.
+    var isReplayable: Bool { false }
+
+    init(reference: DynamicLicenseReference, detectedWidevineKeySystem: Bool) {
+        licenseServerURL = reference.url
+        requestMetadata = reference.metadata
+        pageURL = reference.pageURL
+        iframeDepth = reference.iframeDepth
+        frameToken = reference.frameToken
+        sequence = reference.sequence
+        self.detectedWidevineKeySystem = detectedWidevineKeySystem
+    }
+}
+
 enum HLSCandidateOrigin: String, Hashable, Sendable {
     case direct
     case video
@@ -72,11 +251,38 @@ struct HLSCandidate: Identifiable, Sendable {
     let request: URLCandidates
     let requestReferer: URL?
     let document: PlaylistDocument?
+    let widevinePlaybackContext: WidevinePlaybackContext?
     let pageURL: URL
     let title: String?
     let thumbnailURL: URL?
     let iframeDepth: Int
     let origin: HLSCandidateOrigin
+
+    init(
+        id: UUID,
+        kind: MediaCandidateKind,
+        request: URLCandidates,
+        requestReferer: URL?,
+        document: PlaylistDocument?,
+        widevinePlaybackContext: WidevinePlaybackContext? = nil,
+        pageURL: URL,
+        title: String?,
+        thumbnailURL: URL?,
+        iframeDepth: Int,
+        origin: HLSCandidateOrigin
+    ) {
+        self.id = id
+        self.kind = kind
+        self.request = request
+        self.requestReferer = requestReferer
+        self.document = document
+        self.widevinePlaybackContext = kind == .widevineDASH ? widevinePlaybackContext : nil
+        self.pageURL = pageURL
+        self.title = title
+        self.thumbnailURL = thumbnailURL
+        self.iframeDepth = iframeDepth
+        self.origin = origin
+    }
 
     var playlistURL: URL { document?.effectiveURL ?? request.primary }
 }

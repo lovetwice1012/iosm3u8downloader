@@ -8,7 +8,7 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - `video` / `source`タグ、data属性、ページ内プレイヤー設定からm3u8候補を抽出
 - `iframe` / `srcdoc`を最大3階層まで探索し、候補ごとの検出元Refererを維持
 - WebKitでJavaScript実行後のDOM変更、`fetch` / XHR、resource timingを全frameから監視
-- **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS候補を追加
+- **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS/MPD候補を追加。Widevine EME試行とライセンス要求候補も同一frame内で関連付け
 - HTML入力では候補URL・検出元・サムネイルを一覧表示し、選択した候補だけを検証して保存
 - playlistごとの実URL（リダイレクト後）を基準にした相対URL補完
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
@@ -58,6 +58,10 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 Widevineの許可hostは `HLSDownloader/DRM/WidevineDownloadPolicy.swift` のSetだけで管理し、すべての判定を `isDownloadableWidevineDomain(_:)` へ集約しています。現在は `widevine.sprink.cloud` の完全一致hostのみです。サブドメインや部分一致は許可しません。その他のWidevineは候補化せず、再生・保存とも行いません。DRMなしHLSにはこのドメイン制限を適用しません。
 
 WVDファイルはアプリUIから読み込み、magic/version/L3/lengthを検証した後、`AfterFirstUnlockThisDeviceOnly` のKeychain itemとして保存します。WVD本体、private key、client identification、license headerはリポジトリや診断ログへ出力しません。
+
+Widevineはm3u8/MPDの直リンクだけを前提にせず、「再生ページを開いて解析」からページ内の再生操作を監視します。MPD、`requestMediaKeySystemAccess("com.widevine.alpha")`、`MediaKeySession`のmessage、および直後の`fetch` / XHRを観測し、frame tokenとevent順序でmanifest候補へ結び付けます。候補へ保持するのはlicense URL、method、Content-Type、header**名**、body種別・サイズだけで、Authorization等のheader値、challenge、license応答本文は保持しません。
+
+標準WKWebView側でWidevine CDMが利用できずEMEが拒否されたページでは、MPDとWidevine試行は検出できても、license要求が発生しない場合があります。fetch/XHRは送信直前に観測するため、画面では「通信完了」ではなく「license要求候補」として表示します。Worker / Service Worker内だけで完結する通信も対象外です。
 
 現在のmainに入っている実行providerは意図的に `UnconfiguredWidevineProcessingProvider` です。そのため、MPD検出、ポリシー、WVD保存、provider境界までは有効ですが、Widevine再生、license exchange、segment復号、平文MP4出力はまだ有効ではありません。実配信と統合するには、WVDだけでなく、運営者が指定するlicense URL、request/response包装、必要な認証header、および利用許諾に沿ったWidevine処理providerが必要です。
 

@@ -346,7 +346,7 @@ final class DownloadViewModel: ObservableObject {
             if mergingResults, inputStillMatches {
                 mergeCandidates(capturedCandidates)
                 if capturedCandidates.isEmpty, candidates.isEmpty {
-                    errorMessage = "再生通信からHLS候補を検出できませんでした。動画を再生してから、もう一度お試しください。"
+                    errorMessage = "再生通信からHLS / Widevine候補を検出できませんでした。動画を再生してから、もう一度お試しください。"
                 }
             }
 
@@ -374,6 +374,8 @@ final class DownloadViewModel: ObservableObject {
                         ? existing.request : candidate.request,
                     requestReferer: existing.requestReferer ?? candidate.requestReferer,
                     document: existing.document ?? candidate.document,
+                    widevinePlaybackContext: existing.widevinePlaybackContext
+                        ?? candidate.widevinePlaybackContext,
                     pageURL: existing.pageURL,
                     title: existing.title ?? candidate.title,
                     thumbnailURL: existing.thumbnailURL ?? candidate.thumbnailURL,

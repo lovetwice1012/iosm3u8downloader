@@ -206,6 +206,116 @@ final class DiagnosticLogTests: XCTestCase {
     }
 }
 
+final class PlaybackProbePayloadParserTests: XCTestCase {
+    func testRequiresExactPerSessionMessageNonce() {
+        let expected = "0123456789abcdef0123456789abcdef"
+        XCTAssertTrue(
+            PlaybackProbePayloadParser.hasValidNonce(
+                ["nonce": expected],
+                expected: expected
+            )
+        )
+        XCTAssertFalse(
+            PlaybackProbePayloadParser.hasValidNonce(
+                ["nonce": "0123456789abcdef0123456789abcdee"],
+                expected: expected
+            )
+        )
+        XCTAssertFalse(
+            PlaybackProbePayloadParser.hasValidNonce([:], expected: expected)
+        )
+    }
+
+    func testParsesOnlyNonSecretLicenseRequestMetadata() throws {
+        let payload = try XCTUnwrap(
+            PlaybackProbePayloadParser.licensePayload(
+                from: [
+                    "eventKind": "licenseRequest",
+                    "url": "https://license.example/acquire",
+                    "method": "post",
+                    "contentType": "application/octet-stream; charset=binary",
+                    "headerNames": ["Authorization", "X-Playback-Token"],
+                    "bodyKind": "binary",
+                    "bodyByteCount": NSNumber(value: 512),
+                    "source": "emeCorrelatedFetch",
+                    "frameToken": "frame-123",
+                    "sequence": NSNumber(value: 9),
+                    // A compromised page may add arbitrary fields. The parser
+                    // has no representation for either value and ignores them.
+                    "headerValues": ["Bearer must-not-cross"],
+                    "body": "challenge-must-not-cross"
+                ]
+            )
+        )
+
+        XCTAssertEqual(payload.rawURL, "https://license.example/acquire")
+        XCTAssertEqual(payload.metadata.method, "POST")
+        XCTAssertEqual(payload.metadata.contentType, "application/octet-stream")
+        XCTAssertEqual(payload.metadata.headerNames, ["authorization", "x-playback-token"])
+        XCTAssertEqual(payload.metadata.bodyKind, .binary)
+        XCTAssertEqual(payload.metadata.bodyByteCount, 512)
+        XCTAssertEqual(payload.metadata.source, .emeCorrelatedFetch)
+        XCTAssertEqual(payload.frameToken, "frame-123")
+        XCTAssertEqual(payload.sequence, 9)
+        XCTAssertFalse(String(reflecting: payload).contains("must-not-cross"))
+    }
+
+    func testRejectsUnknownBodyKindAndSource() {
+        let base: [String: Any] = [
+            "eventKind": "licenseRequest",
+            "url": "https://license.example/acquire",
+            "method": "POST",
+            "headerNames": [String](),
+            "bodyKind": "binary",
+            "bodyByteCount": NSNumber(value: 1),
+            "source": "fetch"
+        ]
+        var unknownBody = base
+        unknownBody["bodyKind"] = "protobuf"
+        var unknownSource = base
+        unknownSource["source"] = "serviceWorker"
+
+        XCTAssertNil(PlaybackProbePayloadParser.licensePayload(from: unknownBody))
+        XCTAssertNil(PlaybackProbePayloadParser.licensePayload(from: unknownSource))
+    }
+
+    func testNormalizesUntrustedBounds() throws {
+        let payload = try XCTUnwrap(
+            PlaybackProbePayloadParser.licensePayload(
+                from: [
+                    "eventKind": "licenseRequest",
+                    "url": "https://license.example/acquire",
+                    "method": "POST",
+                    "headerNames": ["Content-Type"],
+                    "bodyKind": "binary",
+                    "bodyByteCount": NSNumber(value: Int.max),
+                    "source": "xmlHttpRequest",
+                    "frameToken": String(repeating: "x", count: 65),
+                    "sequence": NSNumber(value: -10)
+                ]
+            )
+        )
+
+        XCTAssertEqual(payload.metadata.bodyByteCount, 16 * 1_024 * 1_024)
+        XCTAssertNil(payload.frameToken)
+        XCTAssertEqual(payload.sequence, 0)
+
+        var tooManyHeaders: [String: Any] = [
+            "eventKind": "licenseRequest",
+            "url": "https://license.example/acquire",
+            "method": "POST",
+            "headerNames": (0...32).map { "x-header-\($0)" },
+            "bodyKind": "none",
+            "bodyByteCount": NSNumber(value: 0),
+            "source": "fetch"
+        ]
+        XCTAssertNil(PlaybackProbePayloadParser.licensePayload(from: tooManyHeaders))
+        tooManyHeaders["headerNames"] = [String]()
+        tooManyHeaders["url"] = String(repeating: "x", count: 8_193)
+        XCTAssertNil(PlaybackProbePayloadParser.licensePayload(from: tooManyHeaders))
+    }
+}
+
 private final class DiscoveryURLProtocolStub: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
@@ -690,6 +800,228 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertNotNil(candidates.first?.document)
         XCTAssertEqual(recorder.snapshot().compactMap(\.url), [deniedURL, allowedURL])
         XCTAssertTrue(diagnostics.renderedText().contains("download-domain policy"))
+    }
+
+    func testInteractiveInspectionAssociatesLicenseRequestsByFrameTokenAndSequence() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let diagnostics = DiagnosticLogStore()
+        let resolver = SourceResolver(client: client, diagnosticSink: diagnostics.sink)
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let sharedPageURL = try XCTUnwrap(URL(string: "https://player.example/embed"))
+        let firstMPD = try XCTUnwrap(
+            URL(string: "https://widevine.sprink.cloud/video/first.mpd")
+        )
+        let secondMPD = try XCTUnwrap(
+            URL(string: "https://widevine.sprink.cloud/video/second.mpd")
+        )
+        let firstLicense = try XCTUnwrap(
+            URL(string: "https://license.example/acquire?token=first-secret")
+        )
+        let secondLicense = try XCTUnwrap(
+            URL(string: "https://license.example/acquire?token=second-secret")
+        )
+        DiscoveryURLProtocolStub.handler = { request in
+            Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+        let metadata = WidevineLicenseRequestMetadata(
+            method: " post ",
+            contentType: "Application/OCTET-STREAM; charset=binary",
+            headerNames: ["Authorization", "X-Playback-Token", "authorization"],
+            bodyKind: .binary,
+            bodyByteCount: 512,
+            source: .emeCorrelatedFetch
+        )
+        let inspection = DynamicPageInspection(
+            media: [
+                DynamicMediaReference(
+                    url: firstMPD,
+                    kind: .widevineDASH,
+                    pageURL: sharedPageURL,
+                    title: "First",
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime,
+                    frameToken: "frame-first",
+                    sequence: 10
+                ),
+                DynamicMediaReference(
+                    url: secondMPD,
+                    kind: .widevineDASH,
+                    pageURL: sharedPageURL,
+                    title: "Second",
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime,
+                    frameToken: "frame-second",
+                    sequence: 20
+                )
+            ],
+            cookies: [],
+            licenseRequests: [
+                DynamicLicenseReference(
+                    url: secondLicense,
+                    pageURL: sharedPageURL,
+                    iframeDepth: 1,
+                    frameToken: "frame-second",
+                    metadata: metadata,
+                    sequence: 22
+                ),
+                DynamicLicenseReference(
+                    url: firstLicense,
+                    pageURL: sharedPageURL,
+                    iframeDepth: 1,
+                    frameToken: "frame-first",
+                    metadata: metadata,
+                    sequence: 12
+                )
+            ],
+            detectedWidevineKeySystem: true
+        )
+
+        let candidates = await resolver.importDynamicInspection(inspection, rootURL: rootURL)
+        let byManifest = Dictionary(uniqueKeysWithValues: candidates.map { ($0.playlistURL, $0) })
+        let firstContext = try XCTUnwrap(byManifest[firstMPD]?.widevinePlaybackContext)
+        let secondContext = try XCTUnwrap(byManifest[secondMPD]?.widevinePlaybackContext)
+
+        XCTAssertEqual(firstContext.licenseServerURL, firstLicense)
+        XCTAssertEqual(secondContext.licenseServerURL, secondLicense)
+        XCTAssertEqual(firstContext.requestMetadata.method, "POST")
+        XCTAssertEqual(firstContext.requestMetadata.contentType, "application/octet-stream")
+        XCTAssertEqual(
+            firstContext.requestMetadata.headerNames,
+            ["authorization", "x-playback-token"]
+        )
+        XCTAssertTrue(firstContext.detectedWidevineKeySystem)
+        XCTAssertTrue(firstContext.isHighConfidence)
+        XCTAssertFalse(firstContext.isReplayable)
+        let log = diagnostics.renderedText()
+        XCTAssertTrue(log.contains("licenseRequests=2 matched=2 eme=true"))
+        XCTAssertFalse(log.contains("first-secret"))
+        XCTAssertFalse(log.contains("second-secret"))
+        XCTAssertFalse(log.contains("license.example"))
+    }
+
+    func testInteractiveInspectionDoesNotGuessLicenseForAmbiguousSameFrameManifests() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let resolver = SourceResolver(client: client)
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let pageURL = try XCTUnwrap(URL(string: "https://player.example/embed"))
+        let firstMPD = try XCTUnwrap(
+            URL(string: "https://widevine.sprink.cloud/video/first.mpd")
+        )
+        let secondMPD = try XCTUnwrap(
+            URL(string: "https://widevine.sprink.cloud/video/second.mpd")
+        )
+        DiscoveryURLProtocolStub.handler = { request in
+            Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+        let inspection = DynamicPageInspection(
+            media: [
+                DynamicMediaReference(
+                    url: firstMPD,
+                    kind: .widevineDASH,
+                    pageURL: pageURL,
+                    title: nil,
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime,
+                    frameToken: nil,
+                    sequence: 10
+                ),
+                DynamicMediaReference(
+                    url: secondMPD,
+                    kind: .widevineDASH,
+                    pageURL: pageURL,
+                    title: nil,
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime,
+                    frameToken: nil,
+                    sequence: 10
+                )
+            ],
+            cookies: [],
+            licenseRequests: [
+                DynamicLicenseReference(
+                    url: try XCTUnwrap(URL(string: "https://license.example/acquire")),
+                    pageURL: pageURL,
+                    iframeDepth: 1,
+                    metadata: WidevineLicenseRequestMetadata(
+                        method: "POST",
+                        contentType: nil,
+                        headerNames: [],
+                        bodyKind: .binary,
+                        bodyByteCount: 128,
+                        source: .fetch
+                    ),
+                    sequence: 12
+                )
+            ],
+            detectedWidevineKeySystem: true
+        )
+
+        let candidates = await resolver.importDynamicInspection(inspection, rootURL: rootURL)
+
+        XCTAssertEqual(candidates.count, 2)
+        XCTAssertTrue(candidates.allSatisfy { $0.widevinePlaybackContext == nil })
+    }
+
+    func testInteractiveInspectionRejectsSingleWidevineLicenseAcrossDifferentFrames() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let resolver = SourceResolver(client: client)
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let manifestURL = try XCTUnwrap(
+            URL(string: "https://widevine.sprink.cloud/video/manifest.mpd")
+        )
+        let licenseURL = try XCTUnwrap(URL(string: "https://license.example/acquire"))
+        DiscoveryURLProtocolStub.handler = { request in
+            Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+        let inspection = DynamicPageInspection(
+            media: [
+                DynamicMediaReference(
+                    url: manifestURL,
+                    kind: .widevineDASH,
+                    pageURL: try XCTUnwrap(URL(string: "https://player.example/manifest-frame")),
+                    title: nil,
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime,
+                    frameToken: "manifest-frame",
+                    sequence: 10
+                )
+            ],
+            cookies: [],
+            licenseRequests: [
+                DynamicLicenseReference(
+                    url: licenseURL,
+                    pageURL: try XCTUnwrap(URL(string: "https://player.example/license-frame")),
+                    iframeDepth: 2,
+                    frameToken: "license-frame",
+                    metadata: WidevineLicenseRequestMetadata(
+                        method: "POST",
+                        contentType: "application/json",
+                        headerNames: ["content-type"],
+                        bodyKind: .json,
+                        bodyByteCount: 256,
+                        source: .emeCorrelatedXMLHttpRequest
+                    ),
+                    sequence: 12
+                )
+            ],
+            detectedWidevineKeySystem: true
+        )
+
+        let candidates = await resolver.importDynamicInspection(inspection, rootURL: rootURL)
+
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertNil(candidates.first?.widevinePlaybackContext)
     }
 
     @MainActor

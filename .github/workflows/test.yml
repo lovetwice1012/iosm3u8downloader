@@ -30,6 +30,9 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks
 
+      - name: Test WebKit playback probe
+        run: node scripts/test-webkit-probe.js
+
       - name: Choose an available iPhone Simulator
         id: simulator
         shell: bash

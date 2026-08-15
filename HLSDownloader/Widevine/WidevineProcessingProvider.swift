@@ -8,10 +8,16 @@ struct WidevineManifestDocument: Sendable {
 struct WidevineLicenseConfiguration: Sendable {
     let serverURL: URL
     let httpHeaders: [String: String]
+    let observedRequestMetadata: WidevineLicenseRequestMetadata?
 
-    init(serverURL: URL, httpHeaders: [String: String] = [:]) {
+    init(
+        serverURL: URL,
+        httpHeaders: [String: String] = [:],
+        observedRequestMetadata: WidevineLicenseRequestMetadata? = nil
+    ) {
         self.serverURL = serverURL
         self.httpHeaders = httpHeaders
+        self.observedRequestMetadata = observedRequestMetadata
     }
 }
 

@@ -10,13 +10,126 @@ struct DynamicMediaReference: Sendable {
     let thumbnailURL: URL?
     let iframeDepth: Int
     let origin: HLSCandidateOrigin
+    let frameToken: String?
+    let sequence: Int
+
+    init(
+        url: URL,
+        kind: MediaCandidateKind,
+        pageURL: URL,
+        title: String?,
+        thumbnailURL: URL?,
+        iframeDepth: Int,
+        origin: HLSCandidateOrigin,
+        frameToken: String? = nil,
+        sequence: Int = 0
+    ) {
+        self.url = url
+        self.kind = kind
+        self.pageURL = pageURL
+        self.title = title
+        self.thumbnailURL = thumbnailURL
+        self.iframeDepth = max(iframeDepth, 0)
+        self.origin = origin
+        self.frameToken = PlaybackProbePayloadParser.normalizedFrameToken(frameToken)
+        self.sequence = max(sequence, 0)
+    }
 }
 
 struct DynamicPageInspection: @unchecked Sendable {
     let media: [DynamicMediaReference]
     let cookies: [HTTPCookie]
+    let licenseRequests: [DynamicLicenseReference]
+    let detectedWidevineKeySystem: Bool
+
+    init(
+        media: [DynamicMediaReference],
+        cookies: [HTTPCookie],
+        licenseRequests: [DynamicLicenseReference] = [],
+        detectedWidevineKeySystem: Bool = false
+    ) {
+        self.media = media
+        self.cookies = cookies
+        self.licenseRequests = licenseRequests
+        self.detectedWidevineKeySystem = detectedWidevineKeySystem
+    }
 
     static let empty = DynamicPageInspection(media: [], cookies: [])
+}
+
+struct PlaybackLicenseProbePayload {
+    let rawURL: String
+    let metadata: WidevineLicenseRequestMetadata
+    let frameToken: String?
+    let sequence: Int
+}
+
+enum PlaybackProbePayloadParser {
+    private static let maximumURLLength = 8_192
+    private static let maximumFrameTokenLength = 64
+    private static let maximumHeaderNames = 32
+
+    static func hasValidNonce(_ body: [String: Any], expected: String) -> Bool {
+        guard let candidate = body["nonce"] as? String else { return false }
+        let candidateBytes = Array(candidate.utf8)
+        let expectedBytes = Array(expected.utf8)
+        guard candidateBytes.count == expectedBytes.count,
+              !expectedBytes.isEmpty,
+              expectedBytes.count <= 64 else {
+            return false
+        }
+        var difference: UInt8 = 0
+        for index in expectedBytes.indices {
+            difference |= candidateBytes[index] ^ expectedBytes[index]
+        }
+        return difference == 0
+    }
+
+    static func licensePayload(from body: [String: Any]) -> PlaybackLicenseProbePayload? {
+        guard (body["eventKind"] as? String) == "licenseRequest",
+              let rawURL = body["url"] as? String,
+              !rawURL.isEmpty,
+              rawURL.utf8.count <= maximumURLLength,
+              let rawBodyKind = body["bodyKind"] as? String,
+              let bodyKind = WidevineLicenseRequestMetadata.BodyKind(rawValue: rawBodyKind),
+              let rawSource = body["source"] as? String,
+              let source = WidevineLicenseRequestMetadata.Source(rawValue: rawSource) else {
+            return nil
+        }
+
+        let rawHeaderNames = (body["headerNames"] as? [String]) ?? []
+        guard rawHeaderNames.count <= maximumHeaderNames else { return nil }
+        let bodyByteCount = (body["bodyByteCount"] as? NSNumber)?.intValue ?? 0
+        let sequence = (body["sequence"] as? NSNumber)?.intValue ?? 0
+        let metadata = WidevineLicenseRequestMetadata(
+            method: (body["method"] as? String) ?? "UNKNOWN",
+            contentType: body["contentType"] as? String,
+            headerNames: rawHeaderNames,
+            bodyKind: bodyKind,
+            bodyByteCount: bodyByteCount,
+            source: source
+        )
+        return PlaybackLicenseProbePayload(
+            rawURL: rawURL,
+            metadata: metadata,
+            frameToken: normalizedFrameToken(body["frameToken"] as? String),
+            sequence: max(sequence, 0)
+        )
+    }
+
+    static func normalizedFrameToken(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty,
+              token.count <= maximumFrameTokenLength,
+              token.unicodeScalars.allSatisfy({ scalar in
+                  CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+                      .contains(scalar)
+              }) else {
+            return nil
+        }
+        return token
+    }
 }
 
 @MainActor
@@ -74,10 +187,12 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     private static let maximumRawMessages = 4_096
     private static let maximumURLLength = 8_192
     private static let maximumLoggedReferences = 64
+    private static let maximumLicenseRequests = 128
 
     private let rootURL: URL
     private let seedCookies: [HTTPCookie]
     private let diagnosticSink: DiagnosticSink?
+    private let messageNonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     private let websiteDataStore = WKWebsiteDataStore.nonPersistent()
     private var webView: WKWebView?
     private var continuation: CheckedContinuation<DynamicPageInspection, Never>?
@@ -97,6 +212,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     private var referenceLogLimitReported = false
     private var references: [String: DynamicMediaReference] = [:]
     private var referenceOrder: [String] = []
+    private var licenseRequests: [DynamicLicenseReference] = []
+    private var licenseRequestKeys = Set<String>()
+    private var detectedWidevineKeySystem = false
     private var navigationContexts: [String: (pageURL: URL, iframeDepth: Int)] = [:]
     private var pendingFinishReason: FinishReason = .settled
 
@@ -137,7 +255,10 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         )
         contentController.addUserScript(
             WKUserScript(
-                source: Self.probeJavaScript(interactive: false),
+                source: Self.probeJavaScript(
+                    interactive: false,
+                    messageNonce: messageNonce
+                ),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false,
                 in: .page
@@ -224,10 +345,17 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         let cookies = await allCookies()
         let media = referenceOrder.compactMap { references[$0] }
         log(
-            "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
+            "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
         )
         self.continuation = nil
-        continuation.resume(returning: DynamicPageInspection(media: media, cookies: cookies))
+        continuation.resume(
+            returning: DynamicPageInspection(
+                media: media,
+                cookies: cookies,
+                licenseRequests: licenseRequests,
+                detectedWidevineKeySystem: detectedWidevineKeySystem
+            )
+        )
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -355,6 +483,14 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         }
         rawMessageCount += 1
         guard let body = message.body as? [String: Any],
+              PlaybackProbePayloadParser.hasValidNonce(body, expected: messageNonce) else {
+            invalidMessageCount += 1
+            return
+        }
+        if receiveWidevineProbeEvent(body, message: message) {
+            return
+        }
+        guard
               let rawURL = body["url"] as? String,
               let rawManifestKind = body["manifestKind"] as? String,
               let kind = MediaCandidateKind(rawValue: rawManifestKind),
@@ -391,8 +527,64 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             title: title,
             thumbnailURL: thumbnailURL,
             iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
-            origin: origin
+            origin: origin,
+            frameToken: PlaybackProbePayloadParser.normalizedFrameToken(body["frameToken"] as? String),
+            sequence: (body["sequence"] as? NSNumber)?.intValue ?? 0
         )
+    }
+
+    private func receiveWidevineProbeEvent(
+        _ body: [String: Any],
+        message: WKScriptMessage
+    ) -> Bool {
+        switch body["eventKind"] as? String {
+        case "widevineEME":
+            if !detectedWidevineKeySystem {
+                detectedWidevineKeySystem = true
+                log("Widevine EME key-system request observed")
+            }
+            scheduleSettle()
+            return true
+        case "licenseRequest":
+            guard let payload = PlaybackProbePayloadParser.licensePayload(from: body) else {
+                invalidMessageCount += 1
+                return true
+            }
+            guard let frameURL = trustedFrameURL(from: message.frameInfo),
+                  let url = resolvedWebURL(payload.rawURL, relativeTo: frameURL),
+                  AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: url) else {
+                invalidMessageCount += 1
+                return true
+            }
+            let depth = message.frameInfo.isMainFrame ? 0 : 1
+            let key = canonicalKey(url)
+                + "\n" + canonicalKey(frameURL)
+                + "\n" + (payload.frameToken ?? "")
+                + "\n" + payload.metadata.method
+                + "\n" + payload.metadata.source.rawValue
+            guard licenseRequestKeys.insert(key).inserted else { return true }
+            guard licenseRequests.count < Self.maximumLicenseRequests else {
+                referenceLimitReached = true
+                return true
+            }
+            licenseRequests.append(
+                DynamicLicenseReference(
+                    url: url,
+                    pageURL: frameURL,
+                    iframeDepth: depth,
+                    frameToken: payload.frameToken,
+                    metadata: payload.metadata,
+                    sequence: payload.sequence
+                )
+            )
+            log(
+                "license request metadata observed source=\(payload.metadata.source.rawValue) method=\(payload.metadata.method) headers=\(payload.metadata.headerNames.count) body=\(payload.metadata.bodyKind.rawValue)"
+            )
+            scheduleSettle()
+            return true
+        default:
+            return false
+        }
     }
 
     private func recordReference(
@@ -402,13 +594,21 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         title: String?,
         thumbnailURL: URL?,
         iframeDepth: Int,
-        origin: HLSCandidateOrigin
+        origin: HLSCandidateOrigin,
+        frameToken: String? = nil,
+        sequence: Int = 0
     ) {
-        let key = kind.rawValue + "\n" + canonicalKey(url) + "\n" + canonicalKey(pageURL)
+        let key = kind.rawValue
+            + "\n" + canonicalKey(url)
+            + "\n" + canonicalKey(pageURL)
+            + "\n" + (frameToken ?? "")
         var didChange = false
         if let existing = references[key] {
             duplicateReferenceCount += 1
-            if existing.title == nil && title != nil || existing.thumbnailURL == nil && thumbnailURL != nil {
+            if existing.title == nil && title != nil
+                || existing.thumbnailURL == nil && thumbnailURL != nil
+                || existing.frameToken == nil && frameToken != nil
+                || existing.sequence == 0 && sequence > 0 {
                 references[key] = DynamicMediaReference(
                     url: existing.url,
                     kind: existing.kind,
@@ -416,7 +616,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                     title: existing.title ?? title,
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
                     iframeDepth: existing.iframeDepth,
-                    origin: existing.origin
+                    origin: existing.origin,
+                    frameToken: existing.frameToken ?? frameToken,
+                    sequence: existing.sequence > 0 ? existing.sequence : sequence
                 )
                 didChange = true
             }
@@ -433,7 +635,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 title: title,
                 thumbnailURL: thumbnailURL,
                 iframeDepth: iframeDepth,
-                origin: origin
+                origin: origin,
+                frameToken: frameToken,
+                sequence: sequence
             )
             referenceOrder.append(key)
             if loggedReferenceCount < Self.maximumLoggedReferences {
@@ -516,11 +720,19 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         diagnosticSink?(DiagnosticEvent(category: "webkit", message: message))
     }
 
-    fileprivate static func probeJavaScript(interactive: Bool) -> String {
-        probeJavaScriptTemplate.replacingOccurrences(
-            of: "__HLS_DOWNLOADER_INTERACTIVE__",
-            with: interactive ? "true" : "false"
-        )
+    fileprivate static func probeJavaScript(
+        interactive: Bool,
+        messageNonce: String
+    ) -> String {
+        probeJavaScriptTemplate
+            .replacingOccurrences(
+                of: "__HLS_DOWNLOADER_INTERACTIVE__",
+                with: interactive ? "true" : "false"
+            )
+            .replacingOccurrences(
+                of: "__HLS_DOWNLOADER_MESSAGE_NONCE__",
+                with: messageNonce
+            )
     }
 
     private static let probeJavaScriptTemplate = #"""
@@ -528,12 +740,39 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       if (window.__hlsDownloaderProbeInstalled) return;
       window.__hlsDownloaderProbeInstalled = true;
       const interactive = __HLS_DOWNLOADER_INTERACTIVE__;
+      const probeNonce = '__HLS_DOWNLOADER_MESSAGE_NONCE__';
       const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hlsDiscovery;
       if (!handler) return;
+      const frameToken = (() => {
+        try {
+          if (self.crypto && typeof self.crypto.randomUUID === 'function') {
+            return self.crypto.randomUUID();
+          }
+          if (self.crypto && typeof self.crypto.getRandomValues === 'function') {
+            const bytes = new Uint8Array(16);
+            self.crypto.getRandomValues(bytes);
+            return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+          }
+        } catch (_) {}
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 18)}`.slice(0, 64);
+      })();
+      let observationSequence = 0;
+      const nextSequence = () => {
+        observationSequence = observationSequence >= 2147483646 ? 1 : observationSequence + 1;
+        return observationSequence;
+      };
       const posted = new Map();
+      const postedLicenseRequests = new Set();
       const maximumPostedEntries = 2048;
+      const maximumPostedLicenseRequests = 256;
       const maximumBodyBytes = 64 * 1024;
       const maximumInspectableContentLength = 1024 * 1024;
+      let widevineManifestObserved = false;
+      let widevineKeySystemRequested = false;
+      let widevineEMEPosted = false;
+      let emeMessageSignalUntil = 0;
+      let emeMessageBytes = null;
+      let emeMessageBase64 = '';
       const hlsType = value => /(?:application|audio)\/(?:vnd\.apple\.mpegurl|x-mpegurl|mpegurl)/i.test(value || '');
       const dashType = value => /application\/dash\+xml/i.test(value || '');
       const typeKind = value => dashType(value) ? 'widevineDASH' : (hlsType(value) ? 'hls' : '');
@@ -573,6 +812,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         const fallbackManifestKind = forcedManifestKind === 'hlsFallback' ? 'hls' : '';
         const manifestKind = hintedManifestKind || inferredManifestKind || fallbackManifestKind;
         if (!manifestKind) return;
+        if (manifestKind === 'widevineDASH') widevineManifestObserved = true;
         const normalizedKind = kind || 'runtime';
         const normalizedPoster = absolute(poster || pagePoster() || '') || '';
         const normalizedTitle = String(title || document.title || '').slice(0, 256);
@@ -586,14 +826,222 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         posted.set(key, signature);
         try {
           handler.postMessage({
+            nonce: probeNonce,
+            eventKind: 'media',
             url,
             kind: normalizedKind,
             manifestKind,
             poster: normalizedPoster,
-            title: normalizedTitle
+            title: normalizedTitle,
+            frameToken,
+            sequence: nextSequence()
           });
         } catch (_) {}
       };
+      const postWidevineEMESignal = () => {
+        widevineKeySystemRequested = true;
+        if (widevineEMEPosted) return;
+        widevineEMEPosted = true;
+        try {
+          handler.postMessage({
+            nonce: probeNonce,
+            eventKind: 'widevineEME',
+            frameToken,
+            sequence: nextSequence()
+          });
+        } catch (_) {}
+      };
+      const headerMetadata = (...headerSets) => {
+        const names = new Set();
+        let contentType = '';
+        headerSets.forEach(headers => {
+          if (!headers) return;
+          try {
+            const normalized = new Headers(headers);
+            normalized.forEach((value, name) => {
+              const normalizedName = String(name || '').trim().toLowerCase();
+              if (!normalizedName || normalizedName.length > 64 || names.size >= 32) return;
+              names.add(normalizedName);
+              if (normalizedName === 'content-type') contentType = String(value || '').slice(0, 127);
+            });
+          } catch (_) {}
+        });
+        return { names: Array.from(names).sort(), contentType };
+      };
+      const stringByteCount = value => {
+        try { return new TextEncoder().encode(String(value || '')).byteLength; }
+        catch (_) { return String(value || '').length; }
+      };
+      const bodyMetadata = (body, contentType) => {
+        const normalizedType = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+        if (body == null) return { kind: 'none', byteCount: 0 };
+        if (typeof body === 'string') {
+          const kind = /json/.test(normalizedType)
+            ? 'json'
+            : (/application\/x-www-form-urlencoded/.test(normalizedType)
+              ? 'formURLEncoded'
+              : 'text');
+          return { kind, byteCount: stringByteCount(body) };
+        }
+        try {
+          if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+            return { kind: 'formURLEncoded', byteCount: stringByteCount(body.toString()) };
+          }
+          if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+            return { kind: 'binary', byteCount: body.byteLength || 0 };
+          }
+          if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView && ArrayBuffer.isView(body)) {
+            return { kind: 'binary', byteCount: body.byteLength || 0 };
+          }
+          if (typeof Blob !== 'undefined' && body instanceof Blob) {
+            return { kind: 'binary', byteCount: body.size || 0 };
+          }
+          if (typeof FormData !== 'undefined' && body instanceof FormData) {
+            return { kind: 'unknown', byteCount: 0 };
+          }
+        } catch (_) {}
+        return { kind: 'unknown', byteCount: 0 };
+      };
+      const byteView = value => {
+        try {
+          if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) {
+            return new Uint8Array(value);
+          }
+          if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView && ArrayBuffer.isView(value)) {
+            return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+          }
+        } catch (_) {}
+        return null;
+      };
+      const base64FromBytes = bytes => {
+        try {
+          let binary = '';
+          for (let offset = 0; offset < bytes.length; offset += 0x4000) {
+            binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x4000, bytes.length)));
+          }
+          return btoa(binary);
+        } catch (_) { return ''; }
+      };
+      const rememberEMEMessage = value => {
+        const bytes = byteView(value);
+        if (!bytes || !bytes.length || bytes.length > maximumInspectableContentLength) {
+          emeMessageBytes = null;
+          emeMessageBase64 = '';
+          return;
+        }
+        emeMessageBytes = new Uint8Array(bytes);
+        emeMessageBase64 = base64FromBytes(emeMessageBytes);
+      };
+      const bodyMatchesEMEMessage = body => {
+        if (!emeMessageBytes || !emeMessageBytes.length) return false;
+        const bytes = byteView(body);
+        if (bytes) {
+          if (bytes.length !== emeMessageBytes.length) return false;
+          let difference = 0;
+          for (let index = 0; index < bytes.length; index += 1) {
+            difference |= bytes[index] ^ emeMessageBytes[index];
+          }
+          return difference === 0;
+        }
+        let text = '';
+        try {
+          if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+            text = body.toString();
+          } else if (typeof body === 'string') {
+            text = body;
+          }
+        } catch (_) {}
+        if (!text || !emeMessageBase64) return false;
+        const urlSafeBase64 = emeMessageBase64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        const candidates = [text];
+        try { candidates.push(decodeURIComponent(text)); } catch (_) {}
+        return candidates.some(candidate =>
+          candidate.includes(emeMessageBase64) || candidate.includes(urlSafeBase64)
+        );
+      };
+      const hasLicenseURLHint = value => {
+        try {
+          const url = new URL(value, document.baseURI || location.href);
+          return /(?:widevine|licen[cs]e|drm|keyserver|key-server|acquire)/i.test(`${url.hostname}${url.pathname}`);
+        } catch (_) { return false; }
+      };
+      const observeLicenseRequest = (value, method, headers, body, baseSource) => {
+        const url = absolute(value, document.baseURI || location.href);
+        if (!url || !/^https?:/i.test(url)) return;
+        const normalizedMethod = String(method || 'GET').trim().toUpperCase().slice(0, 16) || 'GET';
+        if (normalizedMethod === 'GET' || normalizedMethod === 'HEAD') return;
+        const metadata = headerMetadata(...headers);
+        const bodyInfo = bodyMetadata(body, metadata.contentType);
+        const emeCorrelated = widevineKeySystemRequested
+          && Date.now() <= emeMessageSignalUntil
+          && bodyMatchesEMEMessage(body);
+        const hinted = widevineManifestObserved && hasLicenseURLHint(url);
+        if (!emeCorrelated && !hinted) return;
+        const source = emeCorrelated
+          ? (baseSource === 'fetch' ? 'emeCorrelatedFetch' : 'emeCorrelatedXMLHttpRequest')
+          : baseSource;
+        const key = `${source}\n${normalizedMethod}\n${url}\n${metadata.names.join(',')}\n${bodyInfo.kind}`;
+        if (postedLicenseRequests.has(key)) return;
+        if (postedLicenseRequests.size >= maximumPostedLicenseRequests) return;
+        postedLicenseRequests.add(key);
+        try {
+          handler.postMessage({
+            nonce: probeNonce,
+            eventKind: 'licenseRequest',
+            url,
+            method: normalizedMethod,
+            contentType: metadata.contentType,
+            headerNames: metadata.names,
+            bodyKind: bodyInfo.kind,
+            bodyByteCount: Math.max(0, Math.min(Number(bodyInfo.byteCount) || 0, 16 * 1024 * 1024)),
+            source,
+            frameToken,
+            sequence: nextSequence()
+          });
+        } catch (_) {}
+      };
+
+      try {
+        const originalRequestMediaKeySystemAccess = navigator.requestMediaKeySystemAccess;
+        if (typeof originalRequestMediaKeySystemAccess === 'function') {
+          const wrappedRequestMediaKeySystemAccess = function(keySystem, ...configurations) {
+            if (String(keySystem || '').toLowerCase() === 'com.widevine.alpha') {
+              postWidevineEMESignal();
+            }
+            return Reflect.apply(originalRequestMediaKeySystemAccess, this, [keySystem, ...configurations]);
+          };
+          try {
+            Object.defineProperty(navigator, 'requestMediaKeySystemAccess', {
+              configurable: true,
+              writable: true,
+              value: wrappedRequestMediaKeySystemAccess
+            });
+          } catch (_) {
+            navigator.requestMediaKeySystemAccess = wrappedRequestMediaKeySystemAccess;
+          }
+        }
+      } catch (_) {}
+
+      try {
+        const mediaKeySessionPrototype = self.MediaKeySession && self.MediaKeySession.prototype;
+        const originalGenerateRequest = mediaKeySessionPrototype && mediaKeySessionPrototype.generateRequest;
+        if (typeof originalGenerateRequest === 'function') {
+          const listenerInstalled = Symbol('hlsDownloaderWidevineMessageListener');
+          mediaKeySessionPrototype.generateRequest = function(...args) {
+            try {
+              if (widevineKeySystemRequested && !this[listenerInstalled]) {
+                this[listenerInstalled] = true;
+                this.addEventListener('message', event => {
+                  rememberEMEMessage(event && event.message);
+                  emeMessageSignalUntil = Date.now() + 15_000;
+                  postWidevineEMESignal();
+                }, { capture: true });
+              }
+            } catch (_) {}
+            return Reflect.apply(originalGenerateRequest, this, args);
+          };
+        }
+      } catch (_) {}
       const inspectText = (text, responseURL, kind) => {
         const sample = String(text || '').slice(0, maximumBodyBytes);
         if (!sample) return;
@@ -705,6 +1153,19 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         if (originalFetch) {
           window.fetch = function(...args) {
             const input = args[0];
+            const init = args[1] || {};
+            const isRequest = typeof Request !== 'undefined' && input instanceof Request;
+            const requestURL = isRequest ? input.url : input;
+            const requestMethod = init.method || (isRequest && input.method) || 'GET';
+            const hasExplicitBody = Object.prototype.hasOwnProperty.call(init, 'body');
+            const requestBody = hasExplicitBody ? init.body : (isRequest ? input.body : null);
+            observeLicenseRequest(
+              requestURL,
+              requestMethod,
+              [isRequest ? input.headers : null, init.headers],
+              requestBody,
+              'fetch'
+            );
             post(input && input.url ? input.url : input, 'network', '', document.title, false);
             return Reflect.apply(originalFetch, this, args).then(response => {
               try {
@@ -721,9 +1182,15 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
 
       try {
         const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+        const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
         const requestURL = Symbol('hlsDownloaderRequestURL');
+        const requestMethod = Symbol('hlsDownloaderRequestMethod');
+        const requestHeaders = Symbol('hlsDownloaderRequestHeaders');
         XMLHttpRequest.prototype.open = function(method, url, ...rest) {
           this[requestURL] = url;
+          this[requestMethod] = method;
+          this[requestHeaders] = [];
           post(url, 'network', '', document.title, false);
           this.addEventListener('load', () => {
             try {
@@ -741,6 +1208,23 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             } catch (_) {}
           }, { once: true });
           return Reflect.apply(originalOpen, this, [method, url, ...rest]);
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+          try {
+            if (!this[requestHeaders]) this[requestHeaders] = [];
+            this[requestHeaders].push([String(name || ''), String(value || '')]);
+          } catch (_) {}
+          return Reflect.apply(originalSetRequestHeader, this, [name, value]);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+          observeLicenseRequest(
+            this[requestURL],
+            this[requestMethod],
+            [this[requestHeaders]],
+            body,
+            'xmlHttpRequest'
+          );
+          return Reflect.apply(originalSend, this, [body]);
         };
       } catch (_) {}
 
@@ -795,8 +1279,11 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
     private static let maximumURLLength = 8_192
     private static let maximumLoggedReferences = 64
     private static let maximumNavigationContexts = 1_024
+    private static let maximumLicenseRequests = 128
 
     @Published private(set) var references: [DynamicMediaReference] = []
+    @Published private(set) var licenseRequests: [DynamicLicenseReference] = []
+    @Published private(set) var detectedWidevineKeySystem = false
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
     @Published private(set) var currentURL: URL?
@@ -806,6 +1293,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
     let rootURL: URL
     private let seedCookies: [HTTPCookie]
     private let diagnosticSink: DiagnosticSink?
+    private let messageNonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     private let websiteDataStore: WKWebsiteDataStore
     private let contentController: WKUserContentController
     private var scriptBridge: PlaybackCaptureScriptBridge?
@@ -823,6 +1311,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
     private var loggedReferenceCount = 0
     private var referenceLogLimitReported = false
     private var referenceIndexByKey: [String: Int] = [:]
+    private var licenseRequestKeys = Set<String>()
     private var navigationContexts: [String: (pageURL: URL, iframeDepth: Int)] = [:]
 
     init(
@@ -840,7 +1329,10 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         self.contentController = contentController
         contentController.addUserScript(
             WKUserScript(
-                source: WebPageInspectionSession.probeJavaScript(interactive: true),
+                source: WebPageInspectionSession.probeJavaScript(
+                    interactive: true,
+                    messageNonce: messageNonce
+                ),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false,
                 in: .page
@@ -934,11 +1426,16 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         startupTask = nil
         webView.stopLoading()
         let cookies = await allCookies()
-        let snapshot = DynamicPageInspection(media: references, cookies: cookies)
+        let snapshot = DynamicPageInspection(
+            media: references,
+            cookies: cookies,
+            licenseRequests: licenseRequests,
+            detectedWidevineKeySystem: detectedWidevineKeySystem
+        )
         stoppedSnapshot = snapshot
         cleanup()
         log(
-            "capture finish rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(references.count) blockedNavigations=\(blockedNavigationCount) blockedReferences=\(blockedReferenceCount) cookies=\(cookies.count)"
+            "capture finish rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(references.count) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) blockedReferences=\(blockedReferenceCount) cookies=\(cookies.count)"
         )
 
         let waiters = stopWaiters
@@ -1099,6 +1596,14 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         }
         rawMessageCount += 1
         guard let body = message.body as? [String: Any],
+              PlaybackProbePayloadParser.hasValidNonce(body, expected: messageNonce) else {
+            invalidMessageCount += 1
+            return
+        }
+        if receiveWidevineProbeEvent(body, message: message) {
+            return
+        }
+        guard
               let rawURL = body["url"] as? String,
               let rawManifestKind = body["manifestKind"] as? String,
               let kind = MediaCandidateKind(rawValue: rawManifestKind),
@@ -1149,8 +1654,66 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             title: title,
             thumbnailURL: thumbnailURL,
             iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
-            origin: origin
+            origin: origin,
+            frameToken: PlaybackProbePayloadParser.normalizedFrameToken(body["frameToken"] as? String),
+            sequence: (body["sequence"] as? NSNumber)?.intValue ?? 0
         )
+    }
+
+    private func receiveWidevineProbeEvent(
+        _ body: [String: Any],
+        message: WKScriptMessage
+    ) -> Bool {
+        switch body["eventKind"] as? String {
+        case "widevineEME":
+            if !detectedWidevineKeySystem {
+                detectedWidevineKeySystem = true
+                log("Widevine EME key-system request observed")
+            }
+            return true
+        case "licenseRequest":
+            guard let payload = PlaybackProbePayloadParser.licensePayload(from: body) else {
+                invalidMessageCount += 1
+                return true
+            }
+            guard let frameURL = trustedFrameURL(from: message.frameInfo),
+                  let url = resolvedWebURL(payload.rawURL, relativeTo: frameURL),
+                  AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: url) else {
+                blockedReferenceCount += 1
+                log("capture license metadata blocked by private-network policy")
+                return true
+            }
+            let depth = message.frameInfo.isMainFrame ? 0 : 1
+            let key = canonicalKey(url)
+                + "\n" + canonicalKey(frameURL)
+                + "\n" + (payload.frameToken ?? "")
+                + "\n" + payload.metadata.method
+                + "\n" + payload.metadata.source.rawValue
+            guard licenseRequestKeys.insert(key).inserted else { return true }
+            guard licenseRequests.count < Self.maximumLicenseRequests else {
+                if !referenceLimitReported {
+                    referenceLimitReported = true
+                    log("capture license metadata limit reached limit=\(Self.maximumLicenseRequests)")
+                }
+                return true
+            }
+            licenseRequests.append(
+                DynamicLicenseReference(
+                    url: url,
+                    pageURL: frameURL,
+                    iframeDepth: depth,
+                    frameToken: payload.frameToken,
+                    metadata: payload.metadata,
+                    sequence: payload.sequence
+                )
+            )
+            log(
+                "capture license request metadata observed source=\(payload.metadata.source.rawValue) method=\(payload.metadata.method) headers=\(payload.metadata.headerNames.count) body=\(payload.metadata.bodyKind.rawValue)"
+            )
+            return true
+        default:
+            return false
+        }
     }
 
     private func recordReference(
@@ -1160,7 +1723,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         title: String?,
         thumbnailURL: URL?,
         iframeDepth: Int,
-        origin: HLSCandidateOrigin
+        origin: HLSCandidateOrigin,
+        frameToken: String? = nil,
+        sequence: Int = 0
     ) {
         guard !isStopping, stoppedSnapshot == nil else { return }
         guard AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: url) else {
@@ -1168,12 +1733,17 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             return
         }
 
-        let key = kind.rawValue + "\n" + canonicalKey(url) + "\n" + canonicalKey(pageURL)
+        let key = kind.rawValue
+            + "\n" + canonicalKey(url)
+            + "\n" + canonicalKey(pageURL)
+            + "\n" + (frameToken ?? "")
         if let index = referenceIndexByKey[key] {
             duplicateReferenceCount += 1
             let existing = references[index]
             if existing.title == nil && title != nil
-                || existing.thumbnailURL == nil && thumbnailURL != nil {
+                || existing.thumbnailURL == nil && thumbnailURL != nil
+                || existing.frameToken == nil && frameToken != nil
+                || existing.sequence == 0 && sequence > 0 {
                 references[index] = DynamicMediaReference(
                     url: existing.url,
                     kind: existing.kind,
@@ -1181,7 +1751,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
                     title: existing.title ?? title,
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
                     iframeDepth: existing.iframeDepth,
-                    origin: existing.origin
+                    origin: existing.origin,
+                    frameToken: existing.frameToken ?? frameToken,
+                    sequence: existing.sequence > 0 ? existing.sequence : sequence
                 )
             }
             return
@@ -1202,7 +1774,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             title: title,
             thumbnailURL: thumbnailURL,
             iframeDepth: iframeDepth,
-            origin: origin
+            origin: origin,
+            frameToken: frameToken,
+            sequence: sequence
         )
         referenceIndexByKey[key] = references.count
         references.append(reference)

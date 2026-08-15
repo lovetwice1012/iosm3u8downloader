@@ -133,13 +133,13 @@ struct ContentView: View {
                 urlFieldFocused = false
                 viewModel.startPlaybackCapture()
             } label: {
-                Label("再生しながら解析（アルファ）", systemImage: "waveform.path.ecg.rectangle")
+                Label("再生ページを開いて解析（アルファ）", systemImage: "waveform.path.ecg.rectangle")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .disabled(!viewModel.canStart)
 
-            Text("ページをアプリ内で開き、実際に再生操作をしてHLS通信を検出します。検出後に解析を終了すると候補一覧へ追加します。")
+            Text("ページをアプリ内で開き、実際の再生操作からHLS、DASH/MPD、Widevine EMEとライセンス要求の試行を自動判定します。検出後に解析を終了すると候補一覧へ追加します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -323,16 +323,24 @@ struct ContentView: View {
     }
 
     private func widevineCandidateStatus(_ candidate: HLSCandidate) -> String {
+        let detection: String
+        if candidate.widevinePlaybackContext?.isHighConfidence == true {
+            detection = "再生時のWidevine EMEとライセンス要求を関連付けました。"
+        } else if candidate.widevinePlaybackContext != nil {
+            detection = "再生時のライセンス要求候補を検出しました。"
+        } else {
+            detection = "Widevine MPDを検出しました（ライセンス要求は未検出）。"
+        }
         guard isDownloadableWidevineDomain(candidate.playlistURL) else {
-            return "許可ドメイン外のWidevineは再生・保存できません。"
+            return detection + " 許可ドメイン外のため再生・保存できません。"
         }
         guard viewModel.hasWidevineCredential else {
-            return "保存にはWidevine L3のWVD読み込みが必要です。"
+            return detection + " 保存にはWidevine L3のWVD読み込みが必要です。"
         }
         guard viewModel.isWidevineProcessingConfigured else {
-            return "Widevine処理プロバイダの組み込みが必要です。"
+            return detection + " Widevine処理プロバイダの組み込みが必要です。"
         }
-        return "許可ドメインのWidevine候補です。"
+        return detection + " 許可ドメインのWidevine候補です。"
     }
 
     private var progressCard: some View {
@@ -539,12 +547,12 @@ private struct PlaybackCaptureBrowser: View {
                     .background(Color.orange.opacity(0.18), in: Capsule())
                     .foregroundStyle(.orange)
                 Spacer()
-                Text("HLS候補 \(session.references.count)件")
+                Text(captureSummary)
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
 
-            Text("ページ内の再生ボタンを押して動画を少し再生してください。候補が増えたら「解析を終了」を押します。")
+            Text("ページ内の再生ボタンを押して動画を少し再生してください。MPD、Widevine EME、ライセンス要求の試行も自動で観測します。候補が増えたら「解析を終了」を押します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
@@ -557,6 +565,13 @@ private struct PlaybackCaptureBrowser: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    private var captureSummary: String {
+        let hlsCount = session.references.filter { $0.kind == .hls }.count
+        let widevineCount = session.references.filter { $0.kind == .widevineDASH }.count
+        let eme = session.detectedWidevineKeySystem ? " / EME検出" : ""
+        return "HLS \(hlsCount) / Widevine \(widevineCount) / license要求 \(session.licenseRequests.count)\(eme)"
     }
 
     private var controls: some View {
