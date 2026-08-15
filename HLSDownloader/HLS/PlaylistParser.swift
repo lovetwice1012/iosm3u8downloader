@@ -122,7 +122,7 @@ enum PlaylistParser {
                     guard let offset = parsed.offset else { throw HLSError.byteRangeInvalid }
                     return try makeByteRange(offset: offset, length: parsed.length)
                 }
-                if currentEncryption != nil && currentEncryption?.explicitIV == nil {
+                if currentEncryption?.method == .aes128 && currentEncryption?.explicitIV == nil {
                     throw HLSError.invalidPlaylist("暗号化されたEXT-X-MAPには明示IVが必要です")
                 }
                 currentMap = InitializationMap(
@@ -200,7 +200,7 @@ enum PlaylistParser {
         let method = attributes["METHOD"]?.uppercased() ?? "NONE"
         if method == "NONE" { return nil }
 
-        guard method == EncryptionDescriptor.Method.aes128.rawValue else {
+        guard let encryptionMethod = EncryptionDescriptor.Method(rawValue: method) else {
             throw HLSError.drmUnsupported(method)
         }
         let keyFormat = attributes["KEYFORMAT"] ?? "identity"
@@ -211,7 +211,7 @@ enum PlaylistParser {
             throw HLSError.invalidPlaylist("EXT-X-KEY にURIがありません")
         }
         return EncryptionDescriptor(
-            method: .aes128,
+            method: encryptionMethod,
             keyURL: try URIResolver.resolve(uri, relativeTo: effectiveURL),
             explicitIV: try attributes["IV"].map(parseIV)
         )

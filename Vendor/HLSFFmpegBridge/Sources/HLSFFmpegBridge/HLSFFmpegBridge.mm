@@ -16,8 +16,8 @@ typedef struct {
     FFmpegSessionHandle handle;
     std::atomic<int> cancel_requested{0};
     std::atomic<int> execution_finished{0};
-    std::string diagnostic_secret_one;
-    std::string diagnostic_secret_two;
+    std::vector<std::string> diagnostic_secrets;
+    bool is_probe{false};
     bool owns_session_gate{false};
 } HLSFFmpegRemuxSession;
 
@@ -104,26 +104,24 @@ static void hls_copy_diagnostic_tail(
 
 static void hls_copy_redacted_diagnostic_tail(
     const char *source,
-    const std::string &secret_one,
-    const std::string &secret_two,
+    const std::vector<std::string> &secrets,
     char *destination,
     size_t destination_size
 ) {
-    if (source == NULL || (secret_one.empty() && secret_two.empty())) {
+    if (source == NULL || secrets.empty()) {
         hls_copy_diagnostic_tail(source, destination, destination_size);
         return;
     }
 
     std::string sanitized(source);
     const std::string replacement("<redacted>");
-    const std::string *secrets[] = { &secret_one, &secret_two };
-    for (const std::string *secret : secrets) {
-        if (secret->empty()) {
+    for (const std::string &secret : secrets) {
+        if (secret.empty()) {
             continue;
         }
         size_t position = 0;
-        while ((position = sanitized.find(*secret, position)) != std::string::npos) {
-            sanitized.replace(position, secret->length(), replacement);
+        while ((position = sanitized.find(secret, position)) != std::string::npos) {
+            sanitized.replace(position, secret.length(), replacement);
             position += replacement.length();
         }
     }
@@ -298,11 +296,360 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
     }
     session->handle = handle;
     session->owns_session_gate = true;
-    session->diagnostic_secret_one.assign(video_decryption_key_hex);
+    session->diagnostic_secrets.emplace_back(video_decryption_key_hex);
     if (audio_decryption_key_hex != NULL) {
-        session->diagnostic_secret_two.assign(audio_decryption_key_hex);
+        session->diagnostic_secrets.emplace_back(audio_decryption_key_hex);
     }
     return session;
+}
+
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
+    const char *primary_playlist_path,
+    const char *audio_playlist_path,
+    const char *output_path,
+    int32_t output_mode
+) {
+    if (primary_playlist_path == NULL || output_path == NULL) {
+        return NULL;
+    }
+    const bool writes_mp4 = output_mode == HLS_FFMPEG_SAMPLE_AES_OUTPUT_MP4;
+    const bool writes_wav = output_mode == HLS_FFMPEG_SAMPLE_AES_OUTPUT_WAV_PCM_S16LE;
+    if ((!writes_mp4 && !writes_wav) || (writes_wav && audio_playlist_path != NULL)) {
+        return NULL;
+    }
+
+    hls_ffmpeg_initialize_once();
+    if (!hls_ffmpeg_try_acquire_session_gate()) {
+        return NULL;
+    }
+
+    // The app creates these playlists itself and gives every resource a fixed,
+    // local filename.  Restrict nested HLS access to local protocols even if a
+    // malformed playlist reaches the bridge.
+    const char *local_protocols = "file,crypto";
+    const char *readable_extensions =
+        "m3u8,key,ts,m2t,m2ts,mts,mpg,mpeg,mpegts,aac,ac3,eac3,ec3,"
+        "m4a,m4s,m4v,mov,mp4,cmfa,cmfv,fmp4";
+    const char *media_extensions =
+        "ts,m2t,m2ts,mts,mpg,mpeg,mpegts,aac,ac3,eac3,ec3,"
+        "m4a,m4s,m4v,mov,mp4,cmfa,cmfv,fmp4";
+    std::vector<const char *> arguments = {
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel", "warning",
+        "-y",
+        "-copyts",
+        "-start_at_zero",
+        "-fflags", "+genpts",
+        "-protocol_whitelist", local_protocols,
+        "-allowed_extensions", readable_extensions,
+        "-allowed_segment_extensions", media_extensions,
+        "-i", primary_playlist_path
+    };
+    if (writes_mp4 && audio_playlist_path != NULL) {
+        arguments.insert(arguments.end(), {
+            "-isync", "0",
+            "-fflags", "+genpts",
+            "-protocol_whitelist", local_protocols,
+            "-allowed_extensions", readable_extensions,
+            "-allowed_segment_extensions", media_extensions,
+            "-i", audio_playlist_path
+        });
+    }
+    if (writes_mp4) {
+        arguments.insert(arguments.end(), {
+            "-map", "0:v:0",
+            "-map", audio_playlist_path != NULL ? "1:a:0" : "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            "-f", "mp4",
+            output_path
+        });
+    } else {
+        arguments.insert(arguments.end(), {
+            "-map", "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-c:a", "pcm_s16le",
+            "-rf64", "auto",
+            "-f", "wav",
+            output_path
+        });
+    }
+
+    FFmpegSessionHandle handle = ffmpeg_kit_create_session_from_argv(
+        (int)arguments.size(),
+        arguments.data()
+    );
+    if (handle == NULL) {
+        ffmpeg_kit_clear_sessions();
+        hls_ffmpeg_release_session_gate();
+        return NULL;
+    }
+    ffmpeg_kit_set_log_callback(handle, hls_ffmpeg_discard_log, NULL);
+
+    HLSFFmpegRemuxSession *session = new (std::nothrow) HLSFFmpegRemuxSession();
+    if (session == NULL) {
+        hls_ffmpeg_release_failed_session(handle);
+        return NULL;
+    }
+    session->handle = handle;
+    session->owns_session_gate = true;
+    return session;
+}
+
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
+    const char *input_path,
+    const char *decryption_key_hex,
+    const char *output_path
+) {
+    if (input_path == NULL || output_path == NULL) {
+        return NULL;
+    }
+    if (decryption_key_hex != NULL && !hls_is_hex_key(decryption_key_hex)) {
+        return NULL;
+    }
+
+    hls_ffmpeg_initialize_once();
+    if (!hls_ffmpeg_try_acquire_session_gate()) {
+        return NULL;
+    }
+
+    std::vector<const char *> arguments = {
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel", "warning",
+        "-y",
+        "-fflags", "+genpts",
+        "-protocol_whitelist", "file,crypto"
+    };
+    if (decryption_key_hex != NULL) {
+        arguments.insert(arguments.end(), {
+            "-decryption_key", decryption_key_hex
+        });
+    }
+    arguments.insert(arguments.end(), {
+        "-i", input_path,
+        "-map", "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-c:a", "pcm_s16le",
+        "-rf64", "auto",
+        "-f", "wav",
+        output_path
+    });
+
+    FFmpegSessionHandle handle = ffmpeg_kit_create_session_from_argv(
+        (int)arguments.size(),
+        arguments.data()
+    );
+    if (handle == NULL) {
+        ffmpeg_kit_clear_sessions();
+        hls_ffmpeg_release_session_gate();
+        return NULL;
+    }
+    ffmpeg_kit_set_log_callback(handle, hls_ffmpeg_discard_log, NULL);
+
+    HLSFFmpegRemuxSession *session = new (std::nothrow) HLSFFmpegRemuxSession();
+    if (session == NULL) {
+        hls_ffmpeg_release_failed_session(handle);
+        return NULL;
+    }
+    session->handle = handle;
+    session->owns_session_gate = true;
+    if (decryption_key_hex != NULL) {
+        session->diagnostic_secrets.emplace_back(decryption_key_hex);
+    }
+    return session;
+}
+
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_media_probe_session_create(
+    const char *input_path,
+    const char *decryption_key_hex,
+    int32_t input_kind
+) {
+    if (input_path == NULL) {
+        return NULL;
+    }
+    const bool probes_media = input_kind == HLS_FFMPEG_PROBE_INPUT_MEDIA_FILE;
+    const bool probes_sample_aes =
+        input_kind == HLS_FFMPEG_PROBE_INPUT_SAMPLE_AES_PLAYLIST;
+    if ((!probes_media && !probes_sample_aes)
+        || (decryption_key_hex != NULL && !hls_is_hex_key(decryption_key_hex))
+        || (probes_sample_aes && decryption_key_hex != NULL)) {
+        return NULL;
+    }
+
+    hls_ffmpeg_initialize_once();
+    if (!hls_ffmpeg_try_acquire_session_gate()) {
+        return NULL;
+    }
+
+    const char *local_protocols = "file,crypto";
+    const char *readable_extensions =
+        "m3u8,key,ts,m2t,m2ts,mts,mpg,mpeg,mpegts,aac,ac3,eac3,ec3,"
+        "m4a,m4s,m4v,mov,mp4,cmfa,cmfv,fmp4";
+    const char *media_extensions =
+        "ts,m2t,m2ts,mts,mpg,mpeg,mpegts,aac,ac3,eac3,ec3,"
+        "m4a,m4s,m4v,mov,mp4,cmfa,cmfv,fmp4";
+    std::vector<const char *> arguments = {
+        "-v", "error"
+    };
+    if (probes_sample_aes) {
+        arguments.insert(arguments.end(), {
+            "-protocol_whitelist", local_protocols,
+            "-allowed_extensions", readable_extensions,
+            "-allowed_segment_extensions", media_extensions
+        });
+    } else {
+        arguments.insert(arguments.end(), {
+            "-protocol_whitelist", local_protocols
+        });
+        if (decryption_key_hex != NULL) {
+            arguments.insert(arguments.end(), {
+                "-decryption_key", decryption_key_hex
+            });
+        }
+    }
+    arguments.insert(arguments.end(), {
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0",
+        input_path
+    });
+
+    FFprobeSessionHandle handle = ffprobe_kit_create_session_from_argv(
+        (int)arguments.size(),
+        arguments.data()
+    );
+    if (handle == NULL) {
+        ffmpeg_kit_clear_sessions();
+        hls_ffmpeg_release_session_gate();
+        return NULL;
+    }
+    ffprobe_kit_set_log_callback(handle, hls_ffmpeg_discard_log, NULL);
+
+    HLSFFmpegRemuxSession *session = new (std::nothrow) HLSFFmpegRemuxSession();
+    if (session == NULL) {
+        hls_ffmpeg_release_failed_session(handle);
+        return NULL;
+    }
+    session->handle = handle;
+    session->is_probe = true;
+    session->owns_session_gate = true;
+    if (decryption_key_hex != NULL) {
+        session->diagnostic_secrets.emplace_back(decryption_key_hex);
+    }
+    return session;
+}
+
+int32_t hls_ffmpeg_remux_session_add_diagnostic_secret(
+    HLSFFmpegRemuxSessionHandle session_handle,
+    const char *secret
+) {
+    HLSFFmpegRemuxSession *session = static_cast<HLSFFmpegRemuxSession *>(session_handle);
+    if (session == NULL
+        || secret == NULL
+        || session->handle == NULL
+        || ffmpeg_kit_session_get_state(session->handle)
+            != FFMPEG_KIT_SESSION_STATE_CREATED) {
+        return 0;
+    }
+    const size_t length = strnlen(secret, 513);
+    if (length == 0 || length > 512 || session->diagnostic_secrets.size() >= 256) {
+        return 0;
+    }
+    session->diagnostic_secrets.emplace_back(secret, length);
+    return 1;
+}
+
+int32_t hls_ffmpeg_media_probe_session_execute(
+    HLSFFmpegRemuxSessionHandle session_handle,
+    char *diagnostic_buffer,
+    size_t diagnostic_buffer_size
+) {
+    HLSFFmpegRemuxSession *session = static_cast<HLSFFmpegRemuxSession *>(session_handle);
+    if (diagnostic_buffer != NULL && diagnostic_buffer_size > 0) {
+        diagnostic_buffer[0] = '\0';
+    }
+    if (session == NULL || session->handle == NULL || !session->is_probe) {
+        hls_copy_diagnostic_tail(
+            "FFprobe session could not be created.",
+            diagnostic_buffer,
+            diagnostic_buffer_size
+        );
+        return -1;
+    }
+    if (session->cancel_requested.load(std::memory_order_acquire)) {
+        hls_copy_diagnostic_tail(
+            "FFprobe session was cancelled before execution.",
+            diagnostic_buffer,
+            diagnostic_buffer_size
+        );
+        session->execution_finished.store(1, std::memory_order_release);
+        return -1;
+    }
+
+    ffprobe_kit_session_execute(session->handle);
+    const int64_t return_code = ffmpeg_kit_session_get_return_code(session->handle);
+    if (return_code != 0) {
+        char *logs = ffmpeg_kit_session_get_logs_as_string(session->handle);
+        hls_copy_redacted_diagnostic_tail(
+            logs,
+            session->diagnostic_secrets,
+            diagnostic_buffer,
+            diagnostic_buffer_size
+        );
+        if (logs != NULL) {
+            ffmpeg_kit_free(logs);
+        }
+        session->execution_finished.store(1, std::memory_order_release);
+        return -1;
+    }
+
+    int32_t tracks = 0;
+    char *output = ffmpeg_kit_session_get_output(session->handle);
+    if (output != NULL) {
+        std::string text(output);
+        size_t start = 0;
+        while (start <= text.length()) {
+            const size_t end = text.find_first_of("\r\n", start);
+            const size_t count = end == std::string::npos
+                ? text.length() - start
+                : end - start;
+            std::string line = text.substr(start, count);
+            line.erase(0, line.find_first_not_of(" \t"));
+            const size_t last = line.find_last_not_of(" \t");
+            if (last == std::string::npos) {
+                line.clear();
+            } else {
+                line.erase(last + 1);
+            }
+            if (line == "audio") {
+                tracks |= HLS_FFMPEG_TRACK_AUDIO;
+            } else if (line == "video") {
+                tracks |= HLS_FFMPEG_TRACK_VIDEO;
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+        ffmpeg_kit_free(output);
+    }
+    session->execution_finished.store(1, std::memory_order_release);
+    if (tracks == 0) {
+        hls_copy_diagnostic_tail(
+            "No audio or video streams were found.",
+            diagnostic_buffer,
+            diagnostic_buffer_size
+        );
+        return -1;
+    }
+    return tracks;
 }
 
 int64_t hls_ffmpeg_remux_session_execute(
@@ -314,7 +661,7 @@ int64_t hls_ffmpeg_remux_session_execute(
     if (diagnostic_buffer != NULL && diagnostic_buffer_size > 0) {
         diagnostic_buffer[0] = '\0';
     }
-    if (session == NULL || session->handle == NULL) {
+    if (session == NULL || session->handle == NULL || session->is_probe) {
         hls_copy_diagnostic_tail(
             "FFmpeg session could not be created.",
             diagnostic_buffer,
@@ -338,8 +685,7 @@ int64_t hls_ffmpeg_remux_session_execute(
         char *logs = ffmpeg_kit_session_get_logs_as_string(session->handle);
         hls_copy_redacted_diagnostic_tail(
             logs,
-            session->diagnostic_secret_one,
-            session->diagnostic_secret_two,
+            session->diagnostic_secrets,
             diagnostic_buffer,
             diagnostic_buffer_size
         );
@@ -361,7 +707,13 @@ void hls_ffmpeg_remux_session_cancel(HLSFFmpegRemuxSessionHandle session_handle)
             }
             FFmpegKitSessionState state = ffmpeg_kit_session_get_state(session->handle);
             if (state == FFMPEG_KIT_SESSION_STATE_RUNNING) {
-                ffmpeg_kit_session_cancel(session->handle);
+                if (session->is_probe) {
+                    ffprobe_kit_cancel_session(
+                        ffmpeg_kit_session_get_session_id(session->handle)
+                    );
+                } else {
+                    ffmpeg_kit_session_cancel(session->handle);
+                }
                 return;
             }
             if (state == FFMPEG_KIT_SESSION_STATE_COMPLETED
@@ -370,7 +722,13 @@ void hls_ffmpeg_remux_session_cancel(HLSFFmpegRemuxSessionHandle session_handle)
             }
             usleep(1000);
         }
-        ffmpeg_kit_session_cancel(session->handle);
+        if (session->is_probe) {
+            ffprobe_kit_cancel_session(
+                ffmpeg_kit_session_get_session_id(session->handle)
+            );
+        } else {
+            ffmpeg_kit_session_cancel(session->handle);
+        }
     }
 }
 
@@ -387,16 +745,10 @@ void hls_ffmpeg_remux_session_destroy(HLSFFmpegRemuxSessionHandle session_handle
     // ffmpeg_kit_config_clear_sessions(), which also cancels registered work.
     // The global gate guarantees no other bridge session can be affected.
     ffmpeg_kit_clear_sessions();
-    std::fill(
-        session->diagnostic_secret_one.begin(),
-        session->diagnostic_secret_one.end(),
-        '\0'
-    );
-    std::fill(
-        session->diagnostic_secret_two.begin(),
-        session->diagnostic_secret_two.end(),
-        '\0'
-    );
+    for (std::string &secret : session->diagnostic_secrets) {
+        std::fill(secret.begin(), secret.end(), '\0');
+    }
+    session->diagnostic_secrets.clear();
     if (session->owns_session_gate) {
         session->owns_session_gate = false;
         hls_ffmpeg_release_session_gate();

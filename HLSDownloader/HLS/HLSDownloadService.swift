@@ -47,6 +47,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private let planBuilder: DownloadPlanBuilder
     private let segmentDownloader: SegmentDownloader
     private let composer = MP4Composer()
+    private let sampleAESComposer = SampleAESFFmpegComposer()
     private let fileStore = FileStore()
     private let diagnostics: DiagnosticLogStore
     private let widevineCredentialStore: any WidevineCredentialStoring
@@ -236,6 +237,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         }
         return try await downloadWithBackgroundExecution(
             document: document,
+            requestedPlaylistURL: candidate.request.primary,
             progress: progress
         )
     }
@@ -364,11 +366,17 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         guard values.isRegularFile == true,
               values.isSymbolicLink != true,
               (values.fileSize ?? 0) > 0,
-              Self.isMP4File(sourceURL) else {
+              WidevineMediaOutputValidator.isValid(
+                sourceURL,
+                format: processed.outputFormat
+              ) else {
             throw WidevineProcessingError.invalidOutput
         }
 
-        let locations = try fileStore.outputLocations(for: document.effectiveURL)
+        let locations = try fileStore.outputLocations(
+            for: document.effectiveURL,
+            format: processed.outputFormat
+        )
         try? FileManager.default.removeItem(at: locations.temporary)
         do {
             try await fileStore.copyProtectedFile(
@@ -376,6 +384,12 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 to: locations.temporary
             )
             try Task.checkCancellation()
+            guard WidevineMediaOutputValidator.isValid(
+                locations.temporary,
+                format: processed.outputFormat
+            ) else {
+                throw WidevineProcessingError.invalidOutput
+            }
             // 保存へ進む直前の最終チェック。許可host比較はこの共通関数だけが行う。
             guard isDownloadableWidevineDomain(document.effectiveURL) else {
                 throw WidevineProcessingError.domainNotAllowed
@@ -387,7 +401,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         }
 
         await progress(DownloadProgress(phase: .completed, completedItems: 1, totalItems: 1))
-        diagnostics.record("widevine", "processing completed")
+        diagnostics.record(
+            "widevine",
+            "processing completed format=\(processed.outputFormat.rawValue)"
+        )
         return DownloadResult(
             outputURL: locations.final,
             sourceURL: document.effectiveURL,
@@ -395,21 +412,9 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         )
     }
 
-    private static func isMP4File(_ url: URL) -> Bool {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? handle.close() }
-        guard let header = try? handle.read(upToCount: 12),
-              header.count == 12 else { return false }
-
-        let declaredSize = header.prefix(4).reduce(UInt32.zero) {
-            ($0 << 8) | UInt32($1)
-        }
-        guard declaredSize == 0 || declaredSize >= 8 else { return false }
-        return header[4..<8].elementsEqual(Data("ftyp".utf8))
-    }
-
     private func downloadWithBackgroundExecution(
         document: PlaylistDocument,
+        requestedPlaylistURL: URL,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         try await BackgroundExecutionCoordinator.shared.run(
@@ -420,7 +425,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             await backgroundProgress.report(
                 DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
             )
-            return try await download(document: document) { update in
+            return try await download(
+                document: document,
+                requestedPlaylistURL: requestedPlaylistURL
+            ) { update in
                 await backgroundProgress.report(update)
                 await progress(update)
             }
@@ -429,18 +437,34 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
     private func download(
         document: PlaylistDocument,
+        requestedPlaylistURL: URL,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         let jobDirectory = try fileStore.makeJobDirectory()
         var temporaryOutput: URL?
 
         do {
-            let plan = try await planBuilder.build(from: document)
+            let preparedPlan = try await planBuilder.build(
+                from: document,
+                requestedURL: requestedPlaylistURL
+            )
+            let plan = preparedPlan.plan
             try Task.checkCancellation()
             diagnostics.record(
                 "download",
                 "plan ready mainSegments=\(plan.main.segments.count) audioSegments=\(plan.audio?.segments.count ?? 0) total=\(plan.segmentCount) \(DiagnosticPrivacy.urlSummary(plan.sourceURL))"
             )
+
+            if preparedPlan.containsSampleAES {
+                guard !preparedPlan.containsAES128 else {
+                    throw HLSError.drmUnsupported("mixed AES-128 and SAMPLE-AES playlists")
+                }
+                return try await downloadSampleAES(
+                    preparedPlan,
+                    jobDirectory: jobDirectory,
+                    progress: progress
+                )
+            }
 
             await progress(
                 DownloadProgress(phase: .downloading, completedItems: 0, totalItems: plan.segmentCount)
@@ -485,10 +509,25 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
             try Task.checkCancellation()
             await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
-            diagnostics.record("compose", "started mainFiles=\(main.count) audioFiles=\(audio?.count ?? 0)")
-            let locations = try fileStore.outputLocations(for: plan.sourceURL)
+            let outputFormat = try await composer.outputFormat(
+                main: main,
+                externalAudio: audio
+            )
+            diagnostics.record(
+                "compose",
+                "started format=\(outputFormat.rawValue) mainFiles=\(main.count) audioFiles=\(audio?.count ?? 0)"
+            )
+            let locations = try fileStore.outputLocations(
+                for: plan.sourceURL,
+                format: outputFormat
+            )
             temporaryOutput = locations.temporary
-            try await composer.compose(main: main, externalAudio: audio, outputURL: locations.temporary)
+            try await composer.compose(
+                main: main,
+                externalAudio: audio,
+                format: outputFormat,
+                outputURL: locations.temporary
+            )
             try FileManager.default.moveItem(at: locations.temporary, to: locations.final)
             temporaryOutput = nil
             fileStore.removeJobDirectory(jobDirectory)
@@ -519,6 +558,119 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             fileStore.removeJobDirectory(jobDirectory)
             throw error
         }
+    }
+
+    private func downloadSampleAES(
+        _ prepared: PreparedDownloadPlan,
+        jobDirectory: URL,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        try prepared.validateSampleAESPermit()
+        let plan = prepared.plan
+        await progress(
+            DownloadProgress(
+                phase: .downloading,
+                completedItems: 0,
+                totalItems: plan.segmentCount
+            )
+        )
+        let progressTracker = SegmentProgressTracker(
+            totalItems: plan.segmentCount,
+            progress: progress
+        )
+
+        let main: DownloadedSampleAESPlaylist
+        let audio: DownloadedSampleAESPlaylist?
+        if let audioPlaylist = plan.audio,
+           let audioRequestedURL = prepared.audioRequestedURL {
+            async let mainDownload = segmentDownloader.downloadSampleAESPlaylist(
+                playlist: plan.main,
+                requestedPlaylistURL: prepared.mainRequestedURL,
+                prefix: "main",
+                directory: jobDirectory,
+                completedBefore: 0,
+                totalSegments: plan.segmentCount,
+                progress: { _ in await progressTracker.segmentCompleted() }
+            )
+            async let audioDownload = segmentDownloader.downloadSampleAESPlaylist(
+                playlist: audioPlaylist,
+                requestedPlaylistURL: audioRequestedURL,
+                prefix: "audio",
+                directory: jobDirectory,
+                completedBefore: 0,
+                totalSegments: plan.segmentCount,
+                progress: { _ in await progressTracker.segmentCompleted() }
+            )
+            let downloaded = try await (mainDownload, audioDownload)
+            main = downloaded.0
+            audio = downloaded.1
+        } else {
+            main = try await segmentDownloader.downloadSampleAESPlaylist(
+                playlist: plan.main,
+                requestedPlaylistURL: prepared.mainRequestedURL,
+                prefix: "main",
+                directory: jobDirectory,
+                completedBefore: 0,
+                totalSegments: plan.segmentCount,
+                progress: { _ in await progressTracker.segmentCompleted() }
+            )
+            audio = nil
+        }
+
+        try Task.checkCancellation()
+        try prepared.validateSampleAESPermit()
+        await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
+        diagnostics.record(
+            "compose",
+            "SAMPLE-AES started mainSegments=\(plan.main.segments.count) audioSegments=\(plan.audio?.segments.count ?? 0)"
+        )
+        let decryptedOutput = jobDirectory.appendingPathComponent(
+            "sample-aes-decrypted-output.tmp",
+            isDirectory: false
+        )
+        let diagnosticKeys = Array(Set(
+            main.diagnosticKeys + (audio?.diagnosticKeys ?? [])
+        ))
+        let composedFormat = try await sampleAESComposer.compose(
+            primaryPlaylistURL: main.playlistURL,
+            externalAudioPlaylistURL: audio?.playlistURL,
+            diagnosticKeys: diagnosticKeys,
+            outputURL: decryptedOutput
+        )
+        let outputFormat: MediaOutputFormat = composedFormat == .wav ? .wav : .mp4
+
+        try Task.checkCancellation()
+        try prepared.validateSampleAESPermit()
+        let locations = try fileStore.outputLocations(
+            for: plan.sourceURL,
+            format: outputFormat
+        )
+        do {
+            try await fileStore.copyProtectedFile(
+                from: decryptedOutput,
+                to: locations.temporary
+            )
+            try Task.checkCancellation()
+            // The common playlist permit is the final gate before a decrypted
+            // artifact becomes a user-visible export.
+            try prepared.validateSampleAESPermit()
+            try FileManager.default.moveItem(at: locations.temporary, to: locations.final)
+        } catch {
+            try? FileManager.default.removeItem(at: locations.temporary)
+            throw error
+        }
+
+        fileStore.removeJobDirectory(jobDirectory)
+        await progress(DownloadProgress(phase: .completed, completedItems: 1, totalItems: 1))
+        diagnostics.record(
+            "download",
+            "SAMPLE-AES completed format=\(outputFormat.rawValue) segments=\(plan.segmentCount)"
+        )
+        return DownloadResult(
+            outputURL: locations.final,
+            sourceURL: plan.sourceURL,
+            segmentCount: plan.segmentCount
+        )
     }
 
     private static func hasImageSignature(_ data: Data) -> Bool {

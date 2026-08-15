@@ -1,6 +1,6 @@
 # HLS Downloader for iOS
 
-URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして単一MP4へまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
+URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして、映像を含む配信はMP4、音声のみの配信はPCM WAVへまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
 
 ## 主な機能
 
@@ -20,7 +20,7 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - identity `AES-128`（AES-CBC、鍵ローテーション、明示IV/sequence IV）
 - MPEG-TSはFFmpegKit/FFmpegで再圧縮せずMP4へremuxし、fMP4等はAVFoundationで結合
 - 断片単体を開けない場合のplaylist単位連結再試行
-- 完成MP4の共有・「ファイル」への保存
+- 完成MP4/WAVの共有・「ファイル」への保存
 - URLやCookieの秘密値を残さない、コピー・共有可能な診断ログ
 - MPEG-DASH/MPDの`ContentProtection`、Widevine system ID、PSSH、CENC/CBCSの検出（アルファ）
 - Widevine L3 WVD v2の構造検証と、端末限定Keychainへの保存
@@ -52,6 +52,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 - 認証なし、URL内の署名query、またはページ自身の読み込み中に得られるCookieで取得できるHTTP(S)
 - H.264/HEVC + AACなど、MP4へ格納でき、端末が再生できるコーデック
 - 選択した1つの映像variantと、それに対応する既定音声の全断片
+- 映像trackを含まないHLS/DASH音声の16-bit PCM WAV保存
+- identity `SAMPLE-AES`（許可host上のVOD。FairPlay key formatは対象外）
 
 ### Widevineアルファ基盤
 
@@ -61,25 +63,26 @@ WVDファイルはアプリUIから読み込み、magic/version/Androidまたは
 
 Widevineはm3u8/MPDの直リンクだけを前提にせず、「再生ページを開いて解析」からページ内の再生操作を監視します。MPD、`requestMediaKeySystemAccess("com.widevine.alpha")`、`MediaKeySession`のmessage、および直後の`fetch` / XHRを観測し、frame tokenとevent順序でmanifest候補へ結び付けます。候補へ保持するのはlicense URL、method、Content-Type、header**名**、body種別・サイズだけで、Authorization等のheader値、challenge、license応答本文は保持しません。
 
-標準WKWebView側でWidevine CDMが利用できずEMEが拒否されたページでは、MPDとWidevine試行は検出できても、license要求が発生しない場合があります。fetch/XHRは送信直前に観測するため、画面では「通信完了」ではなく「license要求候補」として表示します。Worker / Service Worker内だけで完結する通信も対象外です。
+iOS標準のAVFoundation／WKWebViewがネイティブ対応するDRMはFairPlayで、Widevine CDMは内蔵されていません。このリポジトリのWidevine L3処理はWVDを使う独自ソフトウェア経路であり、iOS標準のWidevine再生機能ではありません。WKWebViewでEMEが拒否されたページでは、MPDとWidevine試行は検出できても、license要求が発生しない場合があります。fetch/XHRは送信直前に観測するため、画面では「通信完了」ではなく「license要求候補」として表示します。Worker / Service Worker内だけで完結する通信も対象外です。
 
-mainの実行providerは、WVD v2/L3からoffline license challengeを生成し、MPDで選択した映像・音声representationのsegmentを上限付きで取得して、CENC/CBCSの復号とMP4結合を行います。静的VODの単一Period、`SegmentTemplate` / `SegmentTimeline` / `SegmentList`、映像・音声それぞれ1つのKIDに対応します。ライセンスはoffline保存と再生を明示的に許可し、期限・renewal・output protectionなど、平文MP4で強制できない制約を持たない場合だけ受理します。
+mainの実行providerは、WVD v2/L3からoffline license challengeを生成し、MPDで選択した映像・音声representationのsegmentを上限付きで取得して、CENC/CBCSの復号を行います。映像を含む場合はMP4へ結合し、音声trackだけの場合は16-bit PCM WAVへ変換します。静的VODの単一Period、`SegmentTemplate` / `SegmentTimeline` / `SegmentList`、映像・音声それぞれ1つのKIDに対応します。ライセンスはoffline保存と再生を明示的に許可し、期限・renewal・output protectionなど、復号済みファイルで強制できない制約を持たない場合だけ受理します。
 
 license要求はraw binaryを標準経路とし、応答はraw SignedMessage、厳格なbase64、または既知の単一JSON fieldだけを受理します。Authorization等のheader値、独自署名、privacy mode、独自JSON/form wrapperが必要なサービスは、運営者仕様に合わせたtransport設定が別途必要です。複数Period、dynamic MPD、KID rotation、`SegmentBase`、Worker内だけで完結する通信は現在の対象外です。復号キーを渡すFFmpeg処理は全セッションを直列化し、stdoutへのログ転送を止め、終了時にFFmpegKitのsession historyを消去します。復号途中・保存途中の平文ファイルは最初のbyteを書き込む前からData Protectionを設定し、前回の強制終了で残った専用一時ファイルを次回起動時に削除します。
 
 次の形式は、壊れた出力を作らずエラーとして終了します。
 
 - 終端のないlive/event playlist
-- FairPlay、`SAMPLE-AES`、非identity key format
+- FairPlay key format、`SAMPLE-AES-CTR`、非identity key format
+- main/audio rendition間で暗号方式が異なるSAMPLE-AES構成
 - Safari等、別アプリのログインCookieだけを必要とするページ（αブラウザ内でログインできるページは、その非永続セッションのCookieを選択後のダウンロードへ引き継ぎます）
 - Worker / Service Worker内だけでHLS URLを生成し、ページ側へURLを公開しないプレイヤー
 - `#EXT-X-GAP` を含むplaylist
 - `#EXT-X-DISCONTINUITY` を含むplaylist
 - AVFoundationがMP4へ出力できないコーデック
 
-再生通信の解析用ブラウザはforeground専用です。解析中にアプリをbackgroundへ移すと、その時点までの候補とCookieを確定して解析を終了します。候補を選んだ後のダウンロードとMP4化は、iOS 26以降ではジョブごとの一意なidentifierでContinued Processing Taskを動的に登録・要求し、システムが受理した場合はbackgroundでも継続します。個人再署名でBundle IDが変更されてbackground task identifierが一致しない場合、またはiOS 17〜25では、`beginBackgroundTask`による短時間の完了猶予へ自動的にフォールバックします。システムのリソース制約、Live Activityからの取消、Appスイッチャーでの強制終了では中断されます。途中でキャンセルすると、そのジョブの一時断片と未完成MP4を削除します。
+再生通信の解析用ブラウザはforeground専用です。解析中にアプリをbackgroundへ移すと、その時点までの候補とCookieを確定して解析を終了します。候補を選んだ後のダウンロードとMP4/WAV生成は、iOS 26以降ではジョブごとの一意なidentifierでContinued Processing Taskを動的に登録・要求し、システムが受理した場合はbackgroundでも継続します。個人再署名でBundle IDが変更されてbackground task identifierが一致しない場合、またはiOS 17〜25では、`beginBackgroundTask`による短時間の完了猶予へ自動的にフォールバックします。システムのリソース制約、Live Activityからの取消、Appスイッチャーでの強制終了では中断されます。途中でキャンセルすると、そのジョブの一時断片と未完成ファイルを削除します。
 
-候補が不足する場合や取得に失敗した場合は、画面下部の「診断ログ」を更新してコピーまたは共有できます。静的HTML、iframe、WebKit動的監視、playlist検証、ダウンロード、MP4結合の各段階と件数・失敗分類を記録します。URLは実URLの代わりに実行中だけ有効な識別子と形状情報を残し、query値、Cookie、Referer、HTML本文、タイトルは記録しません。
+候補が不足する場合や取得に失敗した場合は、画面下部の「診断ログ」を更新してコピーまたは共有できます。静的HTML、iframe、WebKit動的監視、playlist検証、ダウンロード、MP4/WAV生成の各段階と件数・失敗分類を記録します。URLは実URLの代わりに実行中だけ有効な識別子と形状情報を残し、query値、Cookie、Referer、HTML本文、タイトルは記録しません。
 
 ## プライバシーと利用条件
 
@@ -99,7 +102,7 @@ iOS 17以降のWebKitには、特定の`WKWebsiteDataStore`だけをHTTP CONNECT
 
 ## FFmpegとオープンソースライセンス
 
-MPEG-TSをMP4へ詰め替えるため、FFmpegKit Extended / FFmpeg 8.1.2のLGPLビルドを動的frameworkとして使用します。映像・音声は `-c copy` でstream copyし、再エンコードしません。バイナリは `v0.10.5-ios` のURLとSHA-256をSwift Packageで固定しています。正確なsource、checksum、同梱ライブラリのライセンス本文は [`ThirdPartyNotices.txt`](HLSDownloader/Resources/ThirdPartyNotices.txt) に収録しています。
+MPEG-TSのMP4化、identity SAMPLE-AESの復号、音声のみ配信のPCM WAV化に、FFmpegKit Extended / FFmpeg 8.1.2のLGPLビルドを動的frameworkとして使用します。映像を含むMP4は原則 `-c copy` でstream copyし、WAVだけは `pcm_s16le` へ変換します。バイナリは `v0.10.5-ios` のURLとSHA-256をSwift Packageで固定しています。正確なsource、checksum、同梱ライブラリのライセンス本文は [`ThirdPartyNotices.txt`](HLSDownloader/Resources/ThirdPartyNotices.txt) に収録しています。
 
 ## プロジェクト構成
 

@@ -280,7 +280,7 @@ final class BackgroundExecutionCoordinator {
         log(job, "short background allowance selected")
         let jobID = job.id
         job.shortTaskToken = shortTaskManager.beginTask(
-            name: "HLS download and MP4 composition"
+            name: "HLS download and media composition"
         ) { [weak self] in
             Task { @MainActor [weak self] in
                 self?.cancelJob(id: jobID, error: BackgroundExecutionError.expired)

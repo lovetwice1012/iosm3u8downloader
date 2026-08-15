@@ -1,13 +1,26 @@
 import Foundation
 
+enum MediaOutputFormat: String, Equatable, Sendable {
+    case mp4
+    case wav
+}
+
 struct FileStore {
     private static let defaultStartupCleanup: Void = {
-        guard let documents = FileManager.default.urls(
+        if let documents = FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
-        ).first else { return }
-        let root = documents.appendingPathComponent("Exports", isDirectory: true)
-        try? cleanupIncompleteExports(in: root, fileManager: .default)
+        ).first {
+            let root = documents.appendingPathComponent("Exports", isDirectory: true)
+            try? cleanupIncompleteExports(in: root, fileManager: .default)
+        }
+        if let caches = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first {
+            let root = caches.appendingPathComponent("HLSJobs", isDirectory: true)
+            try? cleanupAbandonedJobs(in: root, fileManager: .default)
+        }
     }()
 
     private let fileManager: FileManager
@@ -28,7 +41,10 @@ struct FileStore {
         return directory
     }
 
-    func outputLocations(for sourceURL: URL) throws -> (temporary: URL, final: URL) {
+    func outputLocations(
+        for sourceURL: URL,
+        format: MediaOutputFormat = .mp4
+    ) throws -> (temporary: URL, final: URL) {
         let root = try exportsRoot()
         let base = sanitizedBaseName(sourceURL.host ?? sourceURL.deletingPathExtension().lastPathComponent)
         let formatter = DateFormatter()
@@ -37,13 +53,15 @@ struct FileStore {
         let timestamp = formatter.string(from: Date())
         let stem = "\(base)-\(timestamp)"
 
-        var final = root.appendingPathComponent("\(stem).mp4")
+        var final = root.appendingPathComponent("\(stem).\(format.rawValue)")
         var suffix = 2
         while fileManager.fileExists(atPath: final.path) {
-            final = root.appendingPathComponent("\(stem)-\(suffix).mp4")
+            final = root.appendingPathComponent("\(stem)-\(suffix).\(format.rawValue)")
             suffix += 1
         }
-        let temporary = root.appendingPathComponent(".\(final.deletingPathExtension().lastPathComponent).part.mp4")
+        let temporary = root.appendingPathComponent(
+            ".\(final.deletingPathExtension().lastPathComponent).part.\(format.rawValue)"
+        )
         return (temporary, final)
     }
 
@@ -129,13 +147,50 @@ struct FileStore {
             let name = normalized.lastPathComponent
             guard normalized.deletingLastPathComponent() == normalizedRoot,
                   name.hasPrefix("."),
-                  name.hasSuffix(".part.mp4") else {
+                  (name.hasSuffix(".part.mp4") || name.hasSuffix(".part.wav")) else {
                 continue
             }
             let values = try normalized.resourceValues(
                 forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
             )
             guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                continue
+            }
+            try fileManager.removeItem(at: normalized)
+        }
+    }
+
+    /// Removes only UUID-named job directories created by this app. This also
+    /// clears protected SAMPLE-AES key files left by a force-quit or reboot.
+    static func cleanupAbandonedJobs(
+        in root: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        let normalizedRoot = root.standardizedFileURL
+        guard fileManager.fileExists(atPath: normalizedRoot.path) else { return }
+        let rootValues = try normalizedRoot.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard rootValues.isDirectory == true,
+              rootValues.isSymbolicLink != true else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let children = try fileManager.contentsOfDirectory(
+            at: normalizedRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsSubdirectoryDescendants]
+        )
+        for child in children {
+            let normalized = child.standardizedFileURL
+            guard normalized.deletingLastPathComponent() == normalizedRoot,
+                  UUID(uuidString: normalized.lastPathComponent) != nil else {
+                continue
+            }
+            let values = try normalized.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+            guard values.isDirectory == true,
                   values.isSymbolicLink != true else {
                 continue
             }

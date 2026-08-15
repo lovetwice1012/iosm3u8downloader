@@ -2,6 +2,17 @@ import Foundation
 
 typealias ProgressHandler = @Sendable (DownloadProgress) async -> Void
 
+/// A local-only HLS playlist whose media remains SAMPLE-AES encrypted.
+///
+/// FFmpeg must read the playlist (rather than concatenated media files) so it
+/// can apply per-segment METHOD/URI/IV changes. Key bytes are returned only so
+/// the bridge can redact them from diagnostics; they are never placed in argv.
+struct DownloadedSampleAESPlaylist: Sendable {
+    let playlistURL: URL
+    let diagnosticKeys: [Data]
+    let containsISOBaseMedia: Bool
+}
+
 private actor DownloadPermitPool {
     private var availablePermits: Int
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -112,6 +123,473 @@ final class SegmentDownloader: Sendable {
         }
     }
 
+    /// Downloads an identity SAMPLE-AES media playlist without decrypting its
+    /// samples and rewrites it as a protected, local-only playlist for FFmpeg.
+    /// Clear intervals introduced by METHOD=NONE and TS key rotation are
+    /// retained. fMP4 key rotation is rejected after container validation.
+    func downloadSampleAESPlaylist(
+        playlist: MediaPlaylist,
+        requestedPlaylistURL: URL,
+        prefix: String,
+        directory: URL,
+        completedBefore: Int,
+        totalSegments: Int,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadedSampleAESPlaylist {
+        try validateSampleAESPlaylistPermit(
+            requestedURL: requestedPlaylistURL,
+            effectiveURL: playlist.effectiveURL
+        )
+        let descriptors = try sampleAESDescriptors(in: playlist)
+
+        let requestReferer = playlist.requestReferer ?? playlist.effectiveURL
+        let keyMaterials = try await fetchSampleAESKeys(
+            descriptors,
+            referer: requestReferer,
+            directory: directory,
+            prefix: prefix
+        )
+        let maps = try await fetchSampleAESMaps(
+            for: playlist,
+            referer: requestReferer,
+            directory: directory,
+            prefix: prefix
+        )
+
+        let segments = playlist.segments
+        guard !segments.isEmpty else {
+            throw HLSError.invalidPlaylist("SAMPLE-AES playlist has no media segments")
+        }
+        var results: [SampleAESLocalSegment?] = Array(repeating: nil, count: segments.count)
+        var nextIndex = 0
+        var completedHere = 0
+        let limit = min(maximumConcurrentDownloads, segments.count)
+
+        try await withThrowingTaskGroup(of: (Int, SampleAESLocalSegment).self) { group in
+            for _ in 0..<limit {
+                let index = nextIndex
+                let segment = segments[index]
+                nextIndex += 1
+                group.addTask { [self] in
+                    let downloaded = try await downloadSampleAESMediaWithPermit(
+                        segment,
+                        prefix: prefix,
+                        directory: directory,
+                        referer: requestReferer,
+                        playlistURL: playlist.effectiveURL
+                    )
+                    return (index, downloaded)
+                }
+            }
+
+            while let (index, downloaded) = try await group.next() {
+                results[index] = downloaded
+                completedHere += 1
+                if nextIndex < segments.count {
+                    let newIndex = nextIndex
+                    let segment = segments[newIndex]
+                    nextIndex += 1
+                    group.addTask { [self] in
+                        let next = try await downloadSampleAESMediaWithPermit(
+                            segment,
+                            prefix: prefix,
+                            directory: directory,
+                            referer: requestReferer,
+                            playlistURL: playlist.effectiveURL
+                        )
+                        return (newIndex, next)
+                    }
+                }
+                await progress(
+                    DownloadProgress(
+                        phase: .downloading,
+                        completedItems: completedBefore + completedHere,
+                        totalItems: totalSegments
+                    )
+                )
+            }
+        }
+
+        let downloadedSegments = try results.map { value -> SampleAESLocalSegment in
+            guard let value else {
+                throw HLSError.network("SAMPLE-AES segment result is missing")
+            }
+            return value
+        }
+        let containsISOBaseMedia = downloadedSegments.contains {
+            $0.container == .isoBaseMedia
+        } || maps.values.contains {
+            $0.container == .isoBaseMedia
+        }
+        if containsISOBaseMedia, !descriptors.isEmpty {
+            let encryptedKeyURLs = Set(descriptors.map(\.keyURL))
+            let hasClearIntervals = playlist.segments.contains { $0.encryption == nil }
+            guard encryptedKeyURLs.count == 1, !hasClearIntervals else {
+                throw HLSError.drmUnsupported("SAMPLE-AES fMP4 key rotation")
+            }
+        }
+
+        // Recheck after all redirects and before handing protected local paths
+        // to the decrypting composer.
+        try validateSampleAESPlaylistPermit(
+            requestedURL: requestedPlaylistURL,
+            effectiveURL: playlist.effectiveURL
+        )
+        let playlistURL = directory.appendingPathComponent(
+            "\(prefix)-sample-aes.m3u8",
+            isDirectory: false
+        )
+        let localText = try makeSampleAESLocalPlaylist(
+            playlist: playlist,
+            keyMaterials: keyMaterials,
+            maps: maps,
+            segments: downloadedSegments
+        )
+        try writeProtected(Data(localText.utf8), to: playlistURL)
+        return DownloadedSampleAESPlaylist(
+            playlistURL: playlistURL,
+            diagnosticKeys: keyMaterials.values
+                .sorted { $0.fileName < $1.fileName }
+                .map(\.data),
+            containsISOBaseMedia: containsISOBaseMedia
+        )
+    }
+
+    private struct SampleAESKeyMaterial: Sendable {
+        let data: Data
+        let fileName: String
+    }
+
+    private struct SampleAESLocalMap: Sendable {
+        let fileName: String
+        let container: MediaContainer
+    }
+
+    private struct SampleAESLocalSegment: Sendable {
+        let fileName: String
+        let container: MediaContainer
+    }
+
+    private func sampleAESDescriptors(
+        in playlist: MediaPlaylist
+    ) throws -> Set<EncryptionDescriptor> {
+        var result = Set<EncryptionDescriptor>()
+        for segment in playlist.segments {
+            if let encryption = segment.encryption {
+                guard encryption.method == .sampleAES else {
+                    throw HLSError.drmUnsupported("mixed AES-128 and SAMPLE-AES")
+                }
+                result.insert(encryption)
+            }
+            if let encryption = segment.initializationMap?.encryption {
+                guard encryption.method == .sampleAES else {
+                    throw HLSError.drmUnsupported("mixed AES-128 and SAMPLE-AES map")
+                }
+                result.insert(encryption)
+            }
+        }
+        return result
+    }
+
+    private func fetchSampleAESKeys(
+        _ descriptors: Set<EncryptionDescriptor>,
+        referer: URL,
+        directory: URL,
+        prefix: String
+    ) async throws -> [URLCandidates: SampleAESKeyMaterial] {
+        let uniqueURLs = Set(descriptors.map(\.keyURL)).sorted {
+            $0.primary.absoluteString < $1.primary.absoluteString
+        }
+        var result: [URLCandidates: SampleAESKeyMaterial] = [:]
+        for (index, keyURL) in uniqueURLs.enumerated() {
+            guard keyURL.all.allSatisfy({ isSafeSampleAESResourceURL($0, from: referer) }) else {
+                throw HLSError.drmUnsupported("SAMPLE-AES key URL must be secure")
+            }
+            var lastError: Error = HLSError.invalidAESKey
+            var accepted: Data?
+            for candidate in keyURL.all {
+                do {
+                    let payload = try await client.fetch(candidate, referer: referer)
+                    guard isSafeSampleAESResourceURL(payload.effectiveURL, from: candidate),
+                          payload.data.count == kCCKeySizeAES128,
+                          !["HTML", "XML", "JSON", "m3u8"].contains(
+                              MediaPayloadInspector.signature(payload.data)
+                          ) else {
+                        throw HLSError.invalidAESKey
+                    }
+                    accepted = payload.data
+                    break
+                } catch is CancellationError {
+                    throw HLSError.cancelled
+                } catch let error as HLSError {
+                    if case .cancelled = error { throw error }
+                    lastError = error
+                } catch {
+                    lastError = error
+                }
+            }
+            guard let data = accepted else { throw lastError }
+            let fileName = String(format: "%@-key-%03d.key", prefix, index)
+            try writeProtected(
+                data,
+                to: directory.appendingPathComponent(fileName, isDirectory: false)
+            )
+            result[keyURL] = SampleAESKeyMaterial(data: data, fileName: fileName)
+        }
+        return result
+    }
+
+    private func fetchSampleAESMaps(
+        for playlist: MediaPlaylist,
+        referer: URL,
+        directory: URL,
+        prefix: String
+    ) async throws -> [InitializationMap: SampleAESLocalMap] {
+        let uniqueMaps = Array(Set(playlist.segments.compactMap(\.initializationMap)))
+            .sorted { $0.url.primary.absoluteString < $1.url.primary.absoluteString }
+        var result: [InitializationMap: SampleAESLocalMap] = [:]
+        for (index, map) in uniqueMaps.enumerated() {
+            guard map.url.all.allSatisfy({ isSafeSampleAESResourceURL($0, from: playlist.effectiveURL) }) else {
+                throw HLSError.invalidPlaylist("SAMPLE-AES initialization URL must be secure")
+            }
+            var lastError: Error = HLSError.invalidPlaylist(
+                "SAMPLE-AES initialization data could not be downloaded"
+            )
+            var accepted: (Data, MediaContainer)?
+            for candidate in map.url.all {
+                do {
+                    let response = try await client.fetch(
+                        candidate,
+                        referer: referer,
+                        byteRange: map.byteRange
+                    )
+                    guard isSafeSampleAESResourceURL(response.effectiveURL, from: candidate),
+                          let container = MediaPayloadInspector.detectInitialization(response.data) else {
+                        throw HLSError.invalidPlaylist("invalid SAMPLE-AES initialization data")
+                    }
+                    accepted = (response.data, container)
+                    break
+                } catch is CancellationError {
+                    throw HLSError.cancelled
+                } catch let error as HLSError {
+                    if case .cancelled = error { throw error }
+                    lastError = error
+                } catch {
+                    lastError = error
+                }
+            }
+            guard let (data, container) = accepted else { throw lastError }
+            let fileName = String(
+                format: "%@-map-%03d.%@",
+                prefix,
+                index,
+                container.fileExtension
+            )
+            try writeProtected(
+                data,
+                to: directory.appendingPathComponent(fileName, isDirectory: false)
+            )
+            result[map] = SampleAESLocalMap(fileName: fileName, container: container)
+        }
+        return result
+    }
+
+    private func downloadSampleAESMediaWithPermit(
+        _ segment: MediaSegment,
+        prefix: String,
+        directory: URL,
+        referer: URL,
+        playlistURL: URL
+    ) async throws -> SampleAESLocalSegment {
+        await permitPool.acquire()
+        do {
+            let result = try await downloadSampleAESMedia(
+                segment,
+                prefix: prefix,
+                directory: directory,
+                referer: referer,
+                playlistURL: playlistURL
+            )
+            await permitPool.release()
+            return result
+        } catch {
+            await permitPool.release()
+            throw error
+        }
+    }
+
+    private func downloadSampleAESMedia(
+        _ segment: MediaSegment,
+        prefix: String,
+        directory: URL,
+        referer: URL,
+        playlistURL: URL
+    ) async throws -> SampleAESLocalSegment {
+        guard segment.url.all.allSatisfy({ isSafeSampleAESResourceURL($0, from: playlistURL) }) else {
+            throw HLSError.invalidPlaylist("SAMPLE-AES segment URL must be secure")
+        }
+        var lastError: Error = HLSError.invalidPlaylist("SAMPLE-AES segment could not be downloaded")
+        for candidate in segment.url.all {
+            do {
+                let response = try await client.fetch(
+                    candidate,
+                    referer: referer,
+                    byteRange: segment.byteRange
+                )
+                guard isSafeSampleAESResourceURL(response.effectiveURL, from: candidate),
+                      let container = MediaPayloadInspector.detect(
+                          response.data,
+                          mimeType: response.mimeType
+                      ) else {
+                    throw invalidPayloadError(
+                        stream: prefix == "audio" ? "audio" : "main",
+                        number: segment.ordinal + 1,
+                        response: response,
+                        data: response.data
+                    )
+                }
+                let fileName = String(
+                    format: "%@-encrypted-%06d.%@",
+                    prefix,
+                    segment.ordinal,
+                    container.fileExtension
+                )
+                try writeProtected(
+                    response.data,
+                    to: directory.appendingPathComponent(fileName, isDirectory: false)
+                )
+                return SampleAESLocalSegment(fileName: fileName, container: container)
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                if case .cancelled = error { throw error }
+                lastError = error
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private func makeSampleAESLocalPlaylist(
+        playlist: MediaPlaylist,
+        keyMaterials: [URLCandidates: SampleAESKeyMaterial],
+        maps: [InitializationMap: SampleAESLocalMap],
+        segments: [SampleAESLocalSegment]
+    ) throws -> String {
+        guard playlist.segments.count == segments.count else {
+            throw HLSError.invalidPlaylist("SAMPLE-AES local segment count mismatch")
+        }
+        let maximumDuration = playlist.segments.map(\.duration).max() ?? 1
+        let targetDuration = max(1, Int(ceil(maximumDuration)))
+        var lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+            "#EXT-X-TARGETDURATION:\(targetDuration)",
+            "#EXT-X-MEDIA-SEQUENCE:\(playlist.segments.first?.mediaSequence ?? 0)"
+        ]
+        var activeEncryption: EncryptionDescriptor?
+        var activeMap: InitializationMap?
+
+        func appendEncryption(_ encryption: EncryptionDescriptor?) throws {
+            guard activeEncryption != encryption else { return }
+            if let encryption {
+                guard encryption.method == .sampleAES,
+                      let material = keyMaterials[encryption.keyURL] else {
+                    throw HLSError.invalidAESKey
+                }
+                var tag = "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"\(material.fileName)\",KEYFORMAT=\"identity\""
+                if let iv = encryption.explicitIV {
+                    tag += ",IV=0x" + iv.map { String(format: "%02X", $0) }.joined()
+                }
+                lines.append(tag)
+            } else if activeEncryption != nil {
+                lines.append("#EXT-X-KEY:METHOD=NONE")
+            }
+            activeEncryption = encryption
+        }
+
+        for (index, source) in playlist.segments.enumerated() {
+            if source.initializationMap != activeMap {
+                guard !(source.initializationMap == nil && activeMap != nil) else {
+                    throw HLSError.invalidPlaylist("SAMPLE-AES EXT-X-MAP cannot be removed mid-playlist")
+                }
+                if let map = source.initializationMap {
+                    try appendEncryption(map.encryption ?? source.encryption)
+                    guard let localMap = maps[map] else {
+                        throw HLSError.invalidPlaylist("SAMPLE-AES local initialization data is missing")
+                    }
+                    lines.append("#EXT-X-MAP:URI=\"\(localMap.fileName)\"")
+                }
+                activeMap = source.initializationMap
+            }
+            try appendEncryption(source.encryption)
+            let duration = String(
+                format: "%.6f",
+                locale: Locale(identifier: "en_US_POSIX"),
+                source.duration
+            )
+            lines.append("#EXTINF:\(duration),")
+            lines.append(segments[index].fileName)
+        }
+        lines.append("#EXT-X-ENDLIST")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func validateSampleAESPlaylistPermit(
+        requestedURL: URL,
+        effectiveURL: URL
+    ) throws {
+        guard isDownloadableWidevineDomain(requestedURL),
+              isDownloadableWidevineDomain(effectiveURL) else {
+            throw HLSError.drmUnsupported("SAMPLE-AES download domain not allowed")
+        }
+    }
+
+    private func isSafeSampleAESResourceURL(_ url: URL, from sourceURL: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              components.host != nil,
+              components.user == nil,
+              components.password == nil else {
+            return false
+        }
+        return AutomaticNavigationPolicy.isAllowedFrameNavigation(from: sourceURL, to: url)
+    }
+
+    private func writeProtected(_ data: Data, to destination: URL) throws {
+        guard destination.isFileURL else { throw HLSError.network("invalid local output URL") }
+        let fileManager = FileManager.default
+        let parent = destination.deletingLastPathComponent()
+        let values = try parent.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true,
+              values.isSymbolicLink != true,
+              !fileManager.fileExists(atPath: destination.path) else {
+            throw HLSError.network("protected local output path is invalid")
+        }
+        guard fileManager.createFile(
+            atPath: destination.path,
+            contents: Data(),
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        ) else {
+            throw HLSError.network("protected local file could not be created")
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: destination)
+            defer { try? handle.close() }
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: destination.path
+            )
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            throw error
+        }
+    }
+
     private func downloadSegmentWithPermit(
         _ segment: MediaSegment,
         prefix: String,
@@ -144,6 +622,9 @@ final class SegmentDownloader: Sendable {
             if let encryption = segment.encryption { values.append(encryption) }
             if let encryption = segment.initializationMap?.encryption { values.append(encryption) }
             return values
+        }
+        guard descriptors.allSatisfy({ $0.method == .aes128 }) else {
+            throw HLSError.drmUnsupported("SAMPLE-AES requires the protected HLS pipeline")
         }
 
         var result: [URL: Data] = [:]
@@ -207,11 +688,16 @@ final class SegmentDownloader: Sendable {
                 let response = try await client.fetch(candidate, referer: referer, byteRange: map.byteRange)
                 var data = response.data
                 if let encryption = map.encryption {
-                    guard let key = keyData[encryption.keyURL.primary],
-                          let iv = encryption.explicitIV else {
-                        throw HLSError.invalidAESKey
+                    switch encryption.method {
+                    case .aes128:
+                        guard let key = keyData[encryption.keyURL.primary],
+                              let iv = encryption.explicitIV else {
+                            throw HLSError.invalidAESKey
+                        }
+                        data = try AES128CBCDecryptor.decrypt(data, key: key, iv: iv)
+                    case .sampleAES:
+                        throw HLSError.drmUnsupported("SAMPLE-AES requires the protected HLS pipeline")
                     }
-                    data = try AES128CBCDecryptor.decrypt(data, key: key, iv: iv)
                 }
                 guard MediaPayloadInspector.detectInitialization(data) != nil else {
                     throw invalidPayloadError(
@@ -294,12 +780,17 @@ final class SegmentDownloader: Sendable {
                 let response = try await client.fetch(candidate, referer: referer, byteRange: segment.byteRange)
                 var data = response.data
                 if let encryption = segment.encryption {
-                    guard let key = keyData[encryption.keyURL.primary] else {
-                        throw HLSError.invalidAESKey
+                    switch encryption.method {
+                    case .aes128:
+                        guard let key = keyData[encryption.keyURL.primary] else {
+                            throw HLSError.invalidAESKey
+                        }
+                        let iv = encryption.explicitIV
+                            ?? AES128CBCDecryptor.initializationVector(for: segment.mediaSequence)
+                        data = try AES128CBCDecryptor.decrypt(data, key: key, iv: iv)
+                    case .sampleAES:
+                        throw HLSError.drmUnsupported("SAMPLE-AES requires the protected HLS pipeline")
                     }
-                    let iv = encryption.explicitIV
-                        ?? AES128CBCDecryptor.initializationVector(for: segment.mediaSequence)
-                    data = try AES128CBCDecryptor.decrypt(data, key: key, iv: iv)
                 }
                 guard let container = MediaPayloadInspector.detect(data, mimeType: response.mimeType) else {
                     throw invalidPayloadError(

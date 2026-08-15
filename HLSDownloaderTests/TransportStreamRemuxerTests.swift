@@ -95,6 +95,103 @@ final class TransportStreamRemuxerTests: XCTestCase {
         )
     }
 
+    func testAudioOnlyComposerRejectsUnconsolidatableSegmentsInsteadOfTruncating() async throws {
+        let fixtureURL = try fixture(named: "sample-h264-aac.ts")
+        let sourceURL = URL(string: "https://example.com/audio")!
+        func makeSegment(ordinal: Int, container: MediaContainer) -> DownloadedSegment {
+            DownloadedSegment(
+                source: MediaSegment(
+                    ordinal: ordinal,
+                    mediaSequence: UInt64(ordinal),
+                    duration: 1,
+                    url: URLCandidates(primary: sourceURL, sameOriginQueryFallback: nil),
+                    byteRange: nil,
+                    encryption: nil,
+                    initializationMap: nil,
+                    hasDiscontinuity: false
+                ),
+                fileURL: fixtureURL,
+                container: container,
+                byteCount: 1,
+                initializationDataLength: 0
+            )
+        }
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "audio-truncation-guard-\(UUID().uuidString).wav"
+        )
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        do {
+            try await MP4Composer().compose(
+                main: [
+                    makeSegment(ordinal: 0, container: .aac),
+                    makeSegment(ordinal: 1, container: .mp3)
+                ],
+                externalAudio: nil,
+                format: .wav,
+                outputURL: outputURL
+            )
+            XCTFail("Expected an explicit non-truncating failure")
+        } catch let error as HLSError {
+            guard case .invalidPlaylist(let detail) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(detail.contains("without truncation"))
+        }
+    }
+
+    func testOutputFormatUsesActualTracksForVideoAndAudioOnlyMedia() async throws {
+        let videoURL = try fixture(named: "sample-h264-aac.ts")
+        let audioURL = try fixture(named: "sample-aac-audio-offset.ts")
+        let composer = MP4Composer()
+
+        let videoFormat = try await composer.outputFormat(
+            main: [segment(fileURL: videoURL, duration: 1.5, name: "video")],
+            externalAudio: nil
+        )
+        let audioFormat = try await composer.outputFormat(
+            main: [segment(fileURL: audioURL, duration: 2, name: "audio")],
+            externalAudio: nil
+        )
+        XCTAssertEqual(videoFormat, .mp4)
+        XCTAssertEqual(audioFormat, .wav)
+    }
+
+    func testAES128DecryptedAudioUsesActualTracksAndChoosesWAV() async throws {
+        let audioURL = try fixture(named: "sample-aac-audio-offset.ts")
+        let keyURL = URL(string: "https://example.com/key")!
+        let source = MediaSegment(
+            ordinal: 0,
+            mediaSequence: 0,
+            duration: 2,
+            url: URLCandidates(
+                primary: URL(string: "https://example.com/audio.ts")!,
+                sameOriginQueryFallback: nil
+            ),
+            byteRange: nil,
+            encryption: EncryptionDescriptor(
+                method: .aes128,
+                keyURL: URLCandidates(primary: keyURL, sameOriginQueryFallback: nil),
+                explicitIV: Data(repeating: 0, count: 16)
+            ),
+            initializationMap: nil,
+            hasDiscontinuity: false
+        )
+        let byteCount = try Data(contentsOf: audioURL).count
+        let decrypted = DownloadedSegment(
+            source: source,
+            fileURL: audioURL,
+            container: .transportStream,
+            byteCount: byteCount,
+            initializationDataLength: 0
+        )
+
+        XCTAssertEqual(
+            try await MP4Composer().outputFormat(main: [decrypted], externalAudio: nil),
+            .wav
+        )
+    }
+
     private struct MP4Box {
         let type: String
         let payload: Range<Int>
@@ -307,5 +404,63 @@ final class TransportStreamRemuxerTests: XCTestCase {
             byteCount: byteCount,
             initializationDataLength: 0
         )
+    }
+}
+
+final class FileStoreAudioOutputTests: XCTestCase {
+    func testOutputLocationsUseWAVExtensions() throws {
+        let locations = try FileStore().outputLocations(
+            for: URL(string: "https://example.com/audio.m3u8")!,
+            format: .wav
+        )
+        defer {
+            try? FileManager.default.removeItem(at: locations.temporary)
+            try? FileManager.default.removeItem(at: locations.final)
+        }
+        XCTAssertEqual(locations.final.pathExtension, "wav")
+        XCTAssertTrue(locations.temporary.lastPathComponent.hasSuffix(".part.wav"))
+    }
+
+    func testStartupCleanupRemovesIncompleteMP4AndWAVOnly() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "FileStoreCleanupTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let wav = root.appendingPathComponent(".audio.part.wav")
+        let mp4 = root.appendingPathComponent(".video.part.mp4")
+        let keep = root.appendingPathComponent("keep.wav")
+        XCTAssertTrue(FileManager.default.createFile(atPath: wav.path, contents: Data([1])))
+        XCTAssertTrue(FileManager.default.createFile(atPath: mp4.path, contents: Data([2])))
+        XCTAssertTrue(FileManager.default.createFile(atPath: keep.path, contents: Data([3])))
+
+        try FileStore.cleanupIncompleteExports(in: root)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: wav.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mp4.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keep.path))
+    }
+
+    func testStartupCleanupRemovesOnlyUUIDNamedAbandonedJobs() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "FileStoreJobCleanupTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let abandoned = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let unrelated = root.appendingPathComponent("keep", isDirectory: true)
+        try FileManager.default.createDirectory(at: abandoned, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: abandoned.appendingPathComponent("content.key").path,
+            contents: Data(repeating: 9, count: 16)
+        ))
+
+        try FileStore.cleanupAbandonedJobs(in: root)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandoned.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
     }
 }

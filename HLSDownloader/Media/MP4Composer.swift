@@ -11,15 +11,46 @@ private final class ExportSessionBox: @unchecked Sendable {
 
 final class MP4Composer: @unchecked Sendable {
     private let transportStreamRemuxer = TransportStreamRemuxer()
+    private let trackProbe = LocalMediaTrackProbe()
+    private let audioWAVComposer = FFmpegAudioWAVComposer()
+
+    /// Determines the export format from decoded track metadata. URLs,
+    /// extensions and playlist labels never participate in this choice.
+    func outputFormat(
+        main: [DownloadedSegment],
+        externalAudio: [DownloadedSegment]?
+    ) async throws -> MediaOutputFormat {
+        let mainTracks = try await probeTracks(in: main)
+        if mainTracks.contains(.video) {
+            if let externalAudio {
+                let audioTracks = try await probeTracks(in: externalAudio)
+                guard audioTracks.contains(.audio) else { throw HLSError.noPlayableTracks }
+            }
+            return .mp4
+        }
+
+        if let externalAudio {
+            let audioTracks = try await probeTracks(in: externalAudio)
+            guard audioTracks.contains(.audio) else { throw HLSError.noPlayableTracks }
+            return .wav
+        }
+        guard mainTracks.contains(.audio) else { throw HLSError.noPlayableTracks }
+        return .wav
+    }
 
     func compose(
         main: [DownloadedSegment],
         externalAudio: [DownloadedSegment]?,
+        format: MediaOutputFormat = .mp4,
         outputURL: URL
     ) async throws {
         guard !main.contains(where: { $0.source.hasDiscontinuity }),
               !(externalAudio?.contains(where: { $0.source.hasDiscontinuity }) ?? false) else {
             throw HLSError.invalidPlaylist("EXT-X-DISCONTINUITYを含むHLSは現在MP4化できません")
+        }
+        if format == .wav {
+            try await composeAudioOnly(externalAudio ?? main, outputURL: outputURL)
+            return
         }
         if let externalAudio,
            !main.isEmpty,
@@ -65,6 +96,74 @@ final class MP4Composer: @unchecked Sendable {
         try await composeWithConsolidationFallback(
             main: preparedMain.segments,
             externalAudio: preparedAudio?.segments,
+            outputURL: outputURL
+        )
+    }
+
+    private func probeTracks(in segments: [DownloadedSegment]) async throws -> LocalMediaTrackSet {
+        let ordered = segments.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        guard !ordered.isEmpty else { throw HLSError.noPlayableTracks }
+        let joined = try consolidate(ordered, label: "track-probe")
+        defer {
+            if let joined { try? FileManager.default.removeItem(at: joined.temporaryURL) }
+        }
+        if let joined {
+            return try await trackProbe.probe(
+                inputURL: joined.segment.fileURL,
+                input: .mediaFile()
+            )
+        }
+
+        var combined: LocalMediaTrackSet = []
+        var lastError: Error?
+        // A positive video finding may stop early. Proving audio-only must scan
+        // every segment so a later video period is never silently discarded.
+        for segment in ordered {
+            do {
+                let tracks = try await trackProbe.probe(
+                    inputURL: segment.fileURL,
+                    input: .mediaFile()
+                )
+                combined.formUnion(tracks)
+                if combined.contains(.video) { break }
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                if case .cancelled = error { throw error }
+                lastError = error
+            } catch {
+                lastError = error
+            }
+        }
+        if !combined.isEmpty { return combined }
+        if let hlsError = lastError as? HLSError { throw hlsError }
+        if let lastError {
+            throw HLSError.mediaOpenFailed(
+                stream: "main",
+                number: 1,
+                container: segments.first?.container.rawValue ?? "unknown",
+                byteCount: segments.first?.byteCount ?? 0,
+                detail: lastError.localizedDescription
+            )
+        }
+        throw HLSError.noPlayableTracks
+    }
+
+    private func composeAudioOnly(
+        _ segments: [DownloadedSegment],
+        outputURL: URL
+    ) async throws {
+        let ordered = segments.sorted(by: { $0.source.ordinal < $1.source.ordinal })
+        guard !ordered.isEmpty else { throw HLSError.noPlayableTracks }
+        let joined = try consolidate(ordered, label: "audio-wav")
+        defer {
+            if let joined { try? FileManager.default.removeItem(at: joined.temporaryURL) }
+        }
+        guard ordered.count == 1 || joined != nil else {
+            throw HLSError.invalidPlaylist("audio segments could not be consolidated without truncation")
+        }
+        try await audioWAVComposer.compose(
+            inputURL: joined?.segment.fileURL ?? ordered[0].fileURL,
             outputURL: outputURL
         )
     }
@@ -388,7 +487,11 @@ final class MP4Composer: @unchecked Sendable {
             "\(label)-joined-\(UUID().uuidString).\(first.container.fileExtension)",
             isDirectory: false
         )
-        guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
+        guard FileManager.default.createFile(
+            atPath: temporaryURL.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        ) else {
             throw HLSError.network("連結用ファイルを作成できません")
         }
 

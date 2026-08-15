@@ -16,6 +16,7 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         let video = try XCTUnwrap(plan.video)
         let audio = try XCTUnwrap(plan.audio)
 
+        XCTAssertEqual(plan.outputFormat, .mp4)
         XCTAssertEqual(video.representationID, "v-high")
         XCTAssertEqual(video.bandwidth, 2_500_000)
         XCTAssertEqual(video.keyID, videoKeyID)
@@ -43,6 +44,42 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         XCTAssertEqual(audio.segments.map(\.byteRange), [ByteRange(offset: 100, length: 100), nil])
         XCTAssertEqual(plan.expectedKeyIDs, Set([videoKeyID, audioKeyID]))
         XCTAssertEqual(plan.psshData.count, 1)
+    }
+
+    func testPlannerAllowsAudioOnlyWidevinePresentation() throws {
+        let manifest = try DASHManifestParser.parse(
+            text: audioOnlyManifestXML(),
+            effectiveURL: manifestURL
+        )
+
+        let plan = try WidevineDASHPlanner().makePlan(manifest: manifest)
+
+        XCTAssertNil(plan.video)
+        XCTAssertEqual(plan.outputFormat, .wav)
+        XCTAssertEqual(plan.audio?.mediaType, .audio)
+        XCTAssertEqual(plan.audio?.representationID, "a-main")
+        XCTAssertEqual(plan.expectedKeyIDs, Set([audioKeyID]))
+        XCTAssertEqual(plan.psshData, [try XCTUnwrap(Data(base64Encoded: pssh))])
+    }
+
+    func testWAVValidatorRejectsEmptyDataChunkEvenWhenTrailingBytesExist() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "widevine-empty-wav-test-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var empty = minimalPCM16WAVData()
+        empty.replaceSubrange(40..<44, with: [0, 0, 0, 0])
+        let output = directory.appendingPathComponent("empty.wav")
+        try empty.write(to: output)
+
+        XCTAssertFalse(WidevineMediaOutputValidator.isValid(output, format: .wav))
+        XCTAssertFalse(WidevineMediaOutputValidator.isValid(output, format: .mp4))
     }
 
     func testPlannerRejectsDynamicMultiplePeriodsAndKeyRotation() throws {
@@ -176,6 +213,8 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: result.mediaFileURL) }
 
         XCTAssertEqual(try Data(contentsOf: result.mediaFileURL), minimalMP4Data())
+        XCTAssertEqual(result.outputFormat, .mp4)
+        XCTAssertEqual(result.mediaFileURL.pathExtension, "mp4")
         XCTAssertTrue(result.mediaFileURL.deletingLastPathComponent().lastPathComponent.hasPrefix("job-"))
         XCTAssertFalse(
             FileManager.default.fileExists(
@@ -227,6 +266,58 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
             requestedRanges,
             [ByteRange(offset: 0, length: 100), ByteRange(offset: 100, length: 100)]
         )
+    }
+
+    func testProviderEmitsPCM16WAVForAudioOnlyPresentation() async throws {
+        let fetcher = RecordingDASHFetcher()
+        let acquirer = RecordingKeyAcquirer(
+            keys: [try contentKey(keyID: audioKeyID, value: 0xAA)]
+        )
+        let composer = RecordingMediaComposer(outputData: minimalPCM16WAVData())
+        let temporaryRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "widevine-audio-only-provider-test-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: temporaryRoot,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+
+        let provider = WidevineDASHDownloadProvider(
+            segmentFetcher: fetcher,
+            keyAcquirer: acquirer,
+            mediaComposer: composer,
+            temporaryRoot: temporaryRoot,
+            maximumParallelDownloads: 2
+        )
+        let result = try await provider.process(
+            manifest: WidevineManifestDocument(
+                sourceURL: manifestURL,
+                data: Data(audioOnlyManifestXML().utf8)
+            ),
+            licenseConfiguration: WidevineLicenseConfiguration(
+                serverURL: URL(string: "https://widevine.sprink.cloud/license/acquire")!
+            ),
+            wvdData: Data([0x57, 0x56, 0x44])
+        )
+        defer { try? FileManager.default.removeItem(at: result.mediaFileURL) }
+
+        XCTAssertEqual(result.outputFormat, .wav)
+        XCTAssertEqual(result.mediaFileURL.pathExtension, "wav")
+        XCTAssertEqual(try Data(contentsOf: result.mediaFileURL), minimalPCM16WAVData())
+        XCTAssertTrue(
+            WidevineMediaOutputValidator.isValid(result.mediaFileURL, format: .wav)
+        )
+
+        let acquisition = await acquirer.snapshot()
+        XCTAssertEqual(acquisition.expectedKeyIDs, Set([audioKeyID]))
+        let composition = await composer.snapshot()
+        XCTAssertNil(composition.videoData)
+        XCTAssertNotNil(composition.audioData)
+        XCTAssertNil(composition.videoKey)
+        XCTAssertEqual(composition.audioKey, Data(repeating: 0xAA, count: 16))
+        XCTAssertEqual(composition.audioScheme, .cbcs)
     }
 
     func testStartupCleanupRemovesOnlyProviderJobDirectories() throws {
@@ -687,6 +778,34 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         </MPD>
         """#
     }
+
+    private func audioOnlyManifestXML() -> String {
+        #"""
+        <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+             xmlns:cenc="urn:mpeg:cenc:2013"
+             type="static"
+             mediaPresentationDuration="PT8S">
+          <BaseURL>media/</BaseURL>
+          <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
+            <cenc:pssh>\#(pssh)</cenc:pssh>
+          </ContentProtection>
+          <Period duration="PT8S">
+            <AdaptationSet contentType="audio" mimeType="audio/mp4">
+              <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"
+                  value="cbcs" cenc:default_KID="\#(audioKeyID)" />
+              <Representation id="a-main" bandwidth="128000">
+                <BaseURL>audio/</BaseURL>
+                <SegmentList>
+                  <Initialization sourceURL="init.mp4" range="0-99" />
+                  <SegmentURL media="1.m4s" mediaRange="100-199" />
+                  <SegmentURL media="2.m4s" />
+                </SegmentList>
+              </Representation>
+            </AdaptationSet>
+          </Period>
+        </MPD>
+        """#
+    }
 }
 
 private actor RecordingDASHFetcher: DASHSegmentFetching {
@@ -985,4 +1104,22 @@ private func minimalMP4Data() -> Data {
         0x69, 0x73, 0x6F, 0x6D,
         0x69, 0x73, 0x6F, 0x32
     ])
+}
+
+private func minimalPCM16WAVData() -> Data {
+    var data = Data("RIFF".utf8)
+    data.append(contentsOf: [38, 0, 0, 0])
+    data.append(Data("WAVE".utf8))
+    data.append(Data("fmt ".utf8))
+    data.append(contentsOf: [16, 0, 0, 0])
+    data.append(contentsOf: [1, 0])       // PCM
+    data.append(contentsOf: [1, 0])       // mono
+    data.append(contentsOf: [0x40, 0x1F, 0, 0]) // 8 kHz
+    data.append(contentsOf: [0x80, 0x3E, 0, 0]) // 16 kB/s
+    data.append(contentsOf: [2, 0])       // block align
+    data.append(contentsOf: [16, 0])      // signed 16-bit little-endian
+    data.append(Data("data".utf8))
+    data.append(contentsOf: [2, 0, 0, 0])
+    data.append(contentsOf: [0, 0])
+    return data
 }

@@ -51,6 +51,8 @@
 		B10000000000000000000052 /* WidevineDASHDownloadProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000052 /* WidevineDASHDownloadProviderTests.swift */; };
 		B10000000000000000000055 /* WidevineFFmpegMediaComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000055 /* WidevineFFmpegMediaComposer.swift */; };
 		B10000000000000000000056 /* WidevineFFmpegMediaComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000056 /* WidevineFFmpegMediaComposerTests.swift */; };
+		B10000000000000000000057 /* SampleAESFFmpegComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000057 /* SampleAESFFmpegComposer.swift */; };
+		B10000000000000000000058 /* SampleAESFFmpegComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000058 /* SampleAESFFmpegComposerTests.swift */; };
 		B10000000000000000000053 /* WidevineL3Client.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000053 /* WidevineL3Client.swift */; };
 		B10000000000000000000054 /* WidevineL3ClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000054 /* WidevineL3ClientTests.swift */; };
 		B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */ = {isa = PBXBuildFile; productRef = G20000000000000000000001 /* HLSFFmpegBridge */; };
@@ -117,6 +119,8 @@
 		A10000000000000000000056 /* WidevineFFmpegMediaComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidevineFFmpegMediaComposerTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000053 /* WidevineL3Client.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Widevine/WidevineL3Client.swift; sourceTree = "<group>"; };
 		A10000000000000000000054 /* WidevineL3ClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidevineL3ClientTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000057 /* SampleAESFFmpegComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Media/SampleAESFFmpegComposer.swift; sourceTree = "<group>"; };
+		A10000000000000000000058 /* SampleAESFFmpegComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleAESFFmpegComposerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -176,6 +180,7 @@
 				A1000000000000000000000D /* AES128CBCDecryptor.swift */,
 				A1000000000000000000000E /* MP4Composer.swift */,
 				A10000000000000000000018 /* TransportStreamRemuxer.swift */,
+				A10000000000000000000057 /* SampleAESFFmpegComposer.swift */,
 				A1000000000000000000000F /* FileStore.swift */,
 				A10000000000000000000010 /* HLSDownloader-Bridging-Header.h */,
 				A10000000000000000000011 /* Info.plist */,
@@ -202,6 +207,7 @@
 				A10000000000000000000052 /* WidevineDASHDownloadProviderTests.swift */,
 				A10000000000000000000054 /* WidevineL3ClientTests.swift */,
 				A10000000000000000000056 /* WidevineFFmpegMediaComposerTests.swift */,
+				A10000000000000000000058 /* SampleAESFFmpegComposerTests.swift */,
 				E10000000000000000000005 /* Fixtures */,
 			);
 			path = HLSDownloaderTests;
@@ -362,6 +368,7 @@
 				B1000000000000000000000D /* AES128CBCDecryptor.swift in Sources */,
 				B1000000000000000000000E /* MP4Composer.swift in Sources */,
 				B10000000000000000000014 /* TransportStreamRemuxer.swift in Sources */,
+				B10000000000000000000057 /* SampleAESFFmpegComposer.swift in Sources */,
 				B1000000000000000000000F /* FileStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -384,6 +391,7 @@
 				B10000000000000000000052 /* WidevineDASHDownloadProviderTests.swift in Sources */,
 				B10000000000000000000054 /* WidevineL3ClientTests.swift in Sources */,
 				B10000000000000000000056 /* WidevineFFmpegMediaComposerTests.swift in Sources */,
+				B10000000000000000000058 /* SampleAESFFmpegComposerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -12,7 +12,7 @@ enum DownloadPhase: String, Sendable {
         case .idle: return "待機中"
         case .resolving: return "リンクを解析中"
         case .downloading: return "断片をダウンロード中"
-        case .composing: return "MP4に結合中"
+        case .composing: return "動画・音声ファイルを生成中"
         case .completed: return "完了"
         }
     }
@@ -517,6 +517,7 @@ struct ByteRange: Hashable, Sendable {
 struct EncryptionDescriptor: Hashable, Sendable {
     enum Method: String, Hashable, Sendable {
         case aes128 = "AES-128"
+        case sampleAES = "SAMPLE-AES"
     }
 
     let method: Method

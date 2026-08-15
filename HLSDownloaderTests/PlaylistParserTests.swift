@@ -53,18 +53,146 @@ final class PlaylistParserTests: XCTestCase {
         XCTAssertEqual(playlist.segments[0].encryption?.explicitIV?.count, 16)
     }
 
-    func testRejectsSampleAES() {
+    func testParsesSampleAESIdentityAndRetainsKeyMetadata() throws {
         let text = """
         #EXTM3U
-        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://asset"
+        #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="identity",URI="keys/content.key",IV=0x2A
+        #EXT-X-MAP:URI="init.mp4"
+        #EXTINF:6,
+        segment.m4s
+        #EXT-X-ENDLIST
+        """
+
+        guard case .media(let playlist) = try PlaylistParser.parse(
+            text: text,
+            effectiveURL: URL(string: "https://widevine.sprink.cloud/video/main.m3u8")!
+        ) else {
+            return XCTFail("media playlist expected")
+        }
+
+        let segment = try XCTUnwrap(playlist.segments.first)
+        XCTAssertEqual(segment.encryption?.method, .sampleAES)
+        XCTAssertEqual(
+            segment.encryption?.keyURL.primary.absoluteString,
+            "https://widevine.sprink.cloud/video/keys/content.key"
+        )
+        XCTAssertEqual(segment.encryption?.explicitIV, Data(repeating: 0, count: 15) + Data([0x2A]))
+        XCTAssertEqual(segment.initializationMap?.encryption?.method, .sampleAES)
+    }
+
+    func testParsesSampleAESIdentityForAlternateAudioPlaylistWithoutExplicitIV() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="/keys/audio.key"
+        #EXT-X-MAP:URI="audio-init.mp4"
+        #EXTINF:6,
+        audio-1.m4s
+        #EXT-X-ENDLIST
+        """
+
+        guard case .media(let playlist) = try PlaylistParser.parse(
+            text: text,
+            effectiveURL: URL(string: "https://widevine.sprink.cloud/audio/ja.m3u8")!
+        ) else {
+            return XCTFail("media playlist expected")
+        }
+
+        let encryption = try XCTUnwrap(playlist.segments.first?.encryption)
+        XCTAssertEqual(encryption.method, .sampleAES)
+        XCTAssertEqual(encryption.keyURL.primary.absoluteString, "https://widevine.sprink.cloud/keys/audio.key")
+        XCTAssertNil(encryption.explicitIV)
+    }
+
+    func testSampleAESKeyRotationAndMethodNoneRemainSegmentScoped() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="key-1.bin"
+        #EXTINF:4,
+        segment-1.m4s
+        #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="identity",URI="key-2.bin",IV=0x02
+        #EXTINF:4,
+        segment-2.m4s
+        #EXT-X-KEY:METHOD=NONE
+        #EXTINF:4,
+        segment-3.m4s
+        #EXT-X-ENDLIST
+        """
+
+        guard case .media(let playlist) = try PlaylistParser.parse(
+            text: text,
+            effectiveURL: URL(string: "https://widevine.sprink.cloud/video/stream.m3u8")!
+        ) else {
+            return XCTFail("media playlist expected")
+        }
+
+        XCTAssertEqual(playlist.segments[0].encryption?.keyURL.primary.lastPathComponent, "key-1.bin")
+        XCTAssertNil(playlist.segments[0].encryption?.explicitIV)
+        XCTAssertEqual(playlist.segments[1].encryption?.keyURL.primary.lastPathComponent, "key-2.bin")
+        XCTAssertEqual(playlist.segments[1].encryption?.explicitIV, Data(repeating: 0, count: 15) + Data([0x02]))
+        XCTAssertNil(playlist.segments[2].encryption)
+    }
+
+    func testSampleAESParserDoesNotApplyDownloadDomainPolicyToKeyCDN() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="https://keys.example.com/content.key"
+        #EXTINF:6,
+        segment.m4s
+        #EXT-X-ENDLIST
+        """
+
+        guard case .media(let playlist) = try PlaylistParser.parse(
+            text: text,
+            effectiveURL: URL(string: "https://widevine.sprink.cloud/video/main.m3u8")!
+        ) else {
+            return XCTFail("media playlist expected")
+        }
+        XCTAssertEqual(
+            playlist.segments.first?.encryption?.keyURL.primary.host,
+            "keys.example.com"
+        )
+    }
+
+    func testRejectsFairPlaySampleAES() {
+        let text = """
+        #EXTM3U
+        #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://asset"
         #EXTINF:6,
         segment.ts
         #EXT-X-ENDLIST
         """
 
         XCTAssertThrowsError(
-            try PlaylistParser.parse(text: text, effectiveURL: URL(string: "https://example.com/v.m3u8")!)
-        )
+            try PlaylistParser.parse(
+                text: text,
+                effectiveURL: URL(string: "https://widevine.sprink.cloud/v.m3u8")!
+            )
+        ) { error in
+            guard case HLSError.drmUnsupported = error else {
+                return XCTFail("expected drmUnsupported, got \(error)")
+            }
+        }
+    }
+
+    func testRejectsSampleAESCTR() {
+        let text = """
+        #EXTM3U
+        #EXT-X-KEY:METHOD=SAMPLE-AES-CTR,KEYFORMAT="identity",URI="https://widevine.sprink.cloud/content.key"
+        #EXTINF:6,
+        segment.m4s
+        #EXT-X-ENDLIST
+        """
+
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(
+                text: text,
+                effectiveURL: URL(string: "https://widevine.sprink.cloud/v.m3u8")!
+            )
+        ) { error in
+            guard case HLSError.drmUnsupported = error else {
+                return XCTFail("expected drmUnsupported, got \(error)")
+            }
+        }
     }
 
     func testRejectsSegmentWithoutEXTINF() {
@@ -383,6 +511,466 @@ final class SegmentDownloaderFallbackTests: XCTestCase {
             headerFields: ["Content-Type": mimeType]
         )!
         return (response, data)
+    }
+
+    private static func transportStream() -> Data {
+        var data = Data(repeating: 0, count: 188 * 3)
+        for offset in stride(from: 0, to: data.count, by: 188) {
+            data[offset] = 0x47
+            data[offset + 3] = 0x10
+        }
+        return data
+    }
+}
+
+final class SampleAESPipelineSecurityTests: XCTestCase {
+    override func tearDown() {
+        URLProtocolStub.reset()
+        super.tearDown()
+    }
+
+    func testAcceptsPublicHTTPSKeyCDNAndKeepsKeyOutOfLocalPlaylist() async throws {
+        let key = Data((0..<16).map { UInt8($0) })
+        let (downloader, playlist, directory) = try makeFixture(
+            keyURL: URL(string: "https://keys.public-cdn.example/content.key")!
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        URLProtocolStub.handler = { request in
+            let isKey = request.url?.pathExtension == "key"
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": isKey ? "application/octet-stream" : "video/mp2t"
+                ]
+            )!
+            return (response, isKey ? key : Self.transportStream())
+        }
+
+        let result = try await downloader.downloadSampleAESPlaylist(
+            playlist: playlist,
+            requestedPlaylistURL: playlist.effectiveURL,
+            prefix: "main",
+            directory: directory,
+            completedBefore: 0,
+            totalSegments: 1,
+            progress: { _ in }
+        )
+        let localText = try String(contentsOf: result.playlistURL, encoding: .utf8)
+        XCTAssertTrue(localText.contains("METHOD=SAMPLE-AES"))
+        XCTAssertTrue(localText.contains("main-key-000.key"))
+        XCTAssertFalse(localText.contains("keys.public-cdn.example"))
+        XCTAssertEqual(result.diagnosticKeys, [key])
+    }
+
+    func testRejectsInsecureOrPrivateKeyURLsBeforeFetching() async throws {
+        let rejected = [
+            "http://keys.example/content.key",
+            "https://user:password@keys.example/content.key",
+            "https://localhost/content.key",
+            "https://10.0.0.1/content.key"
+        ]
+        URLProtocolStub.handler = { request in
+            XCTFail("Unsafe key URL was fetched: \(String(describing: request.url))")
+            throw URLError(.unsupportedURL)
+        }
+
+        for value in rejected {
+            let (downloader, playlist, directory) = try makeFixture(
+                keyURL: try XCTUnwrap(URL(string: value))
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+            do {
+                _ = try await downloader.downloadSampleAESPlaylist(
+                    playlist: playlist,
+                    requestedPlaylistURL: playlist.effectiveURL,
+                    prefix: "main",
+                    directory: directory,
+                    completedBefore: 0,
+                    totalSegments: 1,
+                    progress: { _ in }
+                )
+                XCTFail("Accepted unsafe key URL: \(value)")
+            } catch let error as HLSError {
+                guard case .drmUnsupported = error else {
+                    return XCTFail("Unexpected error for \(value): \(error)")
+                }
+            }
+        }
+    }
+
+    func testRejectsKeyRedirectDowngrade() async throws {
+        let (downloader, playlist, directory) = try makeFixture(
+            keyURL: URL(string: "https://keys.example/content.key")!
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        URLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: URL(string: "http://keys.example/content.key")!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/octet-stream"]
+            )!
+            return (response, Data(repeating: 7, count: 16))
+        }
+
+        do {
+            _ = try await downloader.downloadSampleAESPlaylist(
+                playlist: playlist,
+                requestedPlaylistURL: playlist.effectiveURL,
+                prefix: "main",
+                directory: directory,
+                completedBefore: 0,
+                totalSegments: 1,
+                progress: { _ in }
+            )
+            XCTFail("Accepted an HTTPS-to-HTTP key redirect")
+        } catch let error as HLSError {
+            guard case .invalidAESKey = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testRejectsKeyRedirectToPrivateOrLocalDestination() async throws {
+        let rejectedEffectiveURLs = [
+            URL(string: "https://localhost/content.key")!,
+            URL(string: "https://10.0.0.1/content.key")!
+        ]
+
+        for effectiveURL in rejectedEffectiveURLs {
+            let (downloader, playlist, directory) = try makeFixture(
+                keyURL: URL(string: "https://keys.example/content.key")!
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+            URLProtocolStub.handler = { request in
+                let response = HTTPURLResponse(
+                    url: effectiveURL,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/octet-stream"]
+                )!
+                return (response, Data(repeating: 7, count: 16))
+            }
+
+            do {
+                _ = try await downloader.downloadSampleAESPlaylist(
+                    playlist: playlist,
+                    requestedPlaylistURL: playlist.effectiveURL,
+                    prefix: "main",
+                    directory: directory,
+                    completedBefore: 0,
+                    totalSegments: 1,
+                    progress: { _ in }
+                )
+                XCTFail("Accepted a key redirect to \(effectiveURL.host ?? "private host")")
+            } catch let error as HLSError {
+                guard case .invalidAESKey = error else {
+                    return XCTFail("Unexpected error for \(effectiveURL): \(error)")
+                }
+            }
+        }
+    }
+
+    func testPreservesTransportStreamKeyRotationAndMethodNone() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let downloader = SegmentDownloader(
+            client: HTTPClient(configuration: configuration),
+            maximumConcurrentDownloads: 2
+        )
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let keyURLs = [1, 2].map {
+            URLCandidates(
+                primary: URL(string: "https://keys.example/key\($0).key")!,
+                sameOriginQueryFallback: nil
+            )
+        }
+        let encryptions = keyURLs.map {
+            EncryptionDescriptor(method: .sampleAES, keyURL: $0, explicitIV: nil)
+        }
+        let segments = [encryptions[0], nil, encryptions[1]].enumerated().map { index, encryption in
+            MediaSegment(
+                ordinal: index,
+                mediaSequence: UInt64(index),
+                duration: 1,
+                url: URLCandidates(
+                    primary: URL(string: "https://media.example/\(index).ts")!,
+                    sameOriginQueryFallback: nil
+                ),
+                byteRange: nil,
+                encryption: encryption,
+                initializationMap: nil,
+                hasDiscontinuity: false
+            )
+        }
+        let playlist = MediaPlaylist(
+            effectiveURL: allowed,
+            requestReferer: allowed,
+            segments: segments,
+            hasEndList: true
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SampleAESRotationTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        URLProtocolStub.handler = { request in
+            let path = request.url!.path
+            let data: Data
+            let mimeType: String
+            if path.hasSuffix("key1.key") {
+                data = Data(repeating: 1, count: 16)
+                mimeType = "application/octet-stream"
+            } else if path.hasSuffix("key2.key") {
+                data = Data(repeating: 2, count: 16)
+                mimeType = "application/octet-stream"
+            } else {
+                data = Self.transportStream()
+                mimeType = "video/mp2t"
+            }
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": mimeType]
+                )!,
+                data
+            )
+        }
+
+        let result = try await downloader.downloadSampleAESPlaylist(
+            playlist: playlist,
+            requestedPlaylistURL: allowed,
+            prefix: "main",
+            directory: directory,
+            completedBefore: 0,
+            totalSegments: 3,
+            progress: { _ in }
+        )
+        let text = try String(contentsOf: result.playlistURL, encoding: .utf8)
+        XCTAssertEqual(text.components(separatedBy: "METHOD=SAMPLE-AES").count - 1, 2)
+        XCTAssertTrue(text.contains("#EXT-X-KEY:METHOD=NONE"))
+        XCTAssertTrue(text.contains("main-key-000.key"))
+        XCTAssertTrue(text.contains("main-key-001.key"))
+        XCTAssertEqual(Set(result.diagnosticKeys).count, 2)
+    }
+
+    func testRejectsFMP4KeyRotationBeforeComposition() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let downloader = SegmentDownloader(
+            client: HTTPClient(configuration: configuration),
+            maximumConcurrentDownloads: 2
+        )
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let encryptions = [1, 2].map { number in
+            EncryptionDescriptor(
+                method: .sampleAES,
+                keyURL: URLCandidates(
+                    primary: URL(string: "https://keys.example/key\(number).key")!,
+                    sameOriginQueryFallback: nil
+                ),
+                explicitIV: nil
+            )
+        }
+        let map = InitializationMap(
+            url: URLCandidates(
+                primary: URL(string: "https://media.example/init.mp4")!,
+                sameOriginQueryFallback: nil
+            ),
+            byteRange: nil,
+            encryption: encryptions[0]
+        )
+        let segments = encryptions.enumerated().map { index, encryption in
+            MediaSegment(
+                ordinal: index,
+                mediaSequence: UInt64(index),
+                duration: 1,
+                url: URLCandidates(
+                    primary: URL(string: "https://media.example/\(index).m4s")!,
+                    sameOriginQueryFallback: nil
+                ),
+                byteRange: nil,
+                encryption: encryption,
+                initializationMap: map,
+                hasDiscontinuity: false
+            )
+        }
+        let playlist = MediaPlaylist(
+            effectiveURL: allowed,
+            requestReferer: allowed,
+            segments: segments,
+            hasEndList: true
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SampleAESFMP4RotationTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        URLProtocolStub.handler = { request in
+            let path = request.url!.path
+            let data: Data
+            if path.hasSuffix(".key") {
+                data = Data(repeating: path.contains("key1") ? 1 : 2, count: 16)
+            } else if path.hasSuffix("init.mp4") {
+                data = Data([0, 0, 0, 8]) + Data("moov".utf8)
+            } else {
+                data = Data([0, 0, 0, 8]) + Data("moof".utf8)
+            }
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/octet-stream"]
+                )!,
+                data
+            )
+        }
+
+        do {
+            _ = try await downloader.downloadSampleAESPlaylist(
+                playlist: playlist,
+                requestedPlaylistURL: allowed,
+                prefix: "main",
+                directory: directory,
+                completedBefore: 0,
+                totalSegments: 2,
+                progress: { _ in }
+            )
+            XCTFail("Accepted fMP4 SAMPLE-AES key rotation")
+        } catch let error as HLSError {
+            guard case .drmUnsupported(let detail) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(detail.contains("fMP4 key rotation"))
+        }
+    }
+
+    func testRejectsMixedSampleAESRenditionEncryptionAtPlanBoundary() throws {
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let sample = try Self.playlist(
+            effectiveURL: allowed,
+            keyURL: URL(string: "https://keys.example/key")!
+        )
+        let clear = try Self.playlist(effectiveURL: allowed, keyURL: nil)
+        let prepared = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: sample, audio: clear),
+            mainRequestedURL: allowed,
+            audioRequestedURL: allowed
+        )
+
+        XCTAssertThrowsError(try prepared.validateSampleAESPermit()) { error in
+            guard case HLSError.drmUnsupported(let detail) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(detail, "mixed SAMPLE-AES rendition encryption")
+        }
+    }
+
+    func testSampleAESPermitRequiresAllowedRequestedAndEffectivePlaylistURLs() throws {
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let denied = URL(string: "https://example.com/media.m3u8")!
+        let keyURL = URL(string: "https://keys.example/content.key")!
+        let allowedPlaylist = try Self.playlist(effectiveURL: allowed, keyURL: keyURL)
+
+        let accepted = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: allowedPlaylist, audio: nil),
+            mainRequestedURL: allowed,
+            audioRequestedURL: nil
+        )
+        XCTAssertNoThrow(try accepted.validateSampleAESPermit())
+
+        let deniedRequested = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: allowedPlaylist, audio: nil),
+            mainRequestedURL: denied,
+            audioRequestedURL: nil
+        )
+        XCTAssertThrowsError(try deniedRequested.validateSampleAESPermit())
+
+        let deniedEffectivePlaylist = try Self.playlist(effectiveURL: denied, keyURL: keyURL)
+        let deniedEffective = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: deniedEffectivePlaylist, audio: nil),
+            mainRequestedURL: allowed,
+            audioRequestedURL: nil
+        )
+        XCTAssertThrowsError(try deniedEffective.validateSampleAESPermit())
+    }
+
+    func testSampleAESPermitAppliesToExternalAudioRequestedAndEffectiveURLs() throws {
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let denied = URL(string: "https://example.com/audio.m3u8")!
+        let keyURL = URL(string: "https://keys.example/content.key")!
+        let main = try Self.playlist(effectiveURL: allowed, keyURL: keyURL)
+        let allowedAudio = try Self.playlist(effectiveURL: allowed, keyURL: keyURL)
+
+        let deniedRequested = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: main, audio: allowedAudio),
+            mainRequestedURL: allowed,
+            audioRequestedURL: denied
+        )
+        XCTAssertThrowsError(try deniedRequested.validateSampleAESPermit())
+
+        let deniedEffectiveAudio = try Self.playlist(effectiveURL: denied, keyURL: keyURL)
+        let deniedEffective = PreparedDownloadPlan(
+            plan: DownloadPlan(sourceURL: allowed, main: main, audio: deniedEffectiveAudio),
+            mainRequestedURL: allowed,
+            audioRequestedURL: allowed
+        )
+        XCTAssertThrowsError(try deniedEffective.validateSampleAESPermit())
+    }
+
+    private func makeFixture(
+        keyURL: URL
+    ) throws -> (SegmentDownloader, MediaPlaylist, URL) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let downloader = SegmentDownloader(
+            client: HTTPClient(configuration: configuration),
+            maximumConcurrentDownloads: 1
+        )
+        let allowed = URL(string: "https://widevine.sprink.cloud/media.m3u8")!
+        let playlist = try Self.playlist(effectiveURL: allowed, keyURL: keyURL)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "SampleAESPipelineSecurityTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return (downloader, playlist, directory)
+    }
+
+    private static func playlist(effectiveURL: URL, keyURL: URL?) throws -> MediaPlaylist {
+        let encryption = keyURL.map {
+            EncryptionDescriptor(
+                method: .sampleAES,
+                keyURL: URLCandidates(primary: $0, sameOriginQueryFallback: nil),
+                explicitIV: nil
+            )
+        }
+        let segment = MediaSegment(
+            ordinal: 0,
+            mediaSequence: 0,
+            duration: 4,
+            url: URLCandidates(
+                primary: URL(string: "https://media.public-cdn.example/segment.ts")!,
+                sameOriginQueryFallback: nil
+            ),
+            byteRange: nil,
+            encryption: encryption,
+            initializationMap: nil,
+            hasDiscontinuity: false
+        )
+        return MediaPlaylist(
+            effectiveURL: effectiveURL,
+            requestReferer: effectiveURL,
+            segments: [segment],
+            hasEndList: true
+        )
     }
 
     private static func transportStream() -> Data {

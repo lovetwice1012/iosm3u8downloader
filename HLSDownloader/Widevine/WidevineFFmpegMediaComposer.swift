@@ -108,10 +108,18 @@ struct FFmpegWidevineMediaComposer: WidevineMediaComposing, Sendable {
         outputURL: URL
     ) async throws {
         let audioIsValid = try audio.map { try Self.isValidInput($0) } ?? true
-        guard let video,
-              outputURL.isFileURL,
-              try Self.isValidInput(video),
-              audioIsValid else {
+        guard outputURL.isFileURL, audioIsValid else {
+            throw WidevineDASHProviderError.invalidMediaOutput
+        }
+        if video == nil, let audio {
+            try await FFmpegAudioWAVComposer().compose(
+                inputURL: audio.encryptedFileURL,
+                decryptionKey: audio.keyData,
+                outputURL: outputURL
+            )
+            return
+        }
+        guard let video, try Self.isValidInput(video) else {
             throw WidevineDASHProviderError.invalidMediaOutput
         }
 

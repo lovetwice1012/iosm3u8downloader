@@ -396,7 +396,12 @@ struct ContentView: View {
 
     private func completionCard(_ outputURL: URL) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("MP4を作成しました", systemImage: "checkmark.circle.fill")
+            Label(
+                outputURL.pathExtension.lowercased() == "wav"
+                    ? "WAVを作成しました"
+                    : "MP4を作成しました",
+                systemImage: "checkmark.circle.fill"
+            )
                 .font(.headline)
                 .foregroundStyle(.green)
             Text(outputURL.lastPathComponent)
@@ -467,11 +472,11 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("対応範囲", systemImage: "info.circle")
                 .font(.headline)
-            Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128に対応します。")
+            Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128と許可host上のidentity SAMPLE-AESに対応します。音声trackだけの配信はPCM WAVで保存します。")
             Text("Widevine DASH/MPDは `isDownloadableWidevineDomain` の許可hostだけを候補化します。その他のWidevineは再生・保存とも拒否し、DRMなしHLSは従来どおり全ドメインで処理します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Text("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。Safariのログイン状態、Worker内だけの通信、ライブ配信、FairPlay/SAMPLE-AESには対応できない場合があります。")
+            Text("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。iOS標準DRMはFairPlayで、Widevineは標準WKWebView/AVFoundationの再生機能ではありません。FairPlayは復号済みMP4/WAVとして書き出せず、SAMPLE-AESもFairPlay key formatではなくidentity key formatだけが保存対象です。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Text("再生解析は前面表示中だけ動作します。候補選択後の保存はiOS 26でバックグラウンド継続を要求し、利用できない署名・OSでは短時間の完了猶予へ切り替わります。")

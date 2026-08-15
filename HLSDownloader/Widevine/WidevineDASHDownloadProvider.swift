@@ -213,7 +213,7 @@ enum WidevineDASHProviderError: LocalizedError, Equatable, Sendable {
         case .totalDownloadTooLarge:
             return "DASH動画の合計サイズが安全上限を超えています。"
         case .invalidMediaOutput:
-            return "復号・結合後のMP4を確認できません。"
+            return "復号・変換後のMP4またはWAVを確認できません。"
         }
     }
 }
@@ -298,6 +298,7 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             throw HLSError.invalidPlaylist("Widevine ContentProtectionを確認できません")
         }
         let plan = try WidevineDASHPlanner().makePlan(manifest: manifest)
+        let outputFormat = plan.outputFormat
         let keys = try await keyAcquirer.acquireKeys(
             initData: plan.psshData,
             expectedKeyIDs: plan.expectedKeyIDs,
@@ -321,7 +322,7 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             isDirectory: true
         )
         let outputURL = jobDirectory.appendingPathComponent(
-            "output.mp4",
+            "output.\(outputFormat.rawValue)",
             isDirectory: false
         )
         try Self.prepareProtectedDirectory(jobDirectory, fileManager: fileManager)
@@ -364,7 +365,9 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             audio: audioInput,
             outputURL: outputURL
         )
-        try validateOutput(outputURL)
+        guard WidevineMediaOutputValidator.isValid(outputURL, format: outputFormat) else {
+            throw WidevineDASHProviderError.invalidMediaOutput
+        }
 
         // Provider boundary re-check. HLSDownloadService performs the same
         // centralized policy check again immediately before the final save.
@@ -372,7 +375,10 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             throw WidevineProcessingError.domainNotAllowed
         }
         keepOutput = true
-        return WidevineProcessingResult(mediaFileURL: outputURL)
+        return WidevineProcessingResult(
+            mediaFileURL: outputURL,
+            outputFormat: outputFormat
+        )
     }
 
     /// Removes only artifacts created by this provider. This is used once at
@@ -628,32 +634,6 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             keyData: keyData,
             scheme: track.scheme
         )
-    }
-
-    private func validateOutput(_ url: URL) throws {
-        let values = try url.resourceValues(
-            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
-        )
-        guard values.isRegularFile == true,
-              values.isSymbolicLink != true,
-              let fileSize = values.fileSize,
-              fileSize >= 12 else {
-            throw WidevineDASHProviderError.invalidMediaOutput
-        }
-        let input = try FileHandle(forReadingFrom: url)
-        defer { try? input.close() }
-        guard let header = try input.read(upToCount: 12), header.count == 12 else {
-            throw WidevineDASHProviderError.invalidMediaOutput
-        }
-        let bytes = [UInt8](header)
-        let boxSize = bytes[0...3].reduce(UInt32(0)) { value, byte in
-            (value << 8) | UInt32(byte)
-        }
-        guard boxSize >= 8,
-              UInt64(boxSize) <= UInt64(fileSize),
-              Array(bytes[4...7]) == Array("ftyp".utf8) else {
-            throw WidevineDASHProviderError.invalidMediaOutput
-        }
     }
 
     private static func isSecureNetworkURL(_ url: URL) -> Bool {
@@ -1301,6 +1281,10 @@ struct WidevineDASHDownloadPlan: Equatable, Sendable {
     let audio: WidevineDASHTrackPlan?
     let psshData: [Data]
     let expectedKeyIDs: Set<String>
+
+    /// Output is selected from parsed/selected media tracks, never from a URL
+    /// extension or representation filename.
+    var outputFormat: MediaOutputFormat { video == nil ? .wav : .mp4 }
 }
 
 struct WidevineDASHPlanner {
@@ -1328,7 +1312,7 @@ struct WidevineDASHPlanner {
             manifest: manifest,
             period: period
         )
-        guard video != nil else {
+        guard video != nil || audio != nil else {
             throw WidevineDASHProviderError.noSupportedTracks
         }
 
