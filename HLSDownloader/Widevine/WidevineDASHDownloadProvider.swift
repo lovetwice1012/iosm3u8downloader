@@ -118,7 +118,8 @@ actor DASHDownloadPermitPool {
         }
         let waiterID = UUID()
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
                 guard !Task.isCancelled else {
                     continuation.resume(throwing: CancellationError())
                     return
