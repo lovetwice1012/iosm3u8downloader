@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HLS Downloader</string>
+    <string name="download_notification_channel">HLSダウンロード</string>
+    <string name="download_notification_description">動画のダウンロードとMP4変換の進捗</string>
+</resources>

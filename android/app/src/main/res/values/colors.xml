@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="app_background">#FFF9FB</color>
+    <color name="app_accent">#00639A</color>
+    <color name="app_navigation_bar">#F4F3F7</color>
+</resources>

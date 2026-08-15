@@ -1,4 +1,27 @@
-# HLS Downloader for iOS
+# HLS Downloader for iOS / Android
+
+The original iOS project remains at the repository root. The Android port is
+kept in [`android/`](android/) so both implementations can be compared without
+mixing their source trees.
+
+## Android build and test
+
+Android uses the same URL discovery, visible playback capture, HLS parsing,
+up-to-six-way adaptive segment download, AES-128 decryption and stream-copy MP4
+remux flow as the iOS app. It targets Android 8.0 (API 26) or newer.
+
+```bash
+cd android
+./gradlew :app:testDebugUnitTest :app:lintDebug
+./gradlew :app:assembleRelease
+```
+
+`assembleRelease` deliberately creates
+`android/app/build/outputs/apk/release/app-release-unsigned.apk` without a
+signing configuration. The independent **Test Android app** and **Build
+unsigned Android APK** workflows let an APK build finish without waiting for
+the test workflow. Detailed Android requirements and the pinned FFmpeg binary
+checksum are documented in [`android/README.md`](android/README.md).
 
 URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして単一MP4へまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
 

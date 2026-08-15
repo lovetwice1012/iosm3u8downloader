@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Minimal Gradle wrapper launcher. The wrapper JAR and distribution are both
+# pinned in gradle/wrapper/gradle-wrapper.properties.
+APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+
+if [ -n "$JAVA_HOME" ]; then
+    JAVACMD="$JAVA_HOME/bin/java"
+else
+    JAVACMD=java
+fi
+
+if ! command -v "$JAVACMD" >/dev/null 2>&1; then
+    echo "Java 17 was not found. Set JAVA_HOME or add java to PATH." >&2
+    exit 1
+fi
+
+exec "$JAVACMD" \
+    -Dorg.gradle.appname=gradlew \
+    -classpath "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" \
+    org.gradle.wrapper.GradleWrapperMain \
+    "$@"
