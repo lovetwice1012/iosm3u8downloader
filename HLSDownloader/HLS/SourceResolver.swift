@@ -684,7 +684,7 @@ final class SourceResolver: Sendable {
                     inspection.media[$0].frameToken == frameToken
                 }
                 guard let mediaIndex = nearestPrecedingMediaIndex(
-                    tokenMatches,
+                    Array(tokenMatches),
                     media: inspection.media,
                     licenseSequence: license.sequence
                 ) else {
@@ -705,7 +705,7 @@ final class SourceResolver: Sendable {
                 }
 
             guard let mediaIndex = nearestPrecedingMediaIndex(
-                candidates,
+                Array(candidates),
                 media: inspection.media,
                 licenseSequence: license.sequence
             ) else {
