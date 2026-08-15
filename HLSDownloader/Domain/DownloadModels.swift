@@ -196,8 +196,10 @@ enum DiagnosticPrivacy {
         fingerprintComponents?.password = nil
         fingerprintComponents?.fragment = nil
         fingerprintComponents?.percentEncodedQuery = nil
-        fingerprintComponents?.scheme = fingerprintComponents?.scheme?.lowercased()
-        fingerprintComponents?.host = fingerprintComponents?.host?.lowercased()
+        let fingerprintScheme = fingerprintComponents?.scheme?.lowercased()
+        let fingerprintHost = fingerprintComponents?.host?.lowercased()
+        fingerprintComponents?.scheme = fingerprintScheme
+        fingerprintComponents?.host = fingerprintHost
         var hasher = Hasher()
         hasher.combine(fingerprintComponents?.string ?? "\(scheme):\(pathDepth):\(extensionClass)")
         let fingerprint = String(String(UInt(bitPattern: hasher.finalize()), radix: 16).suffix(12))
