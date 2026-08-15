@@ -8,20 +8,33 @@ struct WidevineManifestDocument: Sendable {
 struct WidevineLicenseConfiguration: Sendable {
     let serverURL: URL
     let httpHeaders: [String: String]
+    let refererURL: URL?
     let observedRequestMetadata: WidevineLicenseRequestMetadata?
 
     init(
         serverURL: URL,
         httpHeaders: [String: String] = [:],
+        refererURL: URL? = nil,
         observedRequestMetadata: WidevineLicenseRequestMetadata? = nil
     ) {
         self.serverURL = serverURL
         self.httpHeaders = httpHeaders
+        self.refererURL = refererURL
         self.observedRequestMetadata = observedRequestMetadata
     }
 }
 
+extension WidevineLicenseConfiguration: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    var description: String { "WidevineLicenseConfiguration(<redacted>)" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["contents": "<redacted>"], displayStyle: .struct)
+    }
+}
+
 struct WidevineProcessingResult: Equatable, Sendable {
+    /// A caller-owned temporary clear-media file. The service removes this
+    /// file after validating and copying it into the protected export area.
     let mediaFileURL: URL
 }
 
@@ -88,7 +101,8 @@ struct DomainRestrictedWidevineProcessingProvider: WidevineProcessingProviding, 
         licenseConfiguration: WidevineLicenseConfiguration,
         wvdData: Data
     ) async throws -> WidevineProcessingResult {
-        guard isDownloadableWidevineDomain(manifest.sourceURL) else {
+        guard isDownloadableWidevineDomain(manifest.sourceURL),
+              isDownloadableWidevineDomain(licenseConfiguration.serverURL) else {
             throw WidevineProcessingError.domainNotAllowed
         }
         return try await base.process(

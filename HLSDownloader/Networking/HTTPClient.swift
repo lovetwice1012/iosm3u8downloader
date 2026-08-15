@@ -10,6 +10,8 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
     ) {
         guard let sourceURL = response.url,
               let targetURL = request.url,
+              !(sourceURL.scheme?.lowercased() == "https"
+                && targetURL.scheme?.lowercased() != "https"),
               AutomaticNavigationPolicy.isAllowedFrameNavigation(
                 from: sourceURL,
                 to: targetURL
@@ -17,7 +19,58 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
             completionHandler(nil)
             return
         }
-        completionHandler(request)
+
+        var sanitizedRequest = request
+        if !Self.isSameOrigin(sourceURL, targetURL) {
+            sanitizedRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+            sanitizedRequest.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
+            sanitizedRequest.setValue(nil, forHTTPHeaderField: "Cookie")
+            sanitizedRequest.setValue(
+                Self.originString(sourceURL),
+                forHTTPHeaderField: "Referer"
+            )
+        }
+        completionHandler(sanitizedRequest)
+    }
+
+    private static func isSameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.scheme?.lowercased() == rhs.scheme?.lowercased()
+            && lhs.host?.lowercased() == rhs.host?.lowercased()
+            && effectivePort(lhs) == effectivePort(rhs)
+    }
+
+    private static func effectivePort(_ url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+
+    private static func originString(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased() else {
+            return nil
+        }
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = host
+        components.port = url.port
+        components.path = "/"
+        return components.url?.absoluteString
+    }
+}
+
+private final class HTTPRejectRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
 
@@ -258,8 +311,284 @@ final class HTTPClient: @unchecked Sendable {
         throw HLSError.network(lastError?.localizedDescription ?? "不明なエラー")
     }
 
+    /// Streams one bounded DASH object directly to a local file. Range
+    /// requests must be honored with HTTP 206 so a large shared media object
+    /// is never downloaded repeatedly just to extract a small subrange.
+    func downloadLimited(
+        _ url: URL,
+        to destinationURL: URL,
+        referer: URL? = nil,
+        byteRange: ByteRange? = nil,
+        maximumBytes: Int
+    ) async throws -> Int64 {
+        guard destinationURL.isFileURL,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              maximumBytes > 0,
+              maximumBytes <= 64 * 1_024 * 1_024 else {
+            throw HLSError.network("DASH断片の保存条件が不正です")
+        }
+        if let byteRange {
+            guard byteRange.offset >= 0,
+                  byteRange.length > 0,
+                  byteRange.length <= Int64(maximumBytes) else {
+                throw HLSError.byteRangeInvalid
+            }
+        }
+
+        var lastError: Error?
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            try? FileManager.default.removeItem(at: destinationURL)
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "GET"
+                request.setValue("video/mp4,audio/mp4,application/octet-stream,*/*;q=0.5", forHTTPHeaderField: "Accept")
+                if let referer = safeReferer(referer, target: url) {
+                    request.setValue(referer, forHTTPHeaderField: "Referer")
+                }
+                if let cookieHeader = importedCookieHeader(for: url) {
+                    request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+                }
+                if let byteRange {
+                    let upperBound = try checkedUpperBound(byteRange)
+                    request.setValue("bytes=\(byteRange.offset)-\(upperBound)", forHTTPHeaderField: "Range")
+                }
+
+                let (bytes, response) = try await session.bytes(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw HLSError.network("DASH断片のHTTP応答を受信できませんでした")
+                }
+                let effectiveURL = http.url ?? url
+                guard scheme != "https"
+                        || effectiveURL.scheme?.lowercased() == "https" else {
+                    throw HLSError.network("DASH断片の安全でないリダイレクトを拒否しました")
+                }
+                guard (200...299).contains(http.statusCode) else {
+                    throw HLSError.httpStatus(
+                        http.statusCode,
+                        effectiveURL.host ?? "DASH配信サーバー"
+                    )
+                }
+                if byteRange != nil, http.statusCode != 206 {
+                    throw HLSError.byteRangeInvalid
+                }
+                if http.expectedContentLength > Int64(maximumBytes) {
+                    throw HLSError.network("DASH断片が大きすぎます")
+                }
+
+                guard FileManager.default.createFile(
+                    atPath: destinationURL.path,
+                    contents: nil
+                ) else {
+                    throw HLSError.network("DASH断片の一時ファイルを作成できませんでした")
+                }
+                let output = try FileHandle(forWritingTo: destinationURL)
+                var buffer = Data()
+                buffer.reserveCapacity(64 * 1_024)
+                var written: Int64 = 0
+                do {
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        guard written < Int64(maximumBytes) else {
+                            throw HLSError.network("DASH断片が大きすぎます")
+                        }
+                        buffer.append(byte)
+                        written += 1
+                        if buffer.count == 64 * 1_024 {
+                            try output.write(contentsOf: buffer)
+                            buffer.removeAll(keepingCapacity: true)
+                        }
+                    }
+                    if !buffer.isEmpty {
+                        try output.write(contentsOf: buffer)
+                    }
+                    try output.close()
+                } catch {
+                    try? output.close()
+                    throw error
+                }
+
+                guard written > 0, written <= Int64(maximumBytes) else {
+                    throw HLSError.network("DASH断片が空か大きすぎます")
+                }
+                if let byteRange {
+                    guard written <= Int64(Int.max) else {
+                        throw HLSError.byteRangeInvalid
+                    }
+                    try validatePartialResponse(
+                        http,
+                        dataCount: Int(written),
+                        expected: byteRange
+                    )
+                }
+                return written
+            } catch is CancellationError {
+                try? FileManager.default.removeItem(at: destinationURL)
+                throw HLSError.cancelled
+            } catch {
+                try? FileManager.default.removeItem(at: destinationURL)
+                if let urlError = error as? URLError,
+                   urlError.code == .cancelled {
+                    throw HLSError.cancelled
+                }
+                lastError = error
+                if attempt < 2, shouldRetry(error: error) {
+                    try await backoff(attempt: attempt)
+                    continue
+                }
+                throw error
+            }
+        }
+
+        try? FileManager.default.removeItem(at: destinationURL)
+        if let hlsError = lastError as? HLSError { throw hlsError }
+        throw HLSError.network("DASH断片の取得に失敗しました")
+    }
+
+    /// Sends a bounded, non-redirecting POST used by the Widevine license
+    /// transport. The caller owns the header values; this method never logs
+    /// them and refuses request-controlled transport headers.
+    func postLimited(
+        _ url: URL,
+        headers: [String: String],
+        body: Data,
+        referer: URL?,
+        maximumResponseBytes: Int
+    ) async throws -> HTTPPayload {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "https" || scheme == "http"),
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              maximumResponseBytes > 0,
+              maximumResponseBytes <= 16 * 1_024 * 1_024,
+              body.count <= 4 * 1_024 * 1_024 else {
+            throw HLSError.network("Widevineライセンス要求が安全な上限を超えています")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/octet-stream,application/json;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
+        for (name, value) in try validatedRequestHeaders(headers) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        if let referer = safeReferer(referer, target: url) {
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+        if request.value(forHTTPHeaderField: "Origin") == nil,
+           let origin = safeOrigin(referer, target: url) {
+            request.setValue(origin, forHTTPHeaderField: "Origin")
+        }
+        if let cookieHeader = importedCookieHeader(for: url) {
+            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60
+        configuration.waitsForConnectivity = true
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.httpCookieAcceptPolicy = .always
+        configuration.httpShouldSetCookies = true
+        configuration.httpCookieStorage = cookieStorage
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": Self.userAgent,
+            "Accept-Language": "ja,en-US;q=0.8,en;q=0.6"
+        ]
+        let delegate = HTTPRejectRedirectDelegate()
+        let licenseSession = URLSession(
+            configuration: configuration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
+        defer { licenseSession.invalidateAndCancel() }
+
+        do {
+            let (bytes, response) = try await licenseSession.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw HLSError.network("WidevineライセンスサーバーからHTTP応答を受信できませんでした")
+            }
+            let effectiveURL = http.url ?? url
+            guard (200...299).contains(http.statusCode) else {
+                throw HLSError.httpStatus(
+                    http.statusCode,
+                    effectiveURL.host ?? "ライセンスサーバー"
+                )
+            }
+            if http.expectedContentLength > Int64(maximumResponseBytes) {
+                throw HLSError.network("Widevineライセンス応答が大きすぎます")
+            }
+
+            var data = Data()
+            data.reserveCapacity(
+                min(maximumResponseBytes, max(Int(http.expectedContentLength), 0))
+            )
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                guard data.count < maximumResponseBytes else {
+                    throw HLSError.network("Widevineライセンス応答が大きすぎます")
+                }
+                data.append(byte)
+            }
+            guard !data.isEmpty else {
+                throw HLSError.network("Widevineライセンス応答が空です")
+            }
+            return HTTPPayload(
+                data: data,
+                effectiveURL: effectiveURL,
+                statusCode: http.statusCode,
+                mimeType: http.mimeType
+            )
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            throw error
+        } catch {
+            throw HLSError.network("Widevineライセンス通信に失敗しました")
+        }
+    }
+
     private func shouldRetry(status: Int) -> Bool {
         status == 408 || status == 429 || (500...599).contains(status)
+    }
+
+    private func validatedRequestHeaders(_ headers: [String: String]) throws -> [(String, String)] {
+        guard headers.count <= 32 else {
+            throw HLSError.network("Widevineライセンス要求ヘッダーが多すぎます")
+        }
+        let forbidden = Set([
+            "connection", "content-length", "cookie", "host", "proxy-authorization",
+            "referer", "transfer-encoding", "user-agent"
+        ])
+        let tokenCharacters = CharacterSet(
+            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~"
+        )
+        var result: [(String, String)] = []
+        result.reserveCapacity(headers.count)
+        for (name, value) in headers {
+            let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedName.isEmpty,
+                  trimmedName.utf8.count <= 64,
+                  trimmedName.unicodeScalars.allSatisfy {
+                      tokenCharacters.contains($0)
+                  },
+                  !forbidden.contains(trimmedName.lowercased()),
+                  value.utf8.count <= 8_192,
+                  !value.contains("\r"),
+                  !value.contains("\n"),
+                  !value.contains("\0") else {
+                throw HLSError.network("Widevineライセンス要求ヘッダーが不正です")
+            }
+            result.append((trimmedName, value))
+        }
+        return result
     }
 
     private func shouldRetry(error: Error) -> Bool {
@@ -279,7 +608,11 @@ final class HTTPClient: @unchecked Sendable {
 
     private func backoff(attempt: Int) async throws {
         let nanoseconds = UInt64(500_000_000 * (attempt + 1))
-        try await Task.sleep(nanoseconds: nanoseconds)
+        do {
+            try await Task.sleep(nanoseconds: nanoseconds)
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        }
     }
 
     private func checkedUpperBound(_ range: ByteRange) throws -> Int64 {
@@ -338,6 +671,24 @@ final class HTTPClient: @unchecked Sendable {
             components.percentEncodedQuery = nil
         }
         return components.url?.absoluteString
+    }
+
+    private func safeOrigin(_ source: URL?, target: URL) -> String? {
+        guard let source,
+              let sourceScheme = source.scheme?.lowercased(),
+              let targetScheme = target.scheme?.lowercased(),
+              sourceScheme == "http" || sourceScheme == "https",
+              !(sourceScheme == "https" && targetScheme == "http"),
+              let host = source.host?.lowercased(),
+              source.user == nil,
+              source.password == nil else {
+            return nil
+        }
+        var components = URLComponents()
+        components.scheme = sourceScheme
+        components.host = host
+        components.port = source.port
+        return components.string
     }
 
     private func isSameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {

@@ -6,14 +6,19 @@ private let downloadableWidevineHosts: Set<String> = [
 
 /// Returns whether this app may accept and process Widevine from this manifest URL.
 ///
-/// This is deliberately an exact host comparison. Subdomains, parent-domain
-/// suffixes, URL paths, query strings and user-info never participate in the
-/// decision. Callers must pass the manifest's final URL after redirects.
+/// This is deliberately an HTTPS URL plus exact-host comparison. Subdomains,
+/// parent-domain suffixes, URL paths and query strings never participate in
+/// the decision, and credential-bearing URLs are rejected. Callers must pass
+/// the manifest's final URL after redirects.
 func isDownloadableWidevineDomain(_ url: URL) -> Bool {
-    guard let host = URLComponents(
+    guard let components = URLComponents(
         url: url,
         resolvingAgainstBaseURL: false
-    )?.host?.lowercased() else {
+    ),
+          components.scheme?.lowercased() == "https",
+          components.user == nil,
+          components.password == nil,
+          let host = components.host?.lowercased() else {
         return false
     }
     return downloadableWidevineHosts.contains(host)

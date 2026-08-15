@@ -41,7 +41,9 @@ final class WidevineProcessingProviderTests: XCTestCase {
             data: Data("<MPD/>".utf8)
         )
         let license = WidevineLicenseConfiguration(
-            serverURL: try XCTUnwrap(URL(string: "https://license.example/request"))
+            serverURL: try XCTUnwrap(
+                URL(string: "https://widevine.sprink.cloud/license/request")
+            )
         )
 
         _ = try await provider.process(
@@ -68,6 +70,22 @@ final class WidevineProcessingProviderTests: XCTestCase {
         }
         let callsAfterBlocked = await base.callCount()
         XCTAssertEqual(callsAfterBlocked, 1)
+
+        let externalLicense = WidevineLicenseConfiguration(
+            serverURL: try XCTUnwrap(URL(string: "https://license.example/request"))
+        )
+        do {
+            _ = try await provider.process(
+                manifest: allowed,
+                licenseConfiguration: externalLicense,
+                wvdData: Data([0x01])
+            )
+            XCTFail("A Widevine license endpoint outside the central allowlist must be rejected")
+        } catch let error as WidevineProcessingError {
+            XCTAssertEqual(error, .domainNotAllowed)
+        }
+        let callsAfterExternalLicense = await base.callCount()
+        XCTAssertEqual(callsAfterExternalLicense, 1)
     }
 }
 

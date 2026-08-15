@@ -57,12 +57,17 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         let configuration = URLSessionConfiguration.ephemeral
         let client = HTTPClient(configuration: configuration)
         let diagnostics = DiagnosticLogStore()
+        let widevineProcessor = WidevineDASHDownloadProvider(
+            segmentFetcher: HTTPDASHSegmentFetcher(client: client),
+            keyAcquirer: WidevineL3KeyAcquirer(transport: client),
+            mediaComposer: FFmpegWidevineMediaComposer()
+        )
         self.init(
             client: client,
             dynamicInspector: WebPageInspector(diagnosticSink: diagnostics.sink),
             diagnostics: diagnostics,
             widevineCredentialStore: KeychainWidevineCredentialStore(),
-            widevineProcessor: UnconfiguredWidevineProcessingProvider()
+            widevineProcessor: widevineProcessor
         )
     }
 
@@ -310,11 +315,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             : nil
         let licenseURL = manifest.widevineLicenseURLs.first ?? observedLicenseURL
         guard let licenseURL,
-              let scheme = licenseURL.scheme?.lowercased(),
-              scheme == "https" || scheme == "http",
-              licenseURL.host != nil,
-              licenseURL.user == nil,
-              licenseURL.password == nil else {
+              isDownloadableWidevineDomain(licenseURL) else {
             throw WidevineProcessingError.licenseServerMissing
         }
         let observedRequestMetadata = playbackContext?.isHighConfidence == true
@@ -340,14 +341,20 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             ),
             licenseConfiguration: WidevineLicenseConfiguration(
                 serverURL: licenseURL,
+                refererURL: playbackContext?.pageURL ?? document.effectiveURL,
                 observedRequestMetadata: observedRequestMetadata
             ),
             wvdData: wvdData
         )
+        let sourceURL = processed.mediaFileURL
+        defer {
+            if sourceURL.isFileURL {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+        }
 
         try Task.checkCancellation()
         await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
-        let sourceURL = processed.mediaFileURL
         guard sourceURL.isFileURL else {
             throw WidevineProcessingError.invalidOutput
         }
@@ -364,7 +371,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         let locations = try fileStore.outputLocations(for: document.effectiveURL)
         try? FileManager.default.removeItem(at: locations.temporary)
         do {
-            try FileManager.default.copyItem(at: sourceURL, to: locations.temporary)
+            try await fileStore.copyProtectedFile(
+                from: sourceURL,
+                to: locations.temporary
+            )
             try Task.checkCancellation()
             // 保存へ進む直前の最終チェック。許可host比較はこの共通関数だけが行う。
             guard isDownloadableWidevineDomain(document.effectiveURL) else {

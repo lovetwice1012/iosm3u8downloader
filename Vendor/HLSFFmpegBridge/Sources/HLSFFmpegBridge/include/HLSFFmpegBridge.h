@@ -16,6 +16,14 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
     const char *output_path
 );
 
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
+    const char *video_input_path,
+    const char *video_decryption_key_hex,
+    const char *audio_input_path,
+    const char *audio_decryption_key_hex,
+    const char *output_path
+);
+
 int64_t hls_ffmpeg_remux_session_execute(
     HLSFFmpegRemuxSessionHandle session,
     char *diagnostic_buffer,

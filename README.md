@@ -55,15 +55,17 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 
 ### Widevineアルファ基盤
 
-Widevineの許可hostは `HLSDownloader/DRM/WidevineDownloadPolicy.swift` のSetだけで管理し、すべての判定を `isDownloadableWidevineDomain(_:)` へ集約しています。現在は `widevine.sprink.cloud` の完全一致hostのみです。サブドメインや部分一致は許可しません。その他のWidevineは候補化せず、再生・保存とも行いません。DRMなしHLSにはこのドメイン制限を適用しません。
+Widevineの許可hostは `HLSDownloader/DRM/WidevineDownloadPolicy.swift` のSetだけで管理し、すべての判定を `isDownloadableWidevineDomain(_:)` へ集約しています。現在はHTTPSの `widevine.sprink.cloud` 完全一致hostのみです。HTTP、userinfo付きURL、サブドメインや部分一致は許可しません。manifestとlicense endpointの両方に同じ判定を適用し、WVDのclient identificationを許可外hostへ送信しません。その他のWidevineは候補化せず、再生・保存とも行いません。DRMなしHLSにはこのドメイン制限を適用しません。
 
-WVDファイルはアプリUIから読み込み、magic/version/L3/lengthを検証した後、`AfterFirstUnlockThisDeviceOnly` のKeychain itemとして保存します。WVD本体、private key、client identification、license headerはリポジトリや診断ログへ出力しません。
+WVDファイルはアプリUIから読み込み、magic/version/AndroidまたはChrome device type/L3/flags/lengthを検証した後、`AfterFirstUnlockThisDeviceOnly` のKeychain itemとして保存します。処理開始時にはclient certificateのRSA公開鍵とWVD秘密鍵の一致も確認します。WVD本体、private key、client identification、content key、license headerはリポジトリや診断ログへ出力しません。
 
 Widevineはm3u8/MPDの直リンクだけを前提にせず、「再生ページを開いて解析」からページ内の再生操作を監視します。MPD、`requestMediaKeySystemAccess("com.widevine.alpha")`、`MediaKeySession`のmessage、および直後の`fetch` / XHRを観測し、frame tokenとevent順序でmanifest候補へ結び付けます。候補へ保持するのはlicense URL、method、Content-Type、header**名**、body種別・サイズだけで、Authorization等のheader値、challenge、license応答本文は保持しません。
 
 標準WKWebView側でWidevine CDMが利用できずEMEが拒否されたページでは、MPDとWidevine試行は検出できても、license要求が発生しない場合があります。fetch/XHRは送信直前に観測するため、画面では「通信完了」ではなく「license要求候補」として表示します。Worker / Service Worker内だけで完結する通信も対象外です。
 
-現在のmainに入っている実行providerは意図的に `UnconfiguredWidevineProcessingProvider` です。そのため、MPD検出、ポリシー、WVD保存、provider境界までは有効ですが、Widevine再生、license exchange、segment復号、平文MP4出力はまだ有効ではありません。実配信と統合するには、WVDだけでなく、運営者が指定するlicense URL、request/response包装、必要な認証header、および利用許諾に沿ったWidevine処理providerが必要です。
+mainの実行providerは、WVD v2/L3からoffline license challengeを生成し、MPDで選択した映像・音声representationのsegmentを上限付きで取得して、CENC/CBCSの復号とMP4結合を行います。静的VODの単一Period、`SegmentTemplate` / `SegmentTimeline` / `SegmentList`、映像・音声それぞれ1つのKIDに対応します。ライセンスはoffline保存と再生を明示的に許可し、期限・renewal・output protectionなど、平文MP4で強制できない制約を持たない場合だけ受理します。
+
+license要求はraw binaryを標準経路とし、応答はraw SignedMessage、厳格なbase64、または既知の単一JSON fieldだけを受理します。Authorization等のheader値、独自署名、privacy mode、独自JSON/form wrapperが必要なサービスは、運営者仕様に合わせたtransport設定が別途必要です。複数Period、dynamic MPD、KID rotation、`SegmentBase`、Worker内だけで完結する通信は現在の対象外です。復号キーを渡すFFmpeg処理は全セッションを直列化し、stdoutへのログ転送を止め、終了時にFFmpegKitのsession historyを消去します。復号途中・保存途中の平文ファイルは最初のbyteを書き込む前からData Protectionを設定し、前回の強制終了で残った専用一時ファイルを次回起動時に削除します。
 
 次の形式は、壊れた出力を作らずエラーとして終了します。
 
@@ -87,7 +89,7 @@ Widevineはm3u8/MPDの直リンクだけを前提にせず、「再生ページ�
 - 公開ページからlocalhost・LANへのiframe、サムネイル、リダイレクトは自動追跡しません。
 - queryの自動引き継ぎは、通常のRFC URL解決がHTTPエラーになった場合に使う「同一origin限定」の候補です。別CDNへtokenを転送しません。
 - 個人利用でHTTPやLAN上のHLSも扱えるようATSを許可しています。HTTPSだけに限定する場合は `Info.plist` の `NSAllowsArbitraryLoads` を削除してください。
-- 自分が保存する権利を持つコンテンツ、または明示的に許可されたコンテンツだけに使用してください。DRMの回避機能はありません。
+- Widevine L3の復号・平文MP4保存機能を含みます。自分が保存する権利を持つコンテンツ、または配信運営者・権利者から明示的に許可されたコンテンツだけに使用してください。本実装はGoogle公式Widevine CDMまたは認定robustness実装の代替ではありません。
 
 ### ローカルVPN / 独自CAについて
 

@@ -7,6 +7,8 @@ final class WidevineDownloadPolicyTests: XCTestCase {
         XCTAssertTrue(isDownloadableWidevineDomain(try XCTUnwrap(URL(string: "https://WIDEVINE.SPRINK.CLOUD:443/video/manifest.mpd"))))
 
         let rejected = [
+            "http://widevine.sprink.cloud/video/manifest.mpd",
+            "https://user:password@widevine.sprink.cloud/video/manifest.mpd",
             "https://www.widevine.sprink.cloud/video/manifest.mpd",
             "https://widevine.sprink.cloud.example.com/video/manifest.mpd",
             "https://evil-widevine.sprink.cloud/video/manifest.mpd",

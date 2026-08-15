@@ -312,7 +312,7 @@ struct ContentView: View {
 
             if !viewModel.isWidevineProcessingConfigured {
                 Label(
-                    "MPD検出とWVD保存は有効ですが、Widevine再生・復号処理プロバイダはまだ組み込まれていません。",
+                    "このビルドではWidevine処理プロバイダを利用できません。",
                     systemImage: "exclamationmark.triangle"
                 )
                 .font(.footnote)

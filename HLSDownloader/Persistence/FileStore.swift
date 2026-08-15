@@ -1,7 +1,21 @@
 import Foundation
 
 struct FileStore {
-    private let fileManager = FileManager.default
+    private static let defaultStartupCleanup: Void = {
+        guard let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first else { return }
+        let root = documents.appendingPathComponent("Exports", isDirectory: true)
+        try? cleanupIncompleteExports(in: root, fileManager: .default)
+    }()
+
+    private let fileManager: FileManager
+
+    init(fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+        _ = Self.defaultStartupCleanup
+    }
 
     func makeJobDirectory() throws -> URL {
         let root = try jobsRoot()
@@ -37,6 +51,98 @@ struct FileStore {
         try? fileManager.removeItem(at: url)
     }
 
+    /// Copies a potentially large clear-media file into a placeholder that is
+    /// protected before the first byte is written. The final move preserves
+    /// the protected inode.
+    func copyProtectedFile(from sourceURL: URL, to destinationURL: URL) async throws {
+        guard sourceURL.isFileURL,
+              destinationURL.isFileURL else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let sourceValues = try sourceURL.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        let parentValues = try destinationURL.deletingLastPathComponent().resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard sourceValues.isRegularFile == true,
+              sourceValues.isSymbolicLink != true,
+              parentValues.isDirectory == true,
+              parentValues.isSymbolicLink != true else {
+            throw WidevineProcessingError.invalidOutput
+        }
+
+        try? fileManager.removeItem(at: destinationURL)
+        let created = fileManager.createFile(
+            atPath: destinationURL.path,
+            contents: Data(),
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        )
+        guard created else { throw WidevineProcessingError.invalidOutput }
+
+        do {
+            let source = try FileHandle(forReadingFrom: sourceURL)
+            let destination = try FileHandle(forWritingTo: destinationURL)
+            defer {
+                try? source.close()
+                try? destination.close()
+            }
+            while true {
+                try Task.checkCancellation()
+                guard let chunk = try source.read(upToCount: 1_024 * 1_024),
+                      !chunk.isEmpty else {
+                    break
+                }
+                try destination.write(contentsOf: chunk)
+            }
+            try destination.synchronize()
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: destinationURL.path
+            )
+        } catch {
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        }
+    }
+
+    static func cleanupIncompleteExports(
+        in root: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        let normalizedRoot = root.standardizedFileURL
+        guard fileManager.fileExists(atPath: normalizedRoot.path) else { return }
+        let rootValues = try normalizedRoot.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard rootValues.isDirectory == true,
+              rootValues.isSymbolicLink != true else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let children = try fileManager.contentsOfDirectory(
+            at: normalizedRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsSubdirectoryDescendants]
+        )
+        for child in children {
+            let normalized = child.standardizedFileURL
+            let name = normalized.lastPathComponent
+            guard normalized.deletingLastPathComponent() == normalizedRoot,
+                  name.hasPrefix("."),
+                  name.hasSuffix(".part.mp4") else {
+                continue
+            }
+            let values = try normalized.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                continue
+            }
+            try fileManager.removeItem(at: normalized)
+        }
+    }
+
     private func jobsRoot() throws -> URL {
         guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             throw HLSError.network("Cachesフォルダを開けません")
@@ -51,7 +157,22 @@ struct FileStore {
             throw HLSError.network("Documentsフォルダを開けません")
         }
         let root = documents.appendingPathComponent("Exports", isDirectory: true)
-        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        )
+        let values = try root.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard values.isDirectory == true,
+              values.isSymbolicLink != true else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        try fileManager.setAttributes(
+            [.protectionKey: FileProtectionType.completeUnlessOpen],
+            ofItemAtPath: root.path
+        )
         return root
     }
 

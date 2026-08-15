@@ -8,6 +8,7 @@ final class WVDFileValidatorTests: XCTestCase {
         let metadata = try validator.validate(makeWVD())
 
         XCTAssertEqual(metadata.version, 2)
+        XCTAssertEqual(metadata.deviceType, .chrome)
         XCTAssertEqual(metadata.securityLevel, .l3)
     }
 
@@ -18,6 +19,14 @@ final class WVDFileValidatorTests: XCTestCase {
             XCTAssertThrowsError(try validator.validate(Data(header.prefix(length)))) { error in
                 XCTAssertEqual(error as? WVDFileValidationError, .truncatedHeader)
             }
+        }
+    }
+
+    func testRejectsOversizedCredentialBeforeParsing() {
+        XCTAssertThrowsError(
+            try validator.validate(Data(repeating: 0, count: 256 * 1_024 + 1))
+        ) { error in
+            XCTAssertEqual(error as? WVDFileValidationError, .fileTooLarge)
         }
     }
 
@@ -42,6 +51,18 @@ final class WVDFileValidatorTests: XCTestCase {
         nonL3[nonL3.startIndex + 5] = 1
         XCTAssertThrowsError(try validator.validate(nonL3)) { error in
             XCTAssertEqual(error as? WVDFileValidationError, .unsupportedSecurityLevel)
+        }
+
+        var unsupportedDevice = makeWVD()
+        unsupportedDevice[unsupportedDevice.startIndex + 4] = 0xFF
+        XCTAssertThrowsError(try validator.validate(unsupportedDevice)) { error in
+            XCTAssertEqual(error as? WVDFileValidationError, .unsupportedDeviceType)
+        }
+
+        var unsupportedFlags = makeWVD()
+        unsupportedFlags[unsupportedFlags.startIndex + 6] = 0x01
+        XCTAssertThrowsError(try validator.validate(unsupportedFlags)) { error in
+            XCTAssertEqual(error as? WVDFileValidationError, .unsupportedFlags)
         }
     }
 
