@@ -4,6 +4,7 @@ import WebKit
 
 struct DynamicMediaReference: Sendable {
     let url: URL
+    let kind: MediaCandidateKind
     let pageURL: URL
     let title: String?
     let thumbnailURL: URL?
@@ -285,12 +286,10 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 iframeDepth: navigationAction.targetFrame?.isMainFrame == true ? 0 : 1
             )
             navigationContexts[canonicalKey(targetURL)] = navigationContext
-            if targetURL.path.range(
-                of: #"\.m3u8$"#,
-                options: [.regularExpression, .caseInsensitive]
-            ) != nil {
+            if let kind = manifestKind(for: targetURL) {
                 recordReference(
                     url: targetURL,
+                    kind: kind,
                     pageURL: navigationContext.pageURL,
                     title: nil,
                     thumbnailURL: nil,
@@ -328,10 +327,11 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             decisionHandler(.cancel)
             return
         }
-        if isHLSMimeType(navigationResponse.response.mimeType) {
+        if let kind = manifestKind(forMIMEType: navigationResponse.response.mimeType) {
             let context = navigationContexts[canonicalKey(targetURL)]
             recordReference(
                 url: targetURL,
+                kind: kind,
                 pageURL: context?.pageURL ?? rootURL,
                 title: nil,
                 thumbnailURL: nil,
@@ -356,6 +356,8 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         rawMessageCount += 1
         guard let body = message.body as? [String: Any],
               let rawURL = body["url"] as? String,
+              let rawManifestKind = body["manifestKind"] as? String,
+              let kind = MediaCandidateKind(rawValue: rawManifestKind),
               rawURL.utf8.count <= Self.maximumURLLength else {
             invalidMessageCount += 1
             return
@@ -384,6 +386,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
 
         recordReference(
             url: url,
+            kind: kind,
             pageURL: frameURL,
             title: title,
             thumbnailURL: thumbnailURL,
@@ -394,19 +397,21 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
 
     private func recordReference(
         url: URL,
+        kind: MediaCandidateKind,
         pageURL: URL,
         title: String?,
         thumbnailURL: URL?,
         iframeDepth: Int,
         origin: HLSCandidateOrigin
     ) {
-        let key = canonicalKey(url) + "\n" + canonicalKey(pageURL)
+        let key = kind.rawValue + "\n" + canonicalKey(url) + "\n" + canonicalKey(pageURL)
         var didChange = false
         if let existing = references[key] {
             duplicateReferenceCount += 1
             if existing.title == nil && title != nil || existing.thumbnailURL == nil && thumbnailURL != nil {
                 references[key] = DynamicMediaReference(
                     url: existing.url,
+                    kind: existing.kind,
                     pageURL: existing.pageURL,
                     title: existing.title ?? title,
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
@@ -423,6 +428,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             messageCount += 1
             references[key] = DynamicMediaReference(
                 url: url,
+                kind: kind,
                 pageURL: pageURL,
                 title: title,
                 thumbnailURL: thumbnailURL,
@@ -433,7 +439,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             if loggedReferenceCount < Self.maximumLoggedReferences {
                 loggedReferenceCount += 1
                 log(
-                    "reference added origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(url))"
+                    "reference added kind=\(kind.rawValue) origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(url))"
                 )
             } else if !referenceLogLimitReported {
                 referenceLogLimitReported = true
@@ -444,13 +450,25 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         if didChange { scheduleSettle() }
     }
 
-    private func isHLSMimeType(_ mimeType: String?) -> Bool {
-        guard let mimeType = mimeType?.lowercased() else { return false }
-        return mimeType.contains("application/vnd.apple.mpegurl")
+    private func manifestKind(forMIMEType mimeType: String?) -> MediaCandidateKind? {
+        guard let mimeType = mimeType?.lowercased() else { return nil }
+        if mimeType.contains("application/dash+xml") { return .widevineDASH }
+        if mimeType.contains("application/vnd.apple.mpegurl")
             || mimeType.contains("application/x-mpegurl")
             || mimeType.contains("application/mpegurl")
             || mimeType.contains("audio/mpegurl")
-            || mimeType.contains("audio/x-mpegurl")
+            || mimeType.contains("audio/x-mpegurl") {
+            return .hls
+        }
+        return nil
+    }
+
+    private func manifestKind(for url: URL) -> MediaCandidateKind? {
+        switch url.pathExtension.lowercased() {
+        case "m3u8": return .hls
+        case "mpd": return .widevineDASH
+        default: return nil
+        }
     }
 
     private func trustedFrameURL(from frameInfo: WKFrameInfo) -> URL? {
@@ -517,6 +535,8 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       const maximumBodyBytes = 64 * 1024;
       const maximumInspectableContentLength = 1024 * 1024;
       const hlsType = value => /(?:application|audio)\/(?:vnd\.apple\.mpegurl|x-mpegurl|mpegurl)/i.test(value || '');
+      const dashType = value => /application\/dash\+xml/i.test(value || '');
+      const typeKind = value => dashType(value) ? 'widevineDASH' : (hlsType(value) ? 'hls' : '');
       const decode = value => String(value == null ? '' : value)
         .replace(/\\\//g, '/')
         .replace(/\\u002f/gi, '/')
@@ -541,14 +561,22 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
           return element && element.getAttribute('content') || '';
         } catch (_) { return ''; }
       };
-      const post = (value, kind, poster, title, force, baseURL) => {
+      const post = (value, kind, poster, title, forcedManifestKind, baseURL) => {
         const url = absolute(value, baseURL);
         if (!url || !/^https?:/i.test(url)) return;
-        if (!force && !/\.m3u8(?:$|[?#])/i.test(url)) return;
+        const inferredManifestKind = /\.mpd(?:$|[?#])/i.test(url)
+          ? 'widevineDASH'
+          : (/\.m3u8(?:$|[?#])/i.test(url) ? 'hls' : '');
+        const hintedManifestKind = forcedManifestKind === 'widevineDASH' || forcedManifestKind === 'hls'
+          ? forcedManifestKind
+          : '';
+        const fallbackManifestKind = forcedManifestKind === 'hlsFallback' ? 'hls' : '';
+        const manifestKind = hintedManifestKind || inferredManifestKind || fallbackManifestKind;
+        if (!manifestKind) return;
         const normalizedKind = kind || 'runtime';
         const normalizedPoster = absolute(poster || pagePoster() || '') || '';
         const normalizedTitle = String(title || document.title || '').slice(0, 256);
-        const key = `${normalizedKind}\n${url}`;
+        const key = `${normalizedKind}\n${manifestKind}\n${url}`;
         const signature = `${normalizedPoster}\n${normalizedTitle}`;
         if (posted.get(key) === signature) return;
         if (!posted.has(key) && posted.size >= maximumPostedEntries) {
@@ -560,6 +588,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
           handler.postMessage({
             url,
             kind: normalizedKind,
+            manifestKind,
             poster: normalizedPoster,
             title: normalizedTitle
           });
@@ -570,16 +599,18 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         if (!sample) return;
         const normalizedSample = decode(sample);
         if (/^\s*#EXTM3U/i.test(normalizedSample)) {
-          post(responseURL, kind || 'network', '', document.title, true);
+          post(responseURL, kind || 'network', '', document.title, 'hls');
+        } else if (/<MPD(?:\s|>)/i.test(normalizedSample)) {
+          post(responseURL, kind || 'network', '', document.title, 'widevineDASH');
         }
-        const matches = normalizedSample.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.m3u8(?:\?[^\s\"'<>`]*)?/gi) || [];
+        const matches = normalizedSample.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>`]*)?/gi) || [];
         matches.slice(0, 64).forEach(value => {
           post(value, kind || 'network', '', document.title, false, responseURL);
         });
       };
       const shouldInspectResponseBody = (type, contentLength) => {
         const normalizedType = String(type || '').split(';', 1)[0].trim().toLowerCase();
-        if (!normalizedType || /^(?:video|audio)\//.test(normalizedType) || hlsType(normalizedType)) return false;
+        if (!normalizedType || /^(?:video|audio)\//.test(normalizedType) || typeKind(normalizedType)) return false;
         const parsedLength = /^\d+$/.test(String(contentLength || '').trim())
           ? Number(contentLength)
           : null;
@@ -637,29 +668,30 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             }
             const poster = video.poster || video.getAttribute('poster') || video.getAttribute('data-poster') || '';
             const title = video.getAttribute('title') || video.getAttribute('aria-label') || document.title || '';
-            ['currentSrc', 'src'].forEach(name => post(video[name], 'video', poster, title, true));
-            ['data-src', 'data-hls-src', 'data-video-src', 'data-playlist', 'data-file', 'data-url']
+            const type = video.getAttribute('type') || '';
+            ['currentSrc', 'src'].forEach(name => post(video[name], 'video', poster, title, typeKind(type) || 'hlsFallback'));
+            ['data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-video-src', 'data-playlist', 'data-file', 'data-url']
               .forEach(name => post(video.getAttribute(name), 'video', poster, title, false));
             video.querySelectorAll('source').forEach(source => {
               const type = source.type || source.getAttribute('type') || '';
-              ['src', 'data-src', 'data-hls-src', 'data-file', 'data-url']
-                .forEach(name => post(source.getAttribute(name), 'source', poster, title, hlsType(type)));
+              ['src', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-file', 'data-url']
+                .forEach(name => post(source.getAttribute(name), 'source', poster, title, typeKind(type)));
             });
           });
           document.querySelectorAll('source').forEach(source => {
             const type = source.type || source.getAttribute('type') || '';
-            ['src', 'data-src', 'data-hls-src', 'data-file', 'data-url']
-              .forEach(name => post(source.getAttribute(name), 'source', '', document.title, hlsType(type)));
+            ['src', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-file', 'data-url']
+              .forEach(name => post(source.getAttribute(name), 'source', '', document.title, typeKind(type)));
           });
-          document.querySelectorAll('[src],[href],[data-src],[data-hls-src],[data-playlist],[data-file],[data-url]')
+          document.querySelectorAll('[src],[href],[data-src],[data-hls-src],[data-dash-src],[data-mpd],[data-playlist],[data-file],[data-url]')
             .forEach(element => {
               const type = element.getAttribute('type') || '';
-              ['src', 'href', 'data-src', 'data-hls-src', 'data-playlist', 'data-file', 'data-url']
-                .forEach(name => post(element.getAttribute(name), 'runtime', '', document.title, hlsType(type)));
+              ['src', 'href', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-playlist', 'data-file', 'data-url']
+                .forEach(name => post(element.getAttribute(name), 'runtime', '', document.title, typeKind(type)));
             });
           document.querySelectorAll('script:not([src])').forEach(script => {
             const text = script.textContent || '';
-            const matches = text.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.m3u8(?:\?[^\s\"'<>`]*)?/gi) || [];
+            const matches = text.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>`]*)?/gi) || [];
             matches.slice(0, 64).forEach(value => post(value, 'script', '', document.title, false));
           });
           if (window.performance && performance.getEntriesByType) {
@@ -678,7 +710,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
               try {
                 const type = response.headers && response.headers.get('content-type');
                 const responseURL = response.url || (input && input.url ? input.url : input);
-                post(responseURL, 'network', '', document.title, hlsType(type));
+                post(responseURL, 'network', '', document.title, typeKind(type));
                 void inspectResponseBody(response, responseURL);
               } catch (_) {}
               return response;
@@ -696,14 +728,16 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
           this.addEventListener('load', () => {
             try {
               const type = this.getResponseHeader('content-type') || '';
-              let manifest = false;
+              let manifestKind = '';
               if ((this.responseType === '' || this.responseType === 'text') && typeof this.responseText === 'string') {
                 const responseURL = this.responseURL || this[requestURL];
                 const sample = this.responseText.slice(0, maximumBodyBytes);
-                manifest = /^\s*#EXTM3U/i.test(sample);
+                manifestKind = /^\s*#EXTM3U/i.test(sample)
+                  ? 'hls'
+                  : (/<MPD(?:\s|>)/i.test(sample) ? 'widevineDASH' : '');
                 inspectText(sample, responseURL, 'network');
               }
-              post(this.responseURL || this[requestURL], 'network', '', document.title, manifest || hlsType(type));
+              post(this.responseURL || this[requestURL], 'network', '', document.title, manifestKind || typeKind(type));
             } catch (_) {}
           }, { once: true });
           return Reflect.apply(originalOpen, this, [method, url, ...rest]);
@@ -1002,12 +1036,10 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             iframeDepth: navigationAction.targetFrame?.isMainFrame == true ? 0 : 1
         )
         rememberNavigationContext(context, for: targetURL)
-        if targetURL.path.range(
-            of: #"\.m3u8$"#,
-            options: [.regularExpression, .caseInsensitive]
-        ) != nil {
+        if let kind = manifestKind(for: targetURL) {
             recordReference(
                 url: targetURL,
+                kind: kind,
                 pageURL: context.pageURL,
                 title: nil,
                 thumbnailURL: nil,
@@ -1038,11 +1070,12 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             decisionHandler(.cancel)
             return
         }
-        if isHLSMimeType(navigationResponse.response.mimeType) {
+        if let kind = manifestKind(forMIMEType: navigationResponse.response.mimeType) {
             let context = navigationContexts[canonicalKey(targetURL)]
             let depth = context?.iframeDepth ?? (navigationResponse.isForMainFrame ? 0 : 1)
             recordReference(
                 url: targetURL,
+                kind: kind,
                 pageURL: context?.pageURL ?? currentURL ?? rootURL,
                 title: nil,
                 thumbnailURL: nil,
@@ -1067,6 +1100,8 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         rawMessageCount += 1
         guard let body = message.body as? [String: Any],
               let rawURL = body["url"] as? String,
+              let rawManifestKind = body["manifestKind"] as? String,
+              let kind = MediaCandidateKind(rawValue: rawManifestKind),
               rawURL.utf8.count <= Self.maximumURLLength else {
             invalidMessageCount += 1
             return
@@ -1109,6 +1144,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
 
         recordReference(
             url: url,
+            kind: kind,
             pageURL: frameURL,
             title: title,
             thumbnailURL: thumbnailURL,
@@ -1119,6 +1155,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
 
     private func recordReference(
         url: URL,
+        kind: MediaCandidateKind,
         pageURL: URL,
         title: String?,
         thumbnailURL: URL?,
@@ -1131,7 +1168,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             return
         }
 
-        let key = canonicalKey(url) + "\n" + canonicalKey(pageURL)
+        let key = kind.rawValue + "\n" + canonicalKey(url) + "\n" + canonicalKey(pageURL)
         if let index = referenceIndexByKey[key] {
             duplicateReferenceCount += 1
             let existing = references[index]
@@ -1139,6 +1176,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
                 || existing.thumbnailURL == nil && thumbnailURL != nil {
                 references[index] = DynamicMediaReference(
                     url: existing.url,
+                    kind: existing.kind,
                     pageURL: existing.pageURL,
                     title: existing.title ?? title,
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
@@ -1159,6 +1197,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
 
         let reference = DynamicMediaReference(
             url: url,
+            kind: kind,
             pageURL: pageURL,
             title: title,
             thumbnailURL: thumbnailURL,
@@ -1170,7 +1209,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         if loggedReferenceCount < Self.maximumLoggedReferences {
             loggedReferenceCount += 1
             log(
-                "capture reference added origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(url))"
+                "capture reference added kind=\(kind.rawValue) origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(url))"
             )
         } else if !referenceLogLimitReported {
             referenceLogLimitReported = true
@@ -1241,13 +1280,25 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         return AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: url)
     }
 
-    private func isHLSMimeType(_ mimeType: String?) -> Bool {
-        guard let mimeType = mimeType?.lowercased() else { return false }
-        return mimeType.contains("application/vnd.apple.mpegurl")
+    private func manifestKind(forMIMEType mimeType: String?) -> MediaCandidateKind? {
+        guard let mimeType = mimeType?.lowercased() else { return nil }
+        if mimeType.contains("application/dash+xml") { return .widevineDASH }
+        if mimeType.contains("application/vnd.apple.mpegurl")
             || mimeType.contains("application/x-mpegurl")
             || mimeType.contains("application/mpegurl")
             || mimeType.contains("audio/mpegurl")
-            || mimeType.contains("audio/x-mpegurl")
+            || mimeType.contains("audio/x-mpegurl") {
+            return .hls
+        }
+        return nil
+    }
+
+    private func manifestKind(for url: URL) -> MediaCandidateKind? {
+        switch url.pathExtension.lowercased() {
+        case "m3u8": return .hls
+        case "mpd": return .widevineDASH
+        default: return nil
+        }
     }
 
     private func trustedFrameURL(from frameInfo: WKFrameInfo) -> URL? {

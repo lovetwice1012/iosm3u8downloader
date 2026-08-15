@@ -30,6 +30,9 @@ final class DownloadViewModel: ObservableObject {
     @Published private(set) var isPlaybackCapturePresented = false
     @Published private(set) var isPreparingPlaybackCapture = false
     @Published private(set) var isFinalizingPlaybackCapture = false
+    @Published private(set) var hasWidevineCredential = false
+    @Published private(set) var isWidevineProcessingConfigured = false
+    @Published private(set) var widevineCredentialMessage: String?
     @Published var errorMessage: String?
 
     private let service: any HLSDownloadServicing
@@ -44,6 +47,8 @@ final class DownloadViewModel: ObservableObject {
 
     init(service: (any HLSDownloadServicing)? = nil) {
         self.service = service ?? HLSDownloadService()
+        hasWidevineCredential = self.service.hasWidevineCredential()
+        isWidevineProcessingConfigured = self.service.isWidevineProcessingConfigured()
     }
 
     var isRunning: Bool {
@@ -60,6 +65,22 @@ final class DownloadViewModel: ObservableObject {
 
     var canStart: Bool {
         !isBusy && !inputURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var hasWidevineCandidates: Bool {
+        candidates.contains(where: { $0.kind == .widevineDASH })
+    }
+
+    func canDownload(_ candidate: HLSCandidate) -> Bool {
+        guard !isBusy else { return false }
+        switch candidate.kind {
+        case .hls:
+            return true
+        case .widevineDASH:
+            return isDownloadableWidevineDomain(candidate.playlistURL)
+                && hasWidevineCredential
+                && isWidevineProcessingConfigured
+        }
     }
 
     func paste() {
@@ -95,7 +116,9 @@ final class DownloadViewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard isCurrentOperation(operationID, input: input) else { return }
 
-                if discovery.isDirectPlaylist, let candidate = discovery.candidates.first {
+                if discovery.isDirectPlaylist,
+                   let candidate = discovery.candidates.first,
+                   candidate.kind == .hls {
                     let result = try await service.download(candidate: candidate) { [weak self] update in
                         await self?.apply(update, operationID: operationID)
                     }
@@ -169,7 +192,8 @@ final class DownloadViewModel: ObservableObject {
     }
 
     func download(_ candidate: HLSCandidate) {
-        guard !isBusy, candidates.contains(where: { $0.id == candidate.id }) else { return }
+        guard canDownload(candidate),
+              candidates.contains(where: { $0.id == candidate.id }) else { return }
         task?.cancel()
         outputURL = nil
         downloadedSegmentCount = 0
@@ -232,6 +256,46 @@ final class DownloadViewModel: ObservableObject {
         refreshDiagnosticLog()
         guard !diagnosticLog.isEmpty else { return }
         UIPasteboard.general.string = diagnosticLog
+    }
+
+    func importWidevineCredential(from url: URL) {
+        guard !isBusy else { return }
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess { url.stopAccessingSecurityScopedResource() }
+        }
+
+        do {
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile != false,
+                  (values.fileSize ?? 0) <= 256 * 1_024 else {
+                throw WidevineCredentialImportError.fileTooLarge
+            }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            guard data.count <= 256 * 1_024 else {
+                throw WidevineCredentialImportError.fileTooLarge
+            }
+            let metadata = try service.importWidevineCredential(data)
+            hasWidevineCredential = true
+            widevineCredentialMessage = "Widevine L\(metadata.securityLevel.rawValue) WVD v\(metadata.version) をKeychainに保存しました。"
+            errorMessage = nil
+        } catch {
+            hasWidevineCredential = service.hasWidevineCredential()
+            widevineCredentialMessage = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func deleteWidevineCredential() {
+        guard !isBusy else { return }
+        do {
+            try service.deleteWidevineCredential()
+            hasWidevineCredential = false
+            widevineCredentialMessage = "WVDをKeychainから削除しました。"
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func apply(_ result: DownloadResult) {
@@ -305,6 +369,7 @@ final class DownloadViewModel: ObservableObject {
                 let existing = candidates[index]
                 candidates[index] = HLSCandidate(
                     id: existing.id,
+                    kind: existing.kind,
                     request: existing.request.sameOriginQueryFallback != nil
                         ? existing.request : candidate.request,
                     requestReferer: existing.requestReferer ?? candidate.requestReferer,
@@ -322,7 +387,9 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func candidateIdentity(_ candidate: HLSCandidate) -> String {
-        canonicalURL(candidate.playlistURL)
+        candidate.kind.rawValue
+            + "\n"
+            + canonicalURL(candidate.playlistURL)
             + "\n"
             + canonicalURL(candidate.requestReferer ?? candidate.pageURL)
     }
@@ -374,5 +441,13 @@ final class DownloadViewModel: ObservableObject {
             return nil
         }
         return UIImage(cgImage: image)
+    }
+}
+
+private enum WidevineCredentialImportError: LocalizedError {
+    case fileTooLarge
+
+    var errorDescription: String? {
+        "WVDファイルが大きすぎます。"
     }
 }

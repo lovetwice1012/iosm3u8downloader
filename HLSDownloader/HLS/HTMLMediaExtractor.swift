@@ -5,6 +5,7 @@ struct ExtractedHTMLMedia: Sendable {
     let rawPosterURL: String?
     let title: String?
     let origin: HLSCandidateOrigin
+    let kind: MediaCandidateKind
 }
 
 struct ExtractedHTMLFrame: Sendable {
@@ -198,7 +199,8 @@ enum HTMLMediaExtractor {
 
         var seenLoose = Set<String>()
         let structuredURLs = Set(media.map { normalizedReferenceKey($0.rawURL) })
-        for rawURL in extractM3U8Strings(from: looseFragments.joined(separator: "\n")) {
+        for reference in extractManifestStrings(from: looseFragments.joined(separator: "\n")) {
+            let rawURL = reference.rawURL
             let key = normalizedReferenceKey(rawURL)
             guard !structuredURLs.contains(key), seenLoose.insert(key).inserted else { continue }
             media.append(
@@ -206,7 +208,8 @@ enum HTMLMediaExtractor {
                     rawURL: rawURL,
                     rawPosterURL: nil,
                     title: nil,
-                    origin: .inlineScript
+                    origin: .inlineScript,
+                    kind: reference.kind
                 )
             )
         }
@@ -221,19 +224,35 @@ enum HTMLMediaExtractor {
     }
 
     static func extractM3U8Strings(from text: String) -> [String] {
+        extractManifestStrings(from: text)
+            .filter { $0.kind == .hls }
+            .map(\.rawURL)
+    }
+
+    static func extractMPDStrings(from text: String) -> [String] {
+        extractManifestStrings(from: text)
+            .filter { $0.kind == .widevineDASH }
+            .map(\.rawURL)
+    }
+
+    private static func extractManifestStrings(
+        from text: String
+    ) -> [(rawURL: String, kind: MediaCandidateKind)] {
         let decoded = URIResolver.decodeEscapes(decodeHTMLEntities(text))
-        let pattern = #"(?i)((?:https?:)?//[^\s\"'<>\\]+?\.m3u8(?:\?[^\s\"'<>\\]*)?|(?:\.\.?/|/)[^\s\"'<>\\]+?\.m3u8(?:\?[^\s\"'<>\\]*)?|[A-Za-z0-9_%@+.-]+(?:/[A-Za-z0-9_%@+.,~!$&()*;=:-]+)*\.m3u8(?:\?[^\s\"'<>\\]*)?)"#
+        let pattern = #"(?i)((?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?|(?:\.\.?/|/)[^\s\"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?|[A-Za-z0-9_%@+.-]+(?:/[A-Za-z0-9_%@+.,~!$&()*;=:-]+)*\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(decoded.startIndex..<decoded.endIndex, in: decoded)
         var seen = Set<String>()
-        var result: [String] = []
+        var result: [(rawURL: String, kind: MediaCandidateKind)] = []
 
         for match in regex.matches(in: decoded, range: range) {
             guard let matchRange = Range(match.range(at: 1), in: decoded) else { continue }
             let raw = String(decoded[matchRange])
                 .trimmingCharacters(in: CharacterSet(charactersIn: "()[]{};,"))
-            guard !raw.isEmpty, seen.insert(normalizedReferenceKey(raw)).inserted else { continue }
-            result.append(raw)
+            guard !raw.isEmpty,
+                  let kind = manifestKind(for: raw, mimeType: nil),
+                  seen.insert(normalizedReferenceKey(raw)).inserted else { continue }
+            result.append((rawURL: raw, kind: kind))
         }
         return result
     }
@@ -286,21 +305,22 @@ enum HTMLMediaExtractor {
         )
         let title = elementTitle(tag.attributes) ?? context?.title
         let names = [
-            "src", "data-src", "data-hls-src", "data-video-src",
-            "data-playlist", "data-file", "data-url"
+            "src", "data-src", "data-hls-src", "data-dash-src", "data-mpd",
+            "data-video-src", "data-playlist", "data-file", "data-url"
         ]
         var seen = Set<String>()
 
         for name in names {
             guard let rawURL = nonempty(tag.attributes[name]),
-                  isLikelyHLS(rawURL, mimeType: mimeType),
+                  let kind = manifestKind(for: rawURL, mimeType: mimeType),
                   seen.insert(normalizedReferenceKey(rawURL)).inserted else { continue }
             media.append(
                 ExtractedHTMLMedia(
                     rawURL: rawURL,
                     rawPosterURL: poster,
                     title: title,
-                    origin: origin
+                    origin: origin,
+                    kind: kind
                 )
             )
         }
@@ -310,9 +330,13 @@ enum HTMLMediaExtractor {
         from tag: Tag,
         into media: inout [ExtractedHTMLMedia]
     ) {
-        let interestingNames = ["data-hls", "data-hls-src", "data-playlist", "data-file", "data-url"]
+        let interestingNames = [
+            "data-hls", "data-hls-src", "data-dash-src", "data-mpd",
+            "data-playlist", "data-file", "data-url"
+        ]
         for name in interestingNames {
-            guard let rawURL = nonempty(tag.attributes[name]), isLikelyHLS(rawURL, mimeType: nil) else {
+            guard let rawURL = nonempty(tag.attributes[name]),
+                  let kind = manifestKind(for: rawURL, mimeType: nil) else {
                 continue
             }
             media.append(
@@ -320,25 +344,43 @@ enum HTMLMediaExtractor {
                     rawURL: rawURL,
                     rawPosterURL: nonempty(tag.attributes["data-poster"]),
                     title: elementTitle(tag.attributes),
-                    origin: .inlineScript
+                    origin: .inlineScript,
+                    kind: kind
                 )
             )
         }
     }
 
-    private static func isLikelyHLS(_ rawURL: String, mimeType: String?) -> Bool {
-        if let mimeType,
-           mimeType.contains("application/vnd.apple.mpegurl")
+    private static func manifestKind(
+        for rawURL: String,
+        mimeType: String?
+    ) -> MediaCandidateKind? {
+        if let mimeType = mimeType?.lowercased() {
+            if mimeType.contains("application/dash+xml") {
+                return .widevineDASH
+            }
+            if mimeType.contains("application/vnd.apple.mpegurl")
             || mimeType.contains("application/x-mpegurl")
             || mimeType.contains("application/mpegurl")
             || mimeType.contains("audio/mpegurl")
             || mimeType.contains("audio/x-mpegurl") {
-            return true
+                return .hls
+            }
         }
-        return URIResolver.decodeEscapes(rawURL).range(
+        let decodedURL = URIResolver.decodeEscapes(rawURL)
+        if decodedURL.range(
             of: #"\.m3u8(?:$|[?#])"#,
             options: [.regularExpression, .caseInsensitive]
-        ) != nil
+        ) != nil {
+            return .hls
+        }
+        if decodedURL.range(
+            of: #"\.mpd(?:$|[?#])"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil {
+            return .widevineDASH
+        }
+        return nil
     }
 
     private static func parseTag(_ body: Substring) -> Tag? {

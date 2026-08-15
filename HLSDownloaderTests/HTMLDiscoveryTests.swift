@@ -118,6 +118,35 @@ final class HTMLMediaExtractorTests: XCTestCase {
         )
 
         XCTAssertEqual(result.media.map(\.rawURL), ["/manifest?id=1", "/manifest?id=2"])
+        XCTAssertEqual(result.media.map(\.kind), [.hls, .hls])
+    }
+
+    func testExtractsDASHFromDOMMIMEDataAttributesAndScriptsWithKinds() throws {
+        let html = #"""
+        <video><source src="/api/manifest?id=1" type="application/dash+xml"></video>
+        <div data-mpd="/data/movie.mpd"></div>
+        <script>
+          const dash = "https://widevine.sprink.cloud/inline/manifest.mpd?token=abc";
+          const hls = "/inline/master.m3u8";
+        </script>
+        """#
+
+        let result = HTMLMediaExtractor.extract(from: html)
+
+        XCTAssertEqual(
+            result.media.map(\.rawURL),
+            [
+                "/api/manifest?id=1",
+                "/data/movie.mpd",
+                "https://widevine.sprink.cloud/inline/manifest.mpd?token=abc",
+                "/inline/master.m3u8"
+            ]
+        )
+        XCTAssertEqual(result.media.map(\.kind), [.widevineDASH, .widevineDASH, .widevineDASH, .hls])
+        XCTAssertEqual(
+            HTMLMediaExtractor.extractMPDStrings(from: #"a="/one.mpd";b="/two.MPD?x=1""#),
+            ["/one.mpd", "/two.MPD?x=1"]
+        )
     }
 
     func testDecodesSemicolonlessEntityAndDoubleEscapedURL() throws {
@@ -256,6 +285,114 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.candidates.count, 1)
         XCTAssertNotNil(discovery.candidates[0].document)
         XCTAssertEqual(discovery.candidates[0].origin, .direct)
+        XCTAssertEqual(discovery.candidates[0].kind, .hls)
+    }
+
+    func testAcceptsDirectWidevineMPDOnlyOnDownloadableDomain() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+
+        let discovery = try await resolver.discover(
+            input: "https://widevine.sprink.cloud/video/manifest.mpd"
+        )
+
+        XCTAssertTrue(discovery.isDirectPlaylist)
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.kind, .widevineDASH)
+        XCTAssertEqual(
+            discovery.candidates.first?.playlistURL.absoluteString,
+            "https://widevine.sprink.cloud/video/manifest.mpd"
+        )
+        XCTAssertNotNil(discovery.candidates.first?.document)
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testRejectsDirectWidevineMPDOnOtherDomainAfterContentValidation() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+
+        do {
+            _ = try await resolver.discover(input: "https://example.com/video/manifest.mpd")
+            XCTFail("許可ドメイン外のMPDを候補化してはいけません")
+        } catch let error as HLSError {
+            guard case .drmUnsupported = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testMPDExtensionContainingHLSRemainsDownloadableOnOtherDomain() async throws {
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            Self.response(
+                request,
+                body: "#EXTM3U\n#EXTINF:4,\nsegment.ts\n#EXT-X-ENDLIST\n",
+                mimeType: "application/vnd.apple.mpegurl"
+            )
+        }
+
+        let discovery = try await resolver.discover(input: "https://example.com/video/manifest.mpd")
+
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.kind, .hls)
+        XCTAssertTrue(discovery.isDirectPlaylist)
+    }
+
+    func testMPDExtensionContainingHTMLStillDiscoversHLSOnOtherDomain() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(
+                request,
+                body: #"<video src="/video/actual-master.m3u8"></video>"#,
+                mimeType: "text/html"
+            )
+        }
+
+        let discovery = try await resolver.discover(input: "https://example.com/player/page.mpd")
+
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.kind, .hls)
+        XCTAssertEqual(
+            discovery.candidates.first?.playlistURL.absoluteString,
+            "https://example.com/video/actual-master.m3u8"
+        )
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testRejectsDirectWidevineMPDRedirectedOutsideDownloadableDomain() async throws {
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            let redirectedURL = URL(string: "https://example.com/video/redirected.mpd")!
+            let response = HTTPURLResponse(
+                url: redirectedURL,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/dash+xml"]
+            )!
+            return (response, Data(Self.widevineMPD.utf8))
+        }
+
+        do {
+            _ = try await resolver.discover(
+                input: "https://widevine.sprink.cloud/video/manifest.mpd"
+            )
+            XCTFail("許可ドメイン外へ到達したMPDを候補化してはいけません")
+        } catch let error as HLSError {
+            guard case .drmUnsupported = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     func testResolvesCandidateAndPosterAgainstFirstBaseWithoutFetchingManifest() async throws {
@@ -285,6 +422,116 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(candidate.origin, .video)
         XCTAssertNil(candidate.document)
         XCTAssertEqual(recorder.snapshot().count, 1, "候補は選択前に自動GETしません")
+    }
+
+    func testValidatesStaticWidevineMPDAndKeepsHLSBehaviorLazy() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            switch request.url?.host {
+            case "site.example":
+                return Self.response(
+                    request,
+                    body: #"<video src="https://cdn.example/master.m3u8"></video><source src="https://widevine.sprink.cloud/video/manifest.mpd" type="application/dash+xml">"#,
+                    mimeType: "text/html"
+                )
+            case "widevine.sprink.cloud":
+                return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+            default:
+                throw URLError(.fileDoesNotExist)
+            }
+        }
+
+        let discovery = try await resolver.discover(input: "https://site.example/watch")
+
+        XCTAssertEqual(discovery.candidates.map(\.kind), [.hls, .widevineDASH])
+        XCTAssertNil(discovery.candidates[0].document)
+        XCTAssertNotNil(discovery.candidates[1].document)
+        XCTAssertEqual(recorder.snapshot().count, 2, "HLSは候補選択まで取得せずMPDだけを検証します")
+    }
+
+    func testRejectsStaticWidevineMPDOnOtherDomainAfterContentValidation() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let diagnostics = DiagnosticLogStore()
+        let resolver = makeResolver(diagnostics: diagnostics)
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            if request.url?.host == "site.example" {
+                return Self.response(
+                    request,
+                    body: #"<video src="https://example.com/video/manifest.mpd"></video>"#,
+                    mimeType: "text/html"
+                )
+            }
+            return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+
+        do {
+            _ = try await resolver.discover(input: "https://site.example/watch")
+            XCTFail("許可ドメイン外のMPDを候補化してはいけません")
+        } catch let error as HLSError {
+            guard case .noPlaylistFound = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(recorder.snapshot().count, 2)
+        XCTAssertTrue(diagnostics.renderedText().contains("download-domain policy"))
+    }
+
+    func testFindsWidevineMPDInsideSameOriginIframe() async throws {
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/watch":
+                return Self.response(
+                    request,
+                    body: #"<iframe src="/video/manifest.mpd"></iframe>"#,
+                    mimeType: "text/html"
+                )
+            case "/video/manifest.mpd":
+                return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+            default:
+                throw URLError(.fileDoesNotExist)
+            }
+        }
+
+        let discovery = try await resolver.discover(input: "https://widevine.sprink.cloud/watch")
+
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.kind, .widevineDASH)
+        XCTAssertEqual(discovery.candidates.first?.origin, .iframe)
+        XCTAssertNotNil(discovery.candidates.first?.document)
+    }
+
+    func testRejectsWidevineMPDInsideOtherDomainIframe() async throws {
+        let diagnostics = DiagnosticLogStore()
+        let resolver = makeResolver(diagnostics: diagnostics)
+        DiscoveryURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/watch":
+                return Self.response(
+                    request,
+                    body: #"<iframe src="/video/manifest.mpd"></iframe>"#,
+                    mimeType: "text/html"
+                )
+            case "/video/manifest.mpd":
+                return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+            default:
+                throw URLError(.fileDoesNotExist)
+            }
+        }
+
+        do {
+            _ = try await resolver.discover(input: "https://example.com/watch")
+            XCTFail("許可ドメイン外iframeのWidevine MPDを候補化してはいけません")
+        } catch let error as HLSError {
+            guard case .noPlaylistFound = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+        XCTAssertTrue(diagnostics.renderedText().contains("download-domain policy"))
     }
 
     func testTraversesNestedIframeKeepsFrameRefererAndStopsCycle() async throws {
@@ -372,6 +619,7 @@ final class SourceDiscoveryTests: XCTestCase {
                 media: [
                     DynamicMediaReference(
                         url: dynamicURL,
+                        kind: .hls,
                         pageURL: pageURL,
                         title: "Runtime player",
                         thumbnailURL: URL(string: "https://player.example/poster.jpg"),
@@ -396,6 +644,54 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(candidate.origin, .runtime)
     }
 
+    func testInteractiveInspectionValidatesAllowedWidevineAndRejectsOtherDomains() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let diagnostics = DiagnosticLogStore()
+        let resolver = SourceResolver(client: client, diagnosticSink: diagnostics.sink)
+        let rootURL = URL(string: "https://site.example/watch")!
+        let allowedURL = URL(string: "https://widevine.sprink.cloud/video/manifest.mpd")!
+        let deniedURL = URL(string: "https://example.com/video/manifest.mpd")!
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(request, body: Self.widevineMPD, mimeType: "application/dash+xml")
+        }
+        let inspection = DynamicPageInspection(
+            media: [
+                DynamicMediaReference(
+                    url: deniedURL,
+                    kind: .widevineDASH,
+                    pageURL: rootURL,
+                    title: nil,
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime
+                ),
+                DynamicMediaReference(
+                    url: allowedURL,
+                    kind: .widevineDASH,
+                    pageURL: rootURL,
+                    title: "Widevine player",
+                    thumbnailURL: nil,
+                    iframeDepth: 1,
+                    origin: .runtime
+                )
+            ],
+            cookies: []
+        )
+
+        let candidates = await resolver.importDynamicInspection(inspection, rootURL: rootURL)
+
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.kind, .widevineDASH)
+        XCTAssertEqual(candidates.first?.playlistURL, allowedURL)
+        XCTAssertNotNil(candidates.first?.document)
+        XCTAssertEqual(recorder.snapshot().compactMap(\.url), [deniedURL, allowedURL])
+        XCTAssertTrue(diagnostics.renderedText().contains("download-domain policy"))
+    }
+
     @MainActor
     func testUsesDynamicInspectionWhenInitialNativeRequestIsRejected() async throws {
         let dynamicURL = URL(string: "https://cdn.example/runtime/master.m3u8")!
@@ -405,6 +701,7 @@ final class SourceDiscoveryTests: XCTestCase {
                 media: [
                     DynamicMediaReference(
                         url: dynamicURL,
+                        kind: .hls,
                         pageURL: pageURL,
                         title: nil,
                         thumbnailURL: nil,
@@ -432,7 +729,7 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.candidates.first?.requestReferer, pageURL)
     }
 
-    func testInteractiveInspectionImportsCookiesAndBlocksPrivateTargetsFromPublicPage() throws {
+    func testInteractiveInspectionImportsCookiesAndBlocksPrivateTargetsFromPublicPage() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
         let client = HTTPClient(configuration: configuration)
@@ -456,6 +753,7 @@ final class SourceDiscoveryTests: XCTestCase {
             media: [
                 DynamicMediaReference(
                     url: privateManifest,
+                    kind: .hls,
                     pageURL: rootURL,
                     title: nil,
                     thumbnailURL: nil,
@@ -464,6 +762,7 @@ final class SourceDiscoveryTests: XCTestCase {
                 ),
                 DynamicMediaReference(
                     url: publicManifest,
+                    kind: .hls,
                     pageURL: rootURL,
                     title: "Playback candidate",
                     thumbnailURL: nil,
@@ -474,7 +773,7 @@ final class SourceDiscoveryTests: XCTestCase {
             cookies: [cookie]
         )
 
-        let candidates = resolver.importDynamicInspection(inspection, rootURL: rootURL)
+        let candidates = await resolver.importDynamicInspection(inspection, rootURL: rootURL)
 
         XCTAssertEqual(candidates.count, 1)
         XCTAssertEqual(candidates.first?.playlistURL, publicManifest)
@@ -624,6 +923,18 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertTrue(receivedDecision)
         XCTAssertNil(redirectedRequest)
     }
+
+    private static let widevineMPD = #"""
+    <?xml version="1.0" encoding="UTF-8"?>
+    <MPD xmlns="urn:mpeg:dash:schema:mpd:2011">
+      <Period>
+        <AdaptationSet contentType="video">
+          <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/>
+          <Representation id="v1"/>
+        </AdaptationSet>
+      </Period>
+    </MPD>
+    """#
 
     private func makeResolver(
         dynamicInspector: (any DynamicPageInspecting)? = nil,

@@ -41,6 +41,11 @@ struct PlaylistDocument: Sendable {
     let referer: URL?
 }
 
+enum MediaCandidateKind: String, Hashable, Sendable {
+    case hls
+    case widevineDASH
+}
+
 enum HLSCandidateOrigin: String, Hashable, Sendable {
     case direct
     case video
@@ -63,6 +68,7 @@ enum HLSCandidateOrigin: String, Hashable, Sendable {
 
 struct HLSCandidate: Identifiable, Sendable {
     let id: UUID
+    let kind: MediaCandidateKind
     let request: URLCandidates
     let requestReferer: URL?
     let document: PlaylistDocument?
@@ -188,7 +194,13 @@ enum DiagnosticPrivacy {
         let pathDepth = url.path.split(separator: "/").count
         let queryItems = components?.queryItems?.count ?? (components?.percentEncodedQuery == nil ? 0 : 1)
         let pathExtension = url.pathExtension.lowercased()
-        let extensionClass = pathExtension == "m3u8" ? "m3u8" : (pathExtension.isEmpty ? "none" : "other")
+        let extensionClass: String
+        switch pathExtension {
+        case "m3u8": extensionClass = "m3u8"
+        case "mpd": extensionClass = "mpd"
+        case "": extensionClass = "none"
+        default: extensionClass = "other"
+        }
         let scope = AutomaticNavigationPolicy.isPrivateOrLocal(url) ? "local" : "public"
 
         var fingerprintComponents = components
@@ -209,6 +221,7 @@ enum DiagnosticPrivacy {
     static func mimeClass(_ mimeType: String?) -> String {
         guard let mimeType = mimeType?.lowercased() else { return "unknown" }
         if mimeType.contains("mpegurl") { return "hls" }
+        if mimeType.contains("dash+xml") { return "dash" }
         if mimeType.contains("html") { return "html" }
         if mimeType.hasPrefix("image/") { return "image" }
         if mimeType.contains("json") { return "json" }

@@ -1,11 +1,13 @@
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = DownloadViewModel()
     @State private var diagnosticLogExpanded = false
+    @State private var isWVDImporterPresented = false
     @FocusState private var urlFieldFocused: Bool
 
     var body: some View {
@@ -17,6 +19,9 @@ struct ContentView: View {
 
                     if !viewModel.candidates.isEmpty {
                         candidateListCard
+                    }
+                    if viewModel.hasWidevineCandidates {
+                        widevineCredentialCard
                     }
 
                     if viewModel.isBusy {
@@ -51,6 +56,14 @@ struct ContentView: View {
                 ProgressView("再生解析を準備中…")
             }
         }
+        .fileImporter(
+            isPresented: $isWVDImporterPresented,
+            allowedContentTypes: [UTType(filenameExtension: "wvd") ?? .data],
+            allowsMultipleSelection: false
+        ) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            viewModel.importWidevineCredential(from: url)
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
                 viewModel.playbackCaptureDidEnterBackground()
@@ -71,7 +84,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("リンクを貼るだけ")
                 .font(.title2.bold())
-            Text("m3u8の直接URLまたは動画ページを解析します。ページ内に複数のHLSがあれば、URLとサムネイルの一覧から選んでMP4にできます。")
+            Text("m3u8/MPDの直接URLまたは動画ページを解析します。ページ内に複数の動画があれば、URLとサムネイルの一覧から選べます。")
                 .foregroundStyle(.secondary)
         }
     }
@@ -136,7 +149,7 @@ struct ContentView: View {
     private var candidateListCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("検出されたHLS", systemImage: "play.rectangle.on.rectangle")
+                Label("検出された動画", systemImage: "play.rectangle.on.rectangle")
                     .font(.headline)
                 Spacer()
                 Text("\(viewModel.candidates.count)件")
@@ -166,11 +179,13 @@ struct ContentView: View {
                 candidateThumbnail(candidate)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(candidate.title ?? candidate.playlistURL.host ?? "HLS動画")
+                    Text(candidate.title ?? candidate.playlistURL.host ?? candidate.kind.fallbackTitle)
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(2)
 
                     HStack(spacing: 6) {
+                        Text(candidate.kind.badgeTitle)
+                            .candidateBadgeStyle()
                         Text(candidate.origin.title)
                             .candidateBadgeStyle()
                         if candidate.iframeDepth > 0 {
@@ -195,14 +210,29 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Button {
-                viewModel.download(candidate)
-            } label: {
-                Label("この動画をダウンロード", systemImage: "arrow.down.circle.fill")
-                    .frame(maxWidth: .infinity)
+            if candidate.kind == .widevineDASH {
+                Button {
+                    viewModel.download(candidate)
+                } label: {
+                    Label("ダウンロード・保存", systemImage: "arrow.down.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canDownload(candidate))
+
+                Text(widevineCandidateStatus(candidate))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                Button {
+                    viewModel.download(candidate)
+                } label: {
+                    Label("この動画をダウンロード", systemImage: "arrow.down.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canDownload(candidate))
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(viewModel.isBusy)
         }
         .accessibilityElement(children: .contain)
     }
@@ -217,7 +247,11 @@ struct ContentView: View {
             } else {
                 ZStack {
                     Color(.secondarySystemGroupedBackground)
-                    Image(systemName: candidate.thumbnailURL == nil ? "play.rectangle" : "photo")
+                    Image(
+                        systemName: candidate.kind == .widevineDASH
+                            ? "lock.shield"
+                            : (candidate.thumbnailURL == nil ? "play.rectangle" : "photo")
+                    )
                         .font(.title2)
                         .foregroundStyle(.secondary)
                 }
@@ -230,6 +264,75 @@ struct ContentView: View {
             await viewModel.loadThumbnail(for: candidate)
         }
         .accessibilityHidden(true)
+    }
+
+    private var widevineCredentialCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Widevine L3（アルファ）", systemImage: "lock.shield")
+                .font(.headline)
+
+            if viewModel.hasWidevineCredential {
+                Label("WVDはKeychainに保存済みです", systemImage: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+            } else {
+                Text("使用を許可されたWidevine L3のWVDファイルを読み込んでください。WVDの内容は診断ログへ出力しません。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    isWVDImporterPresented = true
+                } label: {
+                    Label(
+                        viewModel.hasWidevineCredential ? "WVDを入れ替え" : "WVDを読み込む",
+                        systemImage: "key.fill"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isBusy)
+
+                if viewModel.hasWidevineCredential {
+                    Button(role: .destructive) {
+                        viewModel.deleteWidevineCredential()
+                    } label: {
+                        Label("削除", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isBusy)
+                }
+            }
+
+            if let message = viewModel.widevineCredentialMessage {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !viewModel.isWidevineProcessingConfigured {
+                Label(
+                    "MPD検出とWVD保存は有効ですが、Widevine再生・復号処理プロバイダはまだ組み込まれていません。",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.footnote)
+                .foregroundStyle(.orange)
+            }
+        }
+        .cardStyle()
+    }
+
+    private func widevineCandidateStatus(_ candidate: HLSCandidate) -> String {
+        guard isDownloadableWidevineDomain(candidate.playlistURL) else {
+            return "許可ドメイン外のWidevineは再生・保存できません。"
+        }
+        guard viewModel.hasWidevineCredential else {
+            return "保存にはWidevine L3のWVD読み込みが必要です。"
+        }
+        guard viewModel.isWidevineProcessingConfigured else {
+            return "Widevine処理プロバイダの組み込みが必要です。"
+        }
+        return "許可ドメインのWidevine候補です。"
     }
 
     private var progressCard: some View {
@@ -357,6 +460,9 @@ struct ContentView: View {
             Label("対応範囲", systemImage: "info.circle")
                 .font(.headline)
             Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128に対応します。")
+            Text("Widevine DASH/MPDは `isDownloadableWidevineDomain` の許可hostだけを候補化します。その他のWidevineは再生・保存とも拒否し、DRMなしHLSは従来どおり全ドメインで処理します。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             Text("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。Safariのログイン状態、Worker内だけの通信、ライブ配信、FairPlay/SAMPLE-AESには対応できない場合があります。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -385,6 +491,7 @@ struct ContentView: View {
         let extensionClass: String
         switch url.pathExtension.lowercased() {
         case "m3u8": extensionClass = "m3u8"
+        case "mpd": extensionClass = "mpd"
         case "": extensionClass = "なし"
         default: extensionClass = "その他"
         }
@@ -528,6 +635,22 @@ private extension View {
             .padding(.vertical, 3)
             .background(Color.accentColor.opacity(0.12), in: Capsule())
             .foregroundStyle(Color.accentColor)
+    }
+}
+
+private extension MediaCandidateKind {
+    var badgeTitle: String {
+        switch self {
+        case .hls: return "HLS"
+        case .widevineDASH: return "Widevine DASH"
+        }
+    }
+
+    var fallbackTitle: String {
+        switch self {
+        case .hls: return "HLS動画"
+        case .widevineDASH: return "Widevine動画"
+        }
     }
 }
 

@@ -11,6 +11,10 @@ protocol HLSDownloadServicing: Sendable {
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult
     func thumbnailData(for candidate: HLSCandidate) async -> Data?
+    func hasWidevineCredential() -> Bool
+    func importWidevineCredential(_ data: Data) throws -> WVDFileMetadata
+    func deleteWidevineCredential() throws
+    func isWidevineProcessingConfigured() -> Bool
     func resetDiagnosticLog()
     func diagnosticLogText() -> String
 }
@@ -45,6 +49,8 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private let composer = MP4Composer()
     private let fileStore = FileStore()
     private let diagnostics: DiagnosticLogStore
+    private let widevineCredentialStore: any WidevineCredentialStoring
+    private let widevineProcessor: any WidevineProcessingProviding
 
     @MainActor
     convenience init() {
@@ -54,17 +60,23 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         self.init(
             client: client,
             dynamicInspector: WebPageInspector(diagnosticSink: diagnostics.sink),
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            widevineCredentialStore: KeychainWidevineCredentialStore(),
+            widevineProcessor: UnconfiguredWidevineProcessingProvider()
         )
     }
 
     init(
         client: HTTPClient,
         dynamicInspector: (any DynamicPageInspecting)? = nil,
-        diagnostics: DiagnosticLogStore = DiagnosticLogStore()
+        diagnostics: DiagnosticLogStore = DiagnosticLogStore(),
+        widevineCredentialStore: any WidevineCredentialStoring = KeychainWidevineCredentialStore(),
+        widevineProcessor: any WidevineProcessingProviding = UnconfiguredWidevineProcessingProvider()
     ) {
         self.client = client
         self.diagnostics = diagnostics
+        self.widevineCredentialStore = widevineCredentialStore
+        self.widevineProcessor = DomainRestrictedWidevineProcessingProvider(base: widevineProcessor)
         let resolver = SourceResolver(
             client: client,
             dynamicInspector: dynamicInspector,
@@ -108,6 +120,26 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         diagnostics.renderedText()
     }
 
+    func hasWidevineCredential() -> Bool {
+        (try? widevineCredentialStore.load()) != nil
+    }
+
+    func importWidevineCredential(_ data: Data) throws -> WVDFileMetadata {
+        let metadata = try WVDFileValidator().validate(data)
+        try widevineCredentialStore.save(data)
+        diagnostics.record("widevine", "L3 credential imported version=\(metadata.version)")
+        return metadata
+    }
+
+    func deleteWidevineCredential() throws {
+        try widevineCredentialStore.delete()
+        diagnostics.record("widevine", "L3 credential removed")
+    }
+
+    func isWidevineProcessingConfigured() -> Bool {
+        widevineProcessor.isConfigured
+    }
+
     @MainActor
     func preparePlaybackCapture(input: String) async throws -> PlaybackCaptureSession {
         let url = try URIResolver.normalizeInput(input)
@@ -130,7 +162,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     @MainActor
     func finishPlaybackCapture(_ session: PlaybackCaptureSession) async -> [HLSCandidate] {
         let inspection = await session.snapshotAndStop()
-        let candidates = sourceResolver.importDynamicInspection(
+        let candidates = await sourceResolver.importDynamicInspection(
             inspection,
             rootURL: session.rootURL
         )
@@ -143,11 +175,11 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
     func download(input: String, progress: @escaping ProgressHandler) async throws -> DownloadResult {
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
-        let document = try await sourceResolver.resolve(input: input)
-        return try await downloadWithBackgroundExecution(
-            document: document,
-            progress: progress
-        )
+        let discovery = try await sourceResolver.discover(input: input)
+        guard let candidate = discovery.candidates.first else {
+            throw HLSError.noPlaylistFound
+        }
+        return try await download(candidate: candidate, progress: progress)
     }
 
     func download(
@@ -159,6 +191,25 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             "candidate selected origin=\(candidate.origin.rawValue) depth=\(candidate.iframeDepth) \(DiagnosticPrivacy.urlSummary(candidate.playlistURL))"
         )
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
+        if candidate.kind == .widevineDASH {
+            guard isDownloadableWidevineDomain(candidate.playlistURL) else {
+                diagnostics.record("widevine", "download start rejected by domain policy")
+                throw WidevineProcessingError.domainNotAllowed
+            }
+            guard widevineProcessor.isConfigured else {
+                diagnostics.record("widevine", "download start rejected because processor is unconfigured")
+                throw WidevineProcessingError.unconfigured
+            }
+            guard let document = candidate.document else {
+                diagnostics.record("widevine", "download start rejected because validated MPD is missing")
+                throw HLSError.invalidPlaylist("Widevine MPDを再検証できません")
+            }
+            return try await downloadWidevineWithBackgroundExecution(
+                document: document,
+                progress: progress
+            )
+        }
+
         let document: PlaylistDocument
         do {
             if let discoveredDocument = candidate.document {
@@ -205,6 +256,126 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         } catch {
             return nil
         }
+    }
+
+    private func downloadWidevineWithBackgroundExecution(
+        document: PlaylistDocument,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        try await BackgroundExecutionCoordinator.shared.run(
+            title: "Widevine動画を保存",
+            subtitle: "ダウンロードを準備中",
+            diagnosticSink: diagnostics.sink
+        ) { [self] backgroundProgress in
+            await backgroundProgress.report(
+                DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
+            )
+            return try await downloadWidevine(document: document) { update in
+                await backgroundProgress.report(update)
+                await progress(update)
+            }
+        }
+    }
+
+    private func downloadWidevine(
+        document: PlaylistDocument,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        guard isDownloadableWidevineDomain(document.effectiveURL) else {
+            throw WidevineProcessingError.domainNotAllowed
+        }
+        guard let wvdData = try widevineCredentialStore.load() else {
+            throw WidevineProcessingError.credentialMissing
+        }
+
+        let manifestData = Data(document.text.utf8)
+        let manifest = try DASHManifestParser.parse(
+            data: manifestData,
+            effectiveURL: document.effectiveURL
+        )
+        guard manifest.isWidevine else {
+            throw HLSError.invalidPlaylist("Widevine ContentProtectionを確認できません")
+        }
+        guard let licenseURL = manifest.widevineLicenseURLs.first,
+              let scheme = licenseURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              licenseURL.host != nil,
+              licenseURL.user == nil,
+              licenseURL.password == nil else {
+            throw WidevineProcessingError.licenseServerMissing
+        }
+
+        try Task.checkCancellation()
+        await progress(DownloadProgress(phase: .downloading, completedItems: 0, totalItems: 0))
+        diagnostics.record(
+            "widevine",
+            "processing started schemes=\(manifest.encryptionSchemes.count) tracks=\(manifest.adaptationSets.count)"
+        )
+
+        // 復号済みファイル生成の直前にも、共通ポリシーを必ず再確認する。
+        guard isDownloadableWidevineDomain(document.effectiveURL) else {
+            throw WidevineProcessingError.domainNotAllowed
+        }
+        let processed = try await widevineProcessor.process(
+            manifest: WidevineManifestDocument(
+                sourceURL: document.effectiveURL,
+                data: manifestData
+            ),
+            licenseConfiguration: WidevineLicenseConfiguration(serverURL: licenseURL),
+            wvdData: wvdData
+        )
+
+        try Task.checkCancellation()
+        await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
+        let sourceURL = processed.mediaFileURL
+        guard sourceURL.isFileURL else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let values = try sourceURL.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              (values.fileSize ?? 0) > 0,
+              Self.isMP4File(sourceURL) else {
+            throw WidevineProcessingError.invalidOutput
+        }
+
+        let locations = try fileStore.outputLocations(for: document.effectiveURL)
+        try? FileManager.default.removeItem(at: locations.temporary)
+        do {
+            try FileManager.default.copyItem(at: sourceURL, to: locations.temporary)
+            try Task.checkCancellation()
+            // 保存へ進む直前の最終チェック。許可host比較はこの共通関数だけが行う。
+            guard isDownloadableWidevineDomain(document.effectiveURL) else {
+                throw WidevineProcessingError.domainNotAllowed
+            }
+            try FileManager.default.moveItem(at: locations.temporary, to: locations.final)
+        } catch {
+            try? FileManager.default.removeItem(at: locations.temporary)
+            throw error
+        }
+
+        await progress(DownloadProgress(phase: .completed, completedItems: 1, totalItems: 1))
+        diagnostics.record("widevine", "processing completed")
+        return DownloadResult(
+            outputURL: locations.final,
+            sourceURL: document.effectiveURL,
+            segmentCount: 0
+        )
+    }
+
+    private static func isMP4File(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 12),
+              header.count == 12 else { return false }
+
+        let declaredSize = header.prefix(4).reduce(UInt32.zero) {
+            ($0 << 8) | UInt32($1)
+        }
+        guard declaredSize == 0 || declaredSize >= 8 else { return false }
+        return header[4..<8].elementsEqual(Data("ftyp".utf8))
     }
 
     private func downloadWithBackgroundExecution(

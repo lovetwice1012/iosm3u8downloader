@@ -85,6 +85,56 @@ final class SourceResolver: Sendable {
                 candidates: [
                     HLSCandidate(
                         id: UUID(),
+                        kind: .hls,
+                        request: URLCandidates(
+                            primary: payload.effectiveURL,
+                            sameOriginQueryFallback: nil
+                        ),
+                        requestReferer: inputURL,
+                        document: document,
+                        pageURL: payload.effectiveURL,
+                        title: nil,
+                        thumbnailURL: nil,
+                        iframeDepth: 0,
+                        origin: .direct
+                    )
+                ],
+                isDirectPlaylist: true
+            )
+        }
+
+        if isDASHPayload(payload) {
+            guard DASHManifestParser.isMPD(payload.data) else {
+                log("widevine", "direct MPD rejected because the manifest is invalid")
+                throw HLSError.invalidPlaylist("MPEG-DASH MPDが不正です")
+            }
+            let manifest = try DASHManifestParser.parse(
+                data: payload.data,
+                effectiveURL: payload.effectiveURL
+            )
+            guard manifest.isWidevine else {
+                log("widevine", "direct MPD rejected because Widevine ContentProtection was not found")
+                throw HLSError.invalidPlaylist("Widevine ContentProtectionのないMPDには対応していません")
+            }
+            guard isDownloadableWidevineDomain(inputURL),
+                  isDownloadableWidevineDomain(payload.effectiveURL) else {
+                log(
+                    "widevine",
+                    "direct Widevine MPD rejected by download-domain policy redirected=\(payload.effectiveURL != inputURL) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+                )
+                throw HLSError.drmUnsupported("Widevine DASH (許可ドメイン外)")
+            }
+            let document = PlaylistDocument(
+                text: text,
+                effectiveURL: payload.effectiveURL,
+                referer: inputURL
+            )
+            log("widevine", "direct Widevine MPD accepted \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))")
+            return HLSDiscoveryResult(
+                candidates: [
+                    HLSCandidate(
+                        id: UUID(),
+                        kind: .widevineDASH,
                         request: URLCandidates(
                             primary: payload.effectiveURL,
                             sameOriginQueryFallback: nil
@@ -129,12 +179,12 @@ final class SourceResolver: Sendable {
     func importDynamicInspection(
         _ inspection: DynamicPageInspection,
         rootURL: URL
-    ) -> [HLSCandidate] {
+    ) async -> [HLSCandidate] {
         client.storeCookies(inspection.cookies)
         var discovered = Set<String>()
         var accepted = Set<String>()
         var results: [HLSCandidate] = []
-        appendDynamicCandidates(
+        await appendDynamicCandidates(
             inspection,
             rootURL: rootURL,
             discovered: &discovered,
@@ -252,6 +302,7 @@ final class SourceResolver: Sendable {
                             referer: work.referer
                         )
                         appendCandidate(
+                            kind: .hls,
                             request: URLCandidates(
                                 primary: payload.effectiveURL,
                                 sameOriginQueryFallback: nil
@@ -266,6 +317,37 @@ final class SourceResolver: Sendable {
                             accepted: &acceptedCandidates,
                             results: &results
                         )
+                        continue
+                    }
+                    if isDASHPayload(payload) {
+                        do {
+                            let document = try validateWidevineDASHPayload(
+                                payload,
+                                requestedURL: requestedURL,
+                                referer: work.referer
+                            )
+                            appendCandidate(
+                                kind: .widevineDASH,
+                                request: URLCandidates(
+                                    primary: payload.effectiveURL,
+                                    sameOriginQueryFallback: nil
+                                ),
+                                requestReferer: work.referer,
+                                document: document,
+                                pageURL: work.referer ?? payload.effectiveURL,
+                                title: work.inheritedTitle,
+                                thumbnailURL: work.inheritedThumbnailURL,
+                                iframeDepth: work.iframeDepth,
+                                origin: .iframe,
+                                accepted: &acceptedCandidates,
+                                results: &results
+                            )
+                        } catch {
+                            log(
+                                "widevine",
+                                "iframe MPD rejected depth=\(work.iframeDepth) error=\(DiagnosticPrivacy.errorCode(error))"
+                            )
+                        }
                         continue
                     }
                     guard payload.data.count <= maximumHTMLBytes else {
@@ -317,7 +399,11 @@ final class SourceResolver: Sendable {
                     continue
                 }
                 guard isSafeAutomaticURL(request.primary) else { continue }
-                let attemptKey = candidateKey(url: request.primary, referer: documentURL)
+                let attemptKey = candidateKey(
+                    kind: reference.kind,
+                    url: request.primary,
+                    referer: documentURL
+                )
                 _ = discoveredCandidates.insert(attemptKey)
 
                 let resolvedThumbnailURL = resolvedAutomaticURL(
@@ -327,18 +413,50 @@ final class SourceResolver: Sendable {
                 let thumbnailURL = resolvedThumbnailURL.flatMap {
                     AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: $0) ? $0 : nil
                 }
-                appendCandidate(
-                    request: request,
-                    requestReferer: documentURL,
-                    document: nil,
-                    pageURL: documentURL,
-                    title: limitedTitle(reference.title ?? pageTitle),
-                    thumbnailURL: thumbnailURL,
-                    iframeDepth: work.iframeDepth,
-                    origin: reference.origin,
-                    accepted: &acceptedCandidates,
-                    results: &results
-                )
+                switch reference.kind {
+                case .hls:
+                    appendCandidate(
+                        kind: .hls,
+                        request: request,
+                        requestReferer: documentURL,
+                        document: nil,
+                        pageURL: documentURL,
+                        title: limitedTitle(reference.title ?? pageTitle),
+                        thumbnailURL: thumbnailURL,
+                        iframeDepth: work.iframeDepth,
+                        origin: reference.origin,
+                        accepted: &acceptedCandidates,
+                        results: &results
+                    )
+                case .widevineDASH:
+                    do {
+                        let validated = try await loadWidevineDASH(
+                            request,
+                            referer: documentURL,
+                            rootURL: rootURL
+                        )
+                        appendCandidate(
+                            kind: validated.kind,
+                            request: validated.request,
+                            requestReferer: documentURL,
+                            document: validated.document,
+                            pageURL: documentURL,
+                            title: limitedTitle(reference.title ?? pageTitle),
+                            thumbnailURL: thumbnailURL,
+                            iframeDepth: work.iframeDepth,
+                            origin: reference.origin,
+                            accepted: &acceptedCandidates,
+                            results: &results
+                        )
+                    } catch is CancellationError {
+                        throw HLSError.cancelled
+                    } catch let error as HLSError {
+                        if case .cancelled = error { throw error }
+                        log("widevine", "HTML MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                    } catch {
+                        log("widevine", "HTML MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                    }
+                }
             }
 
             guard work.iframeDepth < maximumIframeDepth else {
@@ -396,7 +514,7 @@ final class SourceResolver: Sendable {
         log("webkit", "inspection returned references=\(dynamic.media.count) cookies=\(dynamic.cookies.count)")
         client.storeCookies(dynamic.cookies)
 
-        appendDynamicCandidates(
+        await appendDynamicCandidates(
             dynamic,
             rootURL: rootURL,
             discovered: &discoveredCandidates,
@@ -430,7 +548,7 @@ final class SourceResolver: Sendable {
         var discovered = Set<String>()
         var accepted = Set<String>()
         var results: [HLSCandidate] = []
-        appendDynamicCandidates(
+        await appendDynamicCandidates(
             dynamic,
             rootURL: rootURL,
             discovered: &discovered,
@@ -446,7 +564,7 @@ final class SourceResolver: Sendable {
         discovered: inout Set<String>,
         accepted: inout Set<String>,
         results: inout [HLSCandidate]
-    ) {
+    ) async {
         for reference in inspection.media where results.count < maximumResults {
             guard discovered.count < maximumCandidateReferences else { break }
             guard isSafeAutomaticURL(reference.url),
@@ -458,29 +576,162 @@ final class SourceResolver: Sendable {
                 continue
             }
             let pageURL = isSafeAutomaticURL(reference.pageURL) ? reference.pageURL : rootURL
-            let attemptKey = candidateKey(url: reference.url, referer: pageURL)
+            let attemptKey = candidateKey(
+                kind: reference.kind,
+                url: reference.url,
+                referer: pageURL
+            )
             _ = discovered.insert(attemptKey)
 
-            appendCandidate(
-                request: URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
-                requestReferer: pageURL,
-                document: nil,
-                pageURL: pageURL,
-                title: limitedTitle(reference.title),
-                thumbnailURL: reference.thumbnailURL.flatMap {
-                    isSafeAutomaticURL($0)
-                        && AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: $0)
-                        ? $0 : nil
-                },
-                iframeDepth: reference.iframeDepth,
-                origin: reference.origin,
-                accepted: &accepted,
-                results: &results
-            )
+            let thumbnailURL = reference.thumbnailURL.flatMap {
+                isSafeAutomaticURL($0)
+                    && AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: $0)
+                    ? $0 : nil
+            }
+            switch reference.kind {
+            case .hls:
+                appendCandidate(
+                    kind: .hls,
+                    request: URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                    requestReferer: pageURL,
+                    document: nil,
+                    pageURL: pageURL,
+                    title: limitedTitle(reference.title),
+                    thumbnailURL: thumbnailURL,
+                    iframeDepth: reference.iframeDepth,
+                    origin: reference.origin,
+                    accepted: &accepted,
+                    results: &results
+                )
+            case .widevineDASH:
+                do {
+                    let validated = try await loadWidevineDASH(
+                        URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                        referer: pageURL,
+                        rootURL: rootURL
+                    )
+                    appendCandidate(
+                        kind: validated.kind,
+                        request: validated.request,
+                        requestReferer: pageURL,
+                        document: validated.document,
+                        pageURL: pageURL,
+                        title: limitedTitle(reference.title),
+                        thumbnailURL: thumbnailURL,
+                        iframeDepth: reference.iframeDepth,
+                        origin: reference.origin,
+                        accepted: &accepted,
+                        results: &results
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    log("widevine", "dynamic MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                }
+            }
         }
     }
 
+    private func loadWidevineDASH(
+        _ candidates: URLCandidates,
+        referer: URL?,
+        rootURL: URL
+    ) async throws -> (
+        kind: MediaCandidateKind,
+        request: URLCandidates,
+        document: PlaylistDocument
+    ) {
+        var lastError: Error = HLSError.invalidPlaylist("Widevine MPEG-DASH MPDを確認できませんでした")
+        for candidate in candidates.all {
+            do {
+                log("widevine", "validate MPD \(DiagnosticPrivacy.urlSummary(candidate))")
+                let payload = try await client.fetch(candidate, referer: referer)
+                guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: payload.effectiveURL
+                ) else {
+                    throw HLSError.network("MPDのリダイレクト先が安全ポリシーにより拒否されました")
+                }
+                if let text = decodeText(payload.data), PlaylistParser.isPlaylist(text) {
+                    log(
+                        "playlist",
+                        "MPD-shaped URL contained HLS; reclassified status=\(payload.statusCode) bytes=\(payload.data.count) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+                    )
+                    return (
+                        .hls,
+                        URLCandidates(primary: payload.effectiveURL, sameOriginQueryFallback: nil),
+                        PlaylistDocument(
+                            text: text,
+                            effectiveURL: payload.effectiveURL,
+                            referer: referer
+                        )
+                    )
+                }
+                let document = try validateWidevineDASHPayload(
+                    payload,
+                    requestedURL: candidate,
+                    referer: referer
+                )
+                return (
+                    .widevineDASH,
+                    URLCandidates(primary: payload.effectiveURL, sameOriginQueryFallback: nil),
+                    document
+                )
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                if case .cancelled = error { throw error }
+                lastError = error
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private func validateWidevineDASHPayload(
+        _ payload: HTTPPayload,
+        requestedURL: URL,
+        referer: URL?
+    ) throws -> PlaylistDocument {
+        guard DASHManifestParser.isMPD(payload.data) else {
+            throw HLSError.invalidPlaylist("MPEG-DASH MPDが不正です")
+        }
+        let manifest = try DASHManifestParser.parse(
+            data: payload.data,
+            effectiveURL: payload.effectiveURL
+        )
+        guard manifest.isWidevine else {
+            throw HLSError.invalidPlaylist("Widevine ContentProtectionのないMPDには対応していません")
+        }
+        guard isDownloadableWidevineDomain(requestedURL),
+              isDownloadableWidevineDomain(payload.effectiveURL) else {
+            log(
+                "widevine",
+                "Widevine MPD response rejected by download-domain policy redirected=\(payload.effectiveURL != requestedURL) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+            )
+            throw HLSError.drmUnsupported("Widevine DASH (許可ドメイン外)")
+        }
+        guard let text = decodeText(payload.data) else {
+            throw HLSError.invalidPlaylist("MPEG-DASH MPDをテキストとして読み取れません")
+        }
+        log(
+            "widevine",
+            "MPD accepted status=\(payload.statusCode) bytes=\(payload.data.count) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+        )
+        return PlaylistDocument(
+            text: text,
+            effectiveURL: payload.effectiveURL,
+            referer: referer
+        )
+    }
+
+    private func isDASHPayload(_ payload: HTTPPayload) -> Bool {
+        DASHManifestParser.isMPD(payload.data)
+    }
+
     private func appendCandidate(
+        kind: MediaCandidateKind,
         request: URLCandidates,
         requestReferer: URL?,
         document: PlaylistDocument?,
@@ -493,12 +744,14 @@ final class SourceResolver: Sendable {
         results: inout [HLSCandidate]
     ) {
         let key = candidateKey(
+            kind: kind,
             url: document?.effectiveURL ?? request.primary,
             referer: document?.referer ?? requestReferer ?? pageURL
         )
         guard accepted.insert(key).inserted else {
             guard let index = results.firstIndex(where: {
                 candidateKey(
+                    kind: $0.kind,
                     url: $0.document?.effectiveURL ?? $0.request.primary,
                     referer: $0.document?.referer ?? $0.requestReferer ?? $0.pageURL
                 ) == key
@@ -506,6 +759,7 @@ final class SourceResolver: Sendable {
             let existing = results[index]
             results[index] = HLSCandidate(
                 id: existing.id,
+                kind: existing.kind,
                 request: existing.request.sameOriginQueryFallback != nil ? existing.request : request,
                 requestReferer: existing.requestReferer ?? requestReferer,
                 document: existing.document ?? document,
@@ -524,6 +778,7 @@ final class SourceResolver: Sendable {
         results.append(
             HLSCandidate(
                 id: UUID(),
+                kind: kind,
                 request: request,
                 requestReferer: requestReferer,
                 document: document,
@@ -536,7 +791,7 @@ final class SourceResolver: Sendable {
         )
         log(
             "candidate",
-            "added origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(document?.effectiveURL ?? request.primary))"
+            "added origin=\(origin.rawValue) kind=\(kind.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(document?.effectiveURL ?? request.primary))"
         )
     }
 
@@ -581,8 +836,8 @@ final class SourceResolver: Sendable {
         return components.string ?? url.absoluteString
     }
 
-    private func candidateKey(url: URL, referer: URL?) -> String {
-        canonicalURLKey(url) + "\n" + (referer.map(canonicalURLKey) ?? "")
+    private func candidateKey(kind: MediaCandidateKind, url: URL, referer: URL?) -> String {
+        kind.rawValue + "\n" + canonicalURLKey(url) + "\n" + (referer.map(canonicalURLKey) ?? "")
     }
 
     private func limitedTitle(_ title: String?) -> String? {

@@ -37,6 +37,16 @@
 		B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000020 /* HTMLDiscoveryTests.swift */; };
 		B1000000000000000000001D /* BackgroundExecutionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */; };
 		B1000000000000000000001E /* BackgroundExecutionCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */; };
+		B10000000000000000000031 /* WVDFileValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000031 /* WVDFileValidator.swift */; };
+		B10000000000000000000032 /* WidevineCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000032 /* WidevineCredentialStore.swift */; };
+		B10000000000000000000033 /* WidevineProcessingProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000033 /* WidevineProcessingProvider.swift */; };
+		B10000000000000000000034 /* WVDFileValidatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000034 /* WVDFileValidatorTests.swift */; };
+		B10000000000000000000035 /* WidevineCredentialStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000035 /* WidevineCredentialStoreTests.swift */; };
+		B10000000000000000000036 /* WidevineProcessingProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000036 /* WidevineProcessingProviderTests.swift */; };
+		B10000000000000000000037 /* WidevineDownloadPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000037 /* WidevineDownloadPolicy.swift */; };
+		B10000000000000000000038 /* DASHManifestParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000038 /* DASHManifestParser.swift */; };
+		B10000000000000000000039 /* WidevineDownloadPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000039 /* WidevineDownloadPolicyTests.swift */; };
+		B10000000000000000000040 /* DASHManifestParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000040 /* DASHManifestParserTests.swift */; };
 		B20000000000000000000001 /* HLSFFmpegBridge in Frameworks */ = {isa = PBXBuildFile; productRef = G20000000000000000000001 /* HLSFFmpegBridge */; };
 /* End PBXBuildFile section */
 
@@ -85,6 +95,16 @@
 		A10000000000000000000020 /* HTMLDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLDiscoveryTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Background/BackgroundExecutionCoordinator.swift; sourceTree = "<group>"; };
 		A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundExecutionCoordinatorTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000031 /* WVDFileValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Widevine/WVDFileValidator.swift; sourceTree = "<group>"; };
+		A10000000000000000000032 /* WidevineCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Widevine/WidevineCredentialStore.swift; sourceTree = "<group>"; };
+		A10000000000000000000033 /* WidevineProcessingProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Widevine/WidevineProcessingProvider.swift; sourceTree = "<group>"; };
+		A10000000000000000000034 /* WVDFileValidatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WVDFileValidatorTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000035 /* WidevineCredentialStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidevineCredentialStoreTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000036 /* WidevineProcessingProviderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidevineProcessingProviderTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000037 /* WidevineDownloadPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DRM/WidevineDownloadPolicy.swift; sourceTree = "<group>"; };
+		A10000000000000000000038 /* DASHManifestParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DASH/DASHManifestParser.swift; sourceTree = "<group>"; };
+		A10000000000000000000039 /* WidevineDownloadPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidevineDownloadPolicyTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000040 /* DASHManifestParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DASHManifestParserTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -129,6 +149,11 @@
 				A1000000000000000000001E /* HTMLMediaExtractor.swift */,
 				A1000000000000000000001F /* WebPageInspector.swift */,
 				A10000000000000000000021 /* BackgroundExecutionCoordinator.swift */,
+				A10000000000000000000031 /* WVDFileValidator.swift */,
+				A10000000000000000000032 /* WidevineCredentialStore.swift */,
+				A10000000000000000000033 /* WidevineProcessingProvider.swift */,
+				A10000000000000000000037 /* WidevineDownloadPolicy.swift */,
+				A10000000000000000000038 /* DASHManifestParser.swift */,
 				A10000000000000000000009 /* DownloadPlanBuilder.swift */,
 				A1000000000000000000000A /* HLSDownloadService.swift */,
 				A1000000000000000000000B /* HTTPClient.swift */,
@@ -154,6 +179,11 @@
 				A10000000000000000000019 /* TransportStreamRemuxerTests.swift */,
 				A10000000000000000000020 /* HTMLDiscoveryTests.swift */,
 				A10000000000000000000022 /* BackgroundExecutionCoordinatorTests.swift */,
+				A10000000000000000000034 /* WVDFileValidatorTests.swift */,
+				A10000000000000000000035 /* WidevineCredentialStoreTests.swift */,
+				A10000000000000000000036 /* WidevineProcessingProviderTests.swift */,
+				A10000000000000000000039 /* WidevineDownloadPolicyTests.swift */,
+				A10000000000000000000040 /* DASHManifestParserTests.swift */,
 				E10000000000000000000005 /* Fixtures */,
 			);
 			path = HLSDownloaderTests;
@@ -299,6 +329,11 @@
 				B1000000000000000000001A /* HTMLMediaExtractor.swift in Sources */,
 				B1000000000000000000001B /* WebPageInspector.swift in Sources */,
 				B1000000000000000000001D /* BackgroundExecutionCoordinator.swift in Sources */,
+				B10000000000000000000031 /* WVDFileValidator.swift in Sources */,
+				B10000000000000000000032 /* WidevineCredentialStore.swift in Sources */,
+				B10000000000000000000033 /* WidevineProcessingProvider.swift in Sources */,
+				B10000000000000000000037 /* WidevineDownloadPolicy.swift in Sources */,
+				B10000000000000000000038 /* DASHManifestParser.swift in Sources */,
 				B10000000000000000000009 /* DownloadPlanBuilder.swift in Sources */,
 				B1000000000000000000000A /* HLSDownloadService.swift in Sources */,
 				B1000000000000000000000B /* HTTPClient.swift in Sources */,
@@ -320,6 +355,11 @@
 				B10000000000000000000015 /* TransportStreamRemuxerTests.swift in Sources */,
 				B1000000000000000000001C /* HTMLDiscoveryTests.swift in Sources */,
 				B1000000000000000000001E /* BackgroundExecutionCoordinatorTests.swift in Sources */,
+				B10000000000000000000034 /* WVDFileValidatorTests.swift in Sources */,
+				B10000000000000000000035 /* WidevineCredentialStoreTests.swift in Sources */,
+				B10000000000000000000036 /* WidevineProcessingProviderTests.swift in Sources */,
+				B10000000000000000000039 /* WidevineDownloadPolicyTests.swift in Sources */,
+				B10000000000000000000040 /* DASHManifestParserTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

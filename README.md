@@ -22,6 +22,8 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - 断片単体を開けない場合のplaylist単位連結再試行
 - 完成MP4の共有・「ファイル」への保存
 - URLやCookieの秘密値を残さない、コピー・共有可能な診断ログ
+- MPEG-DASH/MPDの`ContentProtection`、Widevine system ID、PSSH、CENC/CBCSの検出（アルファ）
+- Widevine L3 WVD v2の構造検証と、端末限定Keychainへの保存
 
 ## GitHub Actionsで未署名IPAを作る
 
@@ -50,6 +52,14 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 - 認証なし、URL内の署名query、またはページ自身の読み込み中に得られるCookieで取得できるHTTP(S)
 - H.264/HEVC + AACなど、MP4へ格納でき、端末が再生できるコーデック
 - 選択した1つの映像variantと、それに対応する既定音声の全断片
+
+### Widevineアルファ基盤
+
+Widevineの許可hostは `HLSDownloader/DRM/WidevineDownloadPolicy.swift` のSetだけで管理し、すべての判定を `isDownloadableWidevineDomain(_:)` へ集約しています。現在は `widevine.sprink.cloud` の完全一致hostのみです。サブドメインや部分一致は許可しません。その他のWidevineは候補化せず、再生・保存とも行いません。DRMなしHLSにはこのドメイン制限を適用しません。
+
+WVDファイルはアプリUIから読み込み、magic/version/L3/lengthを検証した後、`AfterFirstUnlockThisDeviceOnly` のKeychain itemとして保存します。WVD本体、private key、client identification、license headerはリポジトリや診断ログへ出力しません。
+
+現在のmainに入っている実行providerは意図的に `UnconfiguredWidevineProcessingProvider` です。そのため、MPD検出、ポリシー、WVD保存、provider境界までは有効ですが、Widevine再生、license exchange、segment復号、平文MP4出力はまだ有効ではありません。実配信と統合するには、WVDだけでなく、運営者が指定するlicense URL、request/response包装、必要な認証header、および利用許諾に沿ったWidevine処理providerが必要です。
 
 次の形式は、壊れた出力を作らずエラーとして終了します。
 
@@ -94,6 +104,9 @@ HLSDownloader/
   Features/       URL入力、進捗、共有UI
   Domain/         playlist/download models and errors
   HLS/            URL検出、playlist解析、download plan
+  DASH/           MPD、ContentProtection、PSSH解析
+  DRM/            Widevine許可hostの共通ポリシー
+  Widevine/       WVD検証、Keychain、処理provider境界
   Networking/     HTTP retry、Range、並列segment取得
   Crypto/         CommonCrypto AES-128/CBC
   Media/          MPEG-TS remux + AVMutableComposition + MP4 export
