@@ -77,9 +77,10 @@ enum HTMLMediaExtractor {
             }
 
             // Retain the original source order for broad fallback discovery in
-            // arbitrary attributes. An iframe with srcdoc is deliberately
-            // excluded here: its markup is parsed later as a child document.
-            if tag.name != "iframe" || tag.attributes["srcdoc"] == nil {
+            // arbitrary attributes. Iframe attributes are deliberately
+            // excluded: src/data-src are traversed as child documents below,
+            // and srcdoc markup is parsed later with the correct frame depth.
+            if tag.name != "iframe" {
                 looseFragments.append(String(body))
             }
 
