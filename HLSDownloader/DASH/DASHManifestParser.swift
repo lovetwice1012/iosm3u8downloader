@@ -601,24 +601,36 @@ private final class DASHXMLBuilder: NSObject, XMLParserDelegate {
     }
 
     private var totalRepresentationCount: Int {
-        periods.reduce(0) { count, period in
-            count + period.adaptationSets.reduce(0) { $0 + $1.representations.count }
-        } + (period?.adaptationSets.reduce(0) { $0 + $1.representations.count } ?? 0)
-            + (adaptation?.representations.count ?? 0)
+        var count = 0
+        for completedPeriod in periods {
+            for completedAdaptation in completedPeriod.adaptationSets {
+                count += completedAdaptation.representations.count
+            }
+        }
+        if let activePeriod = period {
+            for completedAdaptation in activePeriod.adaptationSets {
+                count += completedAdaptation.representations.count
+            }
+        }
+        count += adaptation?.representations.count ?? 0
+        return count
     }
 
     private var totalProtectionCount: Int {
-        let completed = manifestProtections.count + periods.reduce(0) { count, period in
-            count + period.contentProtections.count
-                + period.adaptationSets.reduce(0) { subtotal, adaptation in
-                    subtotal + adaptation.contentProtections.count
-                        + adaptation.representations.reduce(0) { $0 + $1.contentProtections.count }
+        var count = manifestProtections.count
+        for completedPeriod in periods {
+            count += completedPeriod.contentProtections.count
+            for completedAdaptation in completedPeriod.adaptationSets {
+                count += completedAdaptation.contentProtections.count
+                for completedRepresentation in completedAdaptation.representations {
+                    count += completedRepresentation.contentProtections.count
                 }
+            }
         }
-        return completed
-            + (period?.contentProtections.count ?? 0)
-            + (adaptation?.contentProtections.count ?? 0)
-            + (representation?.contentProtections.count ?? 0)
+        count += period?.contentProtections.count ?? 0
+        count += adaptation?.contentProtections.count ?? 0
+        count += representation?.contentProtections.count ?? 0
+        return count
     }
 
     private func beginCapture(_ kind: TextCaptureKind, name: String) {
