@@ -100,7 +100,7 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
             with: #"""
             <AdaptationSet contentType="text" mimeType="application/mp4">
               <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
-                <cenc:pssh>#(unrelatedPSSH)</cenc:pssh>
+                <cenc:pssh>\#(unrelatedPSSH)</cenc:pssh>
               </ContentProtection>
               <Representation id="subtitle" bandwidth="1000" />
             </AdaptationSet>
@@ -272,10 +272,17 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         try await FileStore().copyProtectedFile(from: source, to: partial)
         XCTAssertEqual(try Data(contentsOf: partial), payload)
         let attributes = try FileManager.default.attributesOfItem(atPath: partial.path)
-        XCTAssertEqual(
-            attributes[.protectionKey] as? FileProtectionType,
-            FileProtectionType.completeUnlessOpen
-        )
+        let reportedProtection = attributes[.protectionKey] as? FileProtectionType
+#if targetEnvironment(simulator)
+        // Simulator files live on the macOS host filesystem, which can ignore
+        // NSFileProtection attributes even when setAttributes succeeds. If the
+        // host reports one, it must still be the requested protection class.
+        if let reportedProtection {
+            XCTAssertEqual(reportedProtection, FileProtectionType.completeUnlessOpen)
+        }
+#else
+        XCTAssertEqual(reportedProtection, FileProtectionType.completeUnlessOpen)
+#endif
 
         try FileStore.cleanupIncompleteExports(in: directory)
         XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
@@ -650,12 +657,12 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
              mediaPresentationDuration="PT12S">
           <BaseURL>media/</BaseURL>
           <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
-            <cenc:pssh>#(pssh)</cenc:pssh>
+            <cenc:pssh>\#(pssh)</cenc:pssh>
           </ContentProtection>
           <Period duration="PT12S">
             <AdaptationSet contentType="video" mimeType="video/mp4">
               <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"
-                  value="cenc" cenc:default_KID="#(videoKeyID)" />
+                  value="cenc" cenc:default_KID="\#(videoKeyID)" />
               <SegmentTemplate timescale="1000" startNumber="7"
                   initialization="video/$RepresentationID$/init.mp4"
                   media="video/$RepresentationID$/chunk-$$-$Number%05d$.m4s">
@@ -666,7 +673,7 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
             </AdaptationSet>
             <AdaptationSet contentType="audio" mimeType="audio/mp4">
               <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"
-                  value="cbcs" cenc:default_KID="#(audioKeyID)" />
+                  value="cbcs" cenc:default_KID="\#(audioKeyID)" />
               <Representation id="a-main" bandwidth="128000">
                 <BaseURL>audio/</BaseURL>
                 <SegmentList>
