@@ -11,7 +11,8 @@ private let downloadableWidevineHosts: Set<String> = [
 /// the decision, and credential-bearing URLs are rejected. Callers must pass
 /// the manifest's final URL after redirects.
 func isDownloadableWidevineDomain(_ url: URL) -> Bool {
-    return true
+    //return true
+    return false
     //guard let components = URLComponents(
     //    url: url,
     //    resolvingAgainstBaseURL: false
