@@ -191,10 +191,10 @@ final class BackgroundExecutionCoordinator {
     private var activeJob: Job?
 
     init(
-        shortTaskManager: any ShortBackgroundTaskManaging = UIApplicationShortBackgroundTaskManager(),
+        shortTaskManager: (any ShortBackgroundTaskManaging)? = nil,
         continuedProcessingPolicy: ContinuedProcessingPolicy = .automatic
     ) {
-        self.shortTaskManager = shortTaskManager
+        self.shortTaskManager = shortTaskManager ?? UIApplicationShortBackgroundTaskManager()
         self.continuedProcessingPolicy = continuedProcessingPolicy
     }
 
