@@ -7,6 +7,8 @@ protocol HLSDownloadServicing: Sendable {
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult
     func thumbnailData(for candidate: HLSCandidate) async -> Data?
+    func resetDiagnosticLog()
+    func diagnosticLogText() -> String
 }
 
 private actor SegmentProgressTracker {
@@ -38,24 +40,68 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private let segmentDownloader: SegmentDownloader
     private let composer = MP4Composer()
     private let fileStore = FileStore()
+    private let diagnostics: DiagnosticLogStore
 
     @MainActor
     convenience init() {
         let configuration = URLSessionConfiguration.ephemeral
         let client = HTTPClient(configuration: configuration)
-        self.init(client: client, dynamicInspector: WebPageInspector())
+        let diagnostics = DiagnosticLogStore()
+        self.init(
+            client: client,
+            dynamicInspector: WebPageInspector(diagnosticSink: diagnostics.sink),
+            diagnostics: diagnostics
+        )
     }
 
-    init(client: HTTPClient, dynamicInspector: (any DynamicPageInspecting)? = nil) {
+    init(
+        client: HTTPClient,
+        dynamicInspector: (any DynamicPageInspecting)? = nil,
+        diagnostics: DiagnosticLogStore = DiagnosticLogStore()
+    ) {
         self.client = client
-        let resolver = SourceResolver(client: client, dynamicInspector: dynamicInspector)
+        self.diagnostics = diagnostics
+        let resolver = SourceResolver(
+            client: client,
+            dynamicInspector: dynamicInspector,
+            diagnosticSink: diagnostics.sink
+        )
         sourceResolver = resolver
         planBuilder = DownloadPlanBuilder(resolver: resolver)
         segmentDownloader = SegmentDownloader(client: client)
     }
 
     func discover(input: String) async throws -> HLSDiscoveryResult {
-        try await sourceResolver.discover(input: input)
+        do {
+            let result = try await sourceResolver.discover(input: input)
+            diagnostics.record(
+                "service",
+                "discovery completed candidates=\(result.candidates.count) direct=\(result.isDirectPlaylist)"
+            )
+            return result
+        } catch is CancellationError {
+            diagnostics.record("service", "discovery cancelled")
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            if case .cancelled = error {
+                diagnostics.record("service", "discovery cancelled")
+            } else {
+                diagnostics.record("service", "discovery failed error=\(DiagnosticPrivacy.errorCode(error))")
+            }
+            throw error
+        } catch {
+            diagnostics.record("service", "discovery failed error=\(DiagnosticPrivacy.errorCode(error))")
+            throw error
+        }
+    }
+
+    func resetDiagnosticLog() {
+        diagnostics.reset()
+        diagnostics.record("session", "started")
+    }
+
+    func diagnosticLogText() -> String {
+        diagnostics.renderedText()
     }
 
     func download(input: String, progress: @escaping ProgressHandler) async throws -> DownloadResult {
@@ -68,15 +114,28 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         candidate: HLSCandidate,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
+        diagnostics.record(
+            "service",
+            "candidate selected origin=\(candidate.origin.rawValue) depth=\(candidate.iframeDepth) \(DiagnosticPrivacy.urlSummary(candidate.playlistURL))"
+        )
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
         let document: PlaylistDocument
-        if let discoveredDocument = candidate.document {
-            document = discoveredDocument
-        } else {
-            document = try await sourceResolver.load(
-                candidate.request,
-                referer: candidate.requestReferer
+        do {
+            if let discoveredDocument = candidate.document {
+                document = discoveredDocument
+            } else {
+                document = try await sourceResolver.load(
+                    candidate.request,
+                    referer: candidate.requestReferer
+                )
+            }
+        } catch {
+            let code = DiagnosticPrivacy.errorCode(error)
+            diagnostics.record(
+                "download",
+                code == "cancelled" ? "cancelled before planning" : "playlist validation failed error=\(code)"
             )
+            throw error
         }
         return try await download(document: document, progress: progress)
     }
@@ -115,6 +174,10 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         do {
             let plan = try await planBuilder.build(from: document)
             try Task.checkCancellation()
+            diagnostics.record(
+                "download",
+                "plan ready mainSegments=\(plan.main.segments.count) audioSegments=\(plan.audio?.segments.count ?? 0) total=\(plan.segmentCount) \(DiagnosticPrivacy.urlSummary(plan.sourceURL))"
+            )
 
             await progress(
                 DownloadProgress(phase: .downloading, completedItems: 0, totalItems: plan.segmentCount)
@@ -159,6 +222,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
             try Task.checkCancellation()
             await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
+            diagnostics.record("compose", "started mainFiles=\(main.count) audioFiles=\(audio?.count ?? 0)")
             let locations = try fileStore.outputLocations(for: plan.sourceURL)
             temporaryOutput = locations.temporary
             try await composer.compose(main: main, externalAudio: audio, outputURL: locations.temporary)
@@ -166,16 +230,28 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             temporaryOutput = nil
             fileStore.removeJobDirectory(jobDirectory)
             await progress(DownloadProgress(phase: .completed, completedItems: 1, totalItems: 1))
+            diagnostics.record("download", "completed segments=\(plan.segmentCount)")
             return DownloadResult(
                 outputURL: locations.final,
                 sourceURL: plan.sourceURL,
                 segmentCount: plan.segmentCount
             )
         } catch is CancellationError {
+            diagnostics.record("download", "cancelled")
             if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
             fileStore.removeJobDirectory(jobDirectory)
             throw HLSError.cancelled
+        } catch let error as HLSError {
+            if case .cancelled = error {
+                diagnostics.record("download", "cancelled")
+            } else {
+                diagnostics.record("download", "failed error=\(DiagnosticPrivacy.errorSummary(error))")
+            }
+            if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            fileStore.removeJobDirectory(jobDirectory)
+            throw error
         } catch {
+            diagnostics.record("download", "failed error=\(DiagnosticPrivacy.errorSummary(error))")
             if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
             fileStore.removeJobDirectory(jobDirectory)
             throw error

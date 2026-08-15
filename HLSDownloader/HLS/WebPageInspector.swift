@@ -24,21 +24,58 @@ protocol DynamicPageInspecting: AnyObject, Sendable {
 
 @MainActor
 final class WebPageInspector: DynamicPageInspecting {
+    private let diagnosticSink: DiagnosticSink?
+
+    init(diagnosticSink: DiagnosticSink? = nil) {
+        self.diagnosticSink = diagnosticSink
+    }
+
     func inspect(url: URL, seedCookies: [HTTPCookie]) async -> DynamicPageInspection {
-        let session = WebPageInspectionSession(url: url, seedCookies: seedCookies)
+        diagnosticSink?(
+            DiagnosticEvent(
+                category: "webkit",
+                message: "session start seedCookies=\(seedCookies.count) \(DiagnosticPrivacy.urlSummary(url))"
+            )
+        )
+        let session = WebPageInspectionSession(
+            url: url,
+            seedCookies: seedCookies,
+            diagnosticSink: diagnosticSink
+        )
         return await session.run()
     }
 }
 
 @MainActor
 private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    private enum FinishReason: String {
+        case settled
+        case navigationFailed
+        case provisionalNavigationFailed
+        case webProcessTerminated
+        case hardTimeout
+        case cancelled
+
+        var priority: Int {
+            switch self {
+            case .settled: return 0
+            case .navigationFailed, .provisionalNavigationFailed: return 1
+            case .webProcessTerminated: return 2
+            case .hardTimeout: return 3
+            case .cancelled: return 4
+            }
+        }
+    }
+
     private static let messageName = "hlsDiscovery"
     private static let maximumMessages = 512
     private static let maximumRawMessages = 4_096
     private static let maximumURLLength = 8_192
+    private static let maximumLoggedReferences = 64
 
     private let rootURL: URL
     private let seedCookies: [HTTPCookie]
+    private let diagnosticSink: DiagnosticSink?
     private let websiteDataStore = WKWebsiteDataStore.nonPersistent()
     private var webView: WKWebView?
     private var continuation: CheckedContinuation<DynamicPageInspection, Never>?
@@ -49,13 +86,22 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     private var isFinishing = false
     private var messageCount = 0
     private var rawMessageCount = 0
+    private var invalidMessageCount = 0
+    private var duplicateReferenceCount = 0
+    private var blockedNavigationCount = 0
+    private var referenceLimitReached = false
+    private var rawMessageLimitReached = false
+    private var loggedReferenceCount = 0
+    private var referenceLogLimitReported = false
     private var references: [String: DynamicMediaReference] = [:]
     private var referenceOrder: [String] = []
     private var navigationContexts: [String: (pageURL: URL, iframeDepth: Int)] = [:]
+    private var pendingFinishReason: FinishReason = .settled
 
-    init(url: URL, seedCookies: [HTTPCookie]) {
+    init(url: URL, seedCookies: [HTTPCookie], diagnosticSink: DiagnosticSink?) {
         rootURL = url
         self.seedCookies = seedCookies
+        self.diagnosticSink = diagnosticSink
     }
 
     func run() async -> DynamicPageInspection {
@@ -67,14 +113,14 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 startWebView()
                 if Task.isCancelled || finishRequested {
                     Task { @MainActor [weak self] in
-                        await self?.finish()
+                        await self?.finish(reason: .cancelled)
                     }
                 }
             }
         }, onCancel: {
             Task { @MainActor [weak self] in
                 self?.finishRequested = true
-                await self?.finish()
+                await self?.finish(reason: .cancelled)
             }
         })
     }
@@ -113,7 +159,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         hardTimeoutTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000_000)
             guard !Task.isCancelled else { return }
-            await self?.finish()
+            await self?.finish(reason: .hardTimeout)
         }
     }
 
@@ -135,17 +181,23 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         }
     }
 
-    private func scheduleSettle(after nanoseconds: UInt64 = 6_000_000_000) {
+    private func scheduleSettle(
+        after nanoseconds: UInt64 = 6_000_000_000,
+        reason: FinishReason = .settled
+    ) {
         guard navigationFinished, !isFinishing else { return }
+        if reason.priority > pendingFinishReason.priority {
+            pendingFinishReason = reason
+        }
         settleTask?.cancel()
         settleTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            await self?.finish()
+            guard !Task.isCancelled, let self else { return }
+            await self.finish(reason: self.pendingFinishReason)
         }
     }
 
-    private func finish() async {
+    private func finish(reason: FinishReason) async {
         guard !isFinishing, let continuation else {
             finishRequested = true
             return
@@ -169,12 +221,16 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
 
         let cookies = await allCookies()
         let media = referenceOrder.compactMap { references[$0] }
+        log(
+            "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
+        )
         self.continuation = nil
         continuation.resume(returning: DynamicPageInspection(media: media, cookies: cookies))
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         navigationFinished = true
+        log("navigation finished")
         scheduleSettle(after: 6_000_000_000)
     }
 
@@ -184,7 +240,8 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         withError error: Error
     ) {
         navigationFinished = true
-        scheduleSettle(after: 750_000_000)
+        log("navigation failed error=\(DiagnosticPrivacy.errorCode(error))")
+        scheduleSettle(after: 750_000_000, reason: .navigationFailed)
     }
 
     func webView(
@@ -193,12 +250,14 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         withError error: Error
     ) {
         navigationFinished = true
-        scheduleSettle(after: 750_000_000)
+        log("provisional navigation failed error=\(DiagnosticPrivacy.errorCode(error))")
+        scheduleSettle(after: 750_000_000, reason: .provisionalNavigationFailed)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         navigationFinished = true
-        scheduleSettle(after: 100_000_000)
+        log("web content process terminated")
+        scheduleSettle(after: 100_000_000, reason: .webProcessTerminated)
     }
 
     func webView(
@@ -207,6 +266,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         guard navigationAction.targetFrame != nil else {
+            blockedNavigationCount += 1
             decisionHandler(.cancel)
             return
         }
@@ -239,6 +299,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             }
             decisionHandler(.allow)
         } else {
+            blockedNavigationCount += 1
             decisionHandler(.cancel)
         }
     }
@@ -249,6 +310,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
     ) {
         guard let targetURL = navigationResponse.response.url else {
+            blockedNavigationCount += 1
             decisionHandler(.cancel)
             return
         }
@@ -261,6 +323,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 from: rootURL,
                 to: targetURL
               ) else {
+            blockedNavigationCount += 1
             decisionHandler(.cancel)
             return
         }
@@ -282,19 +345,26 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == Self.messageName,
-              rawMessageCount < Self.maximumRawMessages else {
+        guard message.name == Self.messageName else {
+            return
+        }
+        guard rawMessageCount < Self.maximumRawMessages else {
+            rawMessageLimitReached = true
             return
         }
         rawMessageCount += 1
         guard let body = message.body as? [String: Any],
               let rawURL = body["url"] as? String,
               rawURL.utf8.count <= Self.maximumURLLength else {
+            invalidMessageCount += 1
             return
         }
 
         let frameURL = trustedFrameURL(from: message.frameInfo) ?? rootURL
-        guard let url = resolvedWebURL(rawURL, relativeTo: frameURL) else { return }
+        guard let url = resolvedWebURL(rawURL, relativeTo: frameURL) else {
+            invalidMessageCount += 1
+            return
+        }
         let thumbnailURL: URL?
         if let rawPoster = body["poster"] as? String,
            rawPoster.utf8.count <= Self.maximumURLLength {
@@ -332,6 +402,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         let key = canonicalKey(url) + "\n" + canonicalKey(pageURL)
         var didChange = false
         if let existing = references[key] {
+            duplicateReferenceCount += 1
             if existing.title == nil && title != nil || existing.thumbnailURL == nil && thumbnailURL != nil {
                 references[key] = DynamicMediaReference(
                     url: existing.url,
@@ -344,7 +415,10 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 didChange = true
             }
         } else {
-            guard messageCount < Self.maximumMessages else { return }
+            guard messageCount < Self.maximumMessages else {
+                referenceLimitReached = true
+                return
+            }
             messageCount += 1
             references[key] = DynamicMediaReference(
                 url: url,
@@ -355,6 +429,15 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 origin: origin
             )
             referenceOrder.append(key)
+            if loggedReferenceCount < Self.maximumLoggedReferences {
+                loggedReferenceCount += 1
+                log(
+                    "reference added origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(url))"
+                )
+            } else if !referenceLogLimitReported {
+                referenceLogLimitReported = true
+                log("reference detail log limit reached limit=\(Self.maximumLoggedReferences)")
+            }
             didChange = true
         }
         if didChange { scheduleSettle() }
@@ -408,6 +491,10 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             .joined(separator: " ")
         guard !collapsed.isEmpty else { return nil }
         return String(collapsed.prefix(maximumLength))
+    }
+
+    private func log(_ message: String) {
+        diagnosticSink?(DiagnosticEvent(category: "webkit", message: message))
     }
 
     private static let probeJavaScript = #"""

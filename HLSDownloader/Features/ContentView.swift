@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = DownloadViewModel()
+    @State private var diagnosticLogExpanded = false
     @FocusState private var urlFieldFocused: Bool
 
     var body: some View {
@@ -16,7 +17,7 @@ struct ContentView: View {
                         candidateListCard
                     }
 
-                    if viewModel.isRunning {
+                    if viewModel.isBusy {
                         progressCard
                     }
                     if let error = viewModel.errorMessage {
@@ -24,6 +25,9 @@ struct ContentView: View {
                     }
                     if let outputURL = viewModel.outputURL {
                         completionCard(outputURL)
+                    }
+                    if !viewModel.diagnosticLog.isEmpty {
+                        diagnosticLogCard
                     }
 
                     compatibilityNote
@@ -61,7 +65,7 @@ struct ContentView: View {
                 .padding(12)
                 .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
                 .accessibilityLabel("動画リンク")
-                .disabled(viewModel.isRunning)
+                .disabled(viewModel.isBusy)
 
             HStack(spacing: 12) {
                 Button {
@@ -71,7 +75,7 @@ struct ContentView: View {
                     Label("貼り付け", systemImage: "doc.on.clipboard")
                 }
                 .buttonStyle(.bordered)
-                .disabled(viewModel.isRunning)
+                .disabled(viewModel.isBusy)
 
                 Button {
                     urlFieldFocused = false
@@ -156,7 +160,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(viewModel.isRunning)
+            .disabled(viewModel.isBusy)
         }
         .accessibilityElement(children: .contain)
     }
@@ -189,7 +193,7 @@ struct ContentView: View {
     private var progressCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(viewModel.progress.phase.title)
+                Text(viewModel.isCancelling ? "キャンセル処理中" : viewModel.progress.phase.title)
                     .font(.headline)
                 Spacer()
                 if viewModel.progress.totalItems > 0 {
@@ -199,17 +203,21 @@ struct ContentView: View {
                 }
             }
 
-            if let fraction = viewModel.progress.fraction {
+            if viewModel.isCancelling {
+                ProgressView()
+            } else if let fraction = viewModel.progress.fraction {
                 ProgressView(value: fraction)
                     .accessibilityValue("\(Int(fraction * 100))パーセント")
             } else {
                 ProgressView()
             }
 
-            Button("キャンセル", role: .destructive) {
-                viewModel.cancel()
+            if !viewModel.isCancelling {
+                Button("キャンセル", role: .destructive) {
+                    viewModel.cancel()
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
         }
         .cardStyle()
     }
@@ -242,6 +250,55 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+        }
+        .cardStyle()
+    }
+
+    private var diagnosticLogCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("診断ログ", systemImage: "doc.text.magnifyingglass")
+                    .font(.headline)
+                Spacer()
+                Button("更新") {
+                    viewModel.refreshDiagnosticLog()
+                }
+                .buttonStyle(.borderless)
+            }
+
+            Text("HTML・iframe・JavaScript実行後の探索経路と失敗理由を記録します。URLは識別子化し、クエリ値・Cookie・Referer・HTML本文は記録しません。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            DisclosureGroup("ログを表示", isExpanded: $diagnosticLogExpanded) {
+                ScrollView([.horizontal, .vertical]) {
+                    Text(viewModel.diagnosticLog)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 8)
+                }
+                .frame(height: 220)
+            }
+            .onChange(of: diagnosticLogExpanded) { _, isExpanded in
+                if isExpanded { viewModel.refreshDiagnosticLog() }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    viewModel.copyDiagnosticLog()
+                } label: {
+                    Label("コピー", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                ShareLink(item: viewModel.diagnosticLog) {
+                    Label("共有", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
         }
         .cardStyle()
     }

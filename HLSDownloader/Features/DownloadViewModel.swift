@@ -9,6 +9,7 @@ final class DownloadViewModel: ObservableObject {
         didSet {
             let normalized = inputURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if normalized != discoveredInput {
+                diagnosticSessionID = nil
                 cancelActiveOperation()
                 candidates = []
                 thumbnails = [:]
@@ -22,11 +23,16 @@ final class DownloadViewModel: ObservableObject {
     @Published private(set) var downloadedSegmentCount = 0
     @Published private(set) var candidates: [HLSCandidate] = []
     @Published private(set) var thumbnails: [UUID: UIImage] = [:]
+    @Published private(set) var diagnosticLog = ""
+    @Published private(set) var isCancelling = false
+    @Published private(set) var isOperationActive = false
     @Published var errorMessage: String?
 
     private let service: any HLSDownloadServicing
     private var task: Task<Void, Never>?
     private var operationID: UUID?
+    private var diagnosticSessionID: UUID?
+    private var cancellingOperationIDs = Set<UUID>()
     private var discoveredInput: String?
     private var attemptedThumbnailIDs = Set<UUID>()
     private var thumbnailIDsInFlight = Set<UUID>()
@@ -39,8 +45,12 @@ final class DownloadViewModel: ObservableObject {
         [.resolving, .downloading, .composing].contains(progress.phase)
     }
 
+    var isBusy: Bool {
+        isOperationActive || isCancelling
+    }
+
     var canStart: Bool {
-        !isRunning && !inputURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !isBusy && !inputURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func paste() {
@@ -59,10 +69,15 @@ final class DownloadViewModel: ObservableObject {
         attemptedThumbnailIDs = []
         thumbnailIDsInFlight = []
         discoveredInput = nil
+        service.resetDiagnosticLog()
+        diagnosticLog = service.diagnosticLogText()
         let input = inputURL.trimmingCharacters(in: .whitespacesAndNewlines)
         progress = DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
         let operationID = UUID()
+        let diagnosticSessionID = UUID()
         self.operationID = operationID
+        self.diagnosticSessionID = diagnosticSessionID
+        isOperationActive = true
 
         task = Task { [weak self] in
             guard let self else { return }
@@ -86,12 +101,13 @@ final class DownloadViewModel: ObservableObject {
             } catch {
                 if self.operationID == operationID { handle(error) }
             }
+            if self.diagnosticSessionID == diagnosticSessionID { refreshDiagnosticLog() }
             finishOperation(operationID)
         }
     }
 
     func download(_ candidate: HLSCandidate) {
-        guard !isRunning, candidates.contains(where: { $0.id == candidate.id }) else { return }
+        guard !isBusy, candidates.contains(where: { $0.id == candidate.id }) else { return }
         task?.cancel()
         outputURL = nil
         downloadedSegmentCount = 0
@@ -99,7 +115,10 @@ final class DownloadViewModel: ObservableObject {
         progress = DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
         let input = discoveredInput ?? inputURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let operationID = UUID()
+        let diagnosticSessionID = self.diagnosticSessionID ?? UUID()
         self.operationID = operationID
+        self.diagnosticSessionID = diagnosticSessionID
+        isOperationActive = true
 
         task = Task { [weak self] in
             guard let self else { return }
@@ -113,6 +132,7 @@ final class DownloadViewModel: ObservableObject {
             } catch {
                 if self.operationID == operationID { handle(error) }
             }
+            if self.diagnosticSessionID == diagnosticSessionID { refreshDiagnosticLog() }
             finishOperation(operationID)
         }
     }
@@ -138,6 +158,17 @@ final class DownloadViewModel: ObservableObject {
 
     func cancel() {
         cancelActiveOperation()
+        refreshDiagnosticLog()
+    }
+
+    func refreshDiagnosticLog() {
+        diagnosticLog = service.diagnosticLogText()
+    }
+
+    func copyDiagnosticLog() {
+        refreshDiagnosticLog()
+        guard !diagnosticLog.isEmpty else { return }
+        UIPasteboard.general.string = diagnosticLog
     }
 
     private func apply(_ result: DownloadResult) {
@@ -156,13 +187,22 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func finishOperation(_ operationID: UUID) {
-        guard self.operationID == operationID else { return }
-        task = nil
-        self.operationID = nil
+        if self.operationID == operationID {
+            task = nil
+            self.operationID = nil
+        }
+        if cancellingOperationIDs.remove(operationID) != nil {
+            isCancelling = !cancellingOperationIDs.isEmpty
+        }
+        isOperationActive = false
     }
 
     private func cancelActiveOperation() {
         let activeTask = task
+        if activeTask != nil, let operationID {
+            cancellingOperationIDs.insert(operationID)
+            isCancelling = true
+        }
         task = nil
         operationID = nil
         activeTask?.cancel()

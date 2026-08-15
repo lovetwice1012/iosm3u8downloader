@@ -63,6 +63,10 @@ final class HTTPClient: @unchecked Sendable {
         )
     }
 
+    deinit {
+        session.invalidateAndCancel()
+    }
+
     func cookies(for url: URL) -> [HTTPCookie] {
         let stored = cookieStorage?.cookies(for: url) ?? []
         importedCookieLock.lock()

@@ -39,11 +39,25 @@ final class HTMLMediaExtractorTests: XCTestCase {
         """#
 
         let result = HTMLMediaExtractor.extract(from: html)
+        XCTAssertEqual(result.media.map(\.rawURL), ["//cdn.example/video.m3u8?x=1&y=2"])
         XCTAssertEqual(result.media.first?.rawURL, "//cdn.example/video.m3u8?x=1&y=2")
         XCTAssertEqual(result.media.first?.rawPosterURL, "/p?caption=a>b")
         XCTAssertEqual(result.frames.count, 1)
         XCTAssertEqual(result.frames[0].title, "nested player")
         XCTAssertEqual(result.frames[0].sourceDocument, #"<video src="/inside.m3u8"></video>"#)
+    }
+
+    func testLooseFallbackKeepsTextAndAttributeConfigsWithoutLeakingSrcdoc() throws {
+        let html = #"""
+        <div data-player='{"file":"/attribute.m3u8"}'></div>
+        <textarea>{"file":"/text.m3u8"}</textarea>
+        <iframe srcdoc="&lt;video src=&quot;/inside.m3u8&quot;&gt;&lt;/video&gt;"></iframe>
+        """#
+
+        let result = HTMLMediaExtractor.extract(from: html)
+
+        XCTAssertEqual(result.media.map(\.rawURL), ["/attribute.m3u8", "/text.m3u8"])
+        XCTAssertEqual(result.frames.count, 1)
     }
 
     func testKeepsLazyIframeURLAfterAboutBlankPlaceholder() throws {
@@ -113,6 +127,53 @@ final class HTMLMediaExtractorTests: XCTestCase {
 
         XCTAssertEqual(result.media.first?.rawURL, "https://cdn.example/v.m3u8?a=1&b=2")
         XCTAssertEqual(HTMLMediaExtractor.decodeHTMLEntities("a&amp"), "a&")
+    }
+}
+
+final class DiagnosticLogTests: XCTestCase {
+    func testURLSummaryAndErrorCodeDoNotExposeSecrets() throws {
+        let url = try XCTUnwrap(
+            URL(string: "https://user:password@secret.example/private/master.m3u8?token=top-secret&quality=high#fragment")
+        )
+        let rotatedURL = try XCTUnwrap(
+            URL(string: "https://secret.example/private/master.m3u8?token=different&quality=low")
+        )
+        let store = DiagnosticLogStore()
+        let summary = DiagnosticPrivacy.urlSummary(url)
+        let rotatedSummary = DiagnosticPrivacy.urlSummary(rotatedURL)
+        store.record("test", summary)
+        store.record("test", "error=\(DiagnosticPrivacy.errorCode(HLSError.network("token=leak")))")
+        store.record(
+            "test",
+            "generic=\(DiagnosticPrivacy.errorCode(NSError(domain: "top-secret.example", code: 7)))"
+        )
+        store.record(
+            "test",
+            "media=\(DiagnosticPrivacy.errorSummary(HLSError.invalidMediaPayload(stream: "main", number: 7, mimeType: "video/mp2t; secret=body-secret", byteCount: 123, signature: "body-secret")))"
+        )
+
+        let text = store.renderedText()
+        XCTAssertTrue(text.contains("ext=m3u8"))
+        XCTAssertTrue(text.contains("queryItems=2"))
+        XCTAssertTrue(text.contains("error=network"))
+        XCTAssertTrue(text.contains("generic=NSError(7)"))
+        XCTAssertTrue(text.contains("media=invalidMediaPayload stream=main segment=7 mime=media bytes=123"))
+        XCTAssertEqual(summary.split(separator: " ").first, rotatedSummary.split(separator: " ").first)
+        for secret in ["user", "password", "secret.example", "private", "top-secret", "quality", "fragment", "token=leak", "body-secret"] {
+            XCTAssertFalse(text.contains(secret), secret)
+        }
+    }
+
+    func testLogIsBoundedAndReportsDroppedEntries() {
+        let store = DiagnosticLogStore(capacity: 50, maximumUTF8Bytes: 16 * 1_024)
+        for index in 0..<80 {
+            store.record("test", "event-\(index)")
+        }
+
+        let text = store.renderedText()
+        XCTAssertTrue(text.contains("Entries: 50, dropped: 30"))
+        XCTAssertFalse(text.contains("event-0\n"))
+        XCTAssertTrue(text.contains("event-79"))
     }
 }
 
@@ -388,6 +449,29 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(recorder.snapshot().count, 1)
     }
 
+    func testDiscoveryDiagnosticsExplainCoverageWithoutLeakingURLSecrets() async throws {
+        let diagnostics = DiagnosticLogStore()
+        let resolver = makeResolver(diagnostics: diagnostics)
+        DiscoveryURLProtocolStub.handler = { request in
+            Self.response(
+                request,
+                body: #"<iframe src="http://127.0.0.1/player"></iframe><video src="/master.m3u8?token=top-secret"></video>"#,
+                mimeType: "text/html"
+            )
+        }
+
+        let discovery = try await resolver.discover(input: "https://site.example/watch?session=private")
+        XCTAssertEqual(discovery.candidates.count, 1)
+
+        let text = diagnostics.renderedText()
+        XCTAssertTrue(text.contains("document depth=0 media=1 frames=1"))
+        XCTAssertTrue(text.contains("automatic fetch blocked"))
+        XCTAssertTrue(text.contains("added origin=video"))
+        XCTAssertFalse(text.contains("top-secret"))
+        XCTAssertFalse(text.contains("session=private"))
+        XCTAssertFalse(text.contains("site.example"))
+    }
+
     func testAutomaticNavigationBlocksAdditionalLocalAddressForms() throws {
         let publicURL = URL(string: "https://public.example/watch")!
         let blocked = [
@@ -492,13 +576,15 @@ final class SourceDiscoveryTests: XCTestCase {
     }
 
     private func makeResolver(
-        dynamicInspector: (any DynamicPageInspecting)? = nil
+        dynamicInspector: (any DynamicPageInspecting)? = nil,
+        diagnostics: DiagnosticLogStore? = nil
     ) -> SourceResolver {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
         return SourceResolver(
             client: HTTPClient(configuration: configuration),
-            dynamicInspector: dynamicInspector
+            dynamicInspector: dynamicInspector,
+            diagnosticSink: diagnostics?.sink
         )
     }
 

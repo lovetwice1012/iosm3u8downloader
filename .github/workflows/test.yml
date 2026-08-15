@@ -1,0 +1,60 @@
+name: Test iOS app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run iOS Simulator tests
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Show Xcode environment
+        run: |
+          test "$(uname -m)" = "arm64"
+          uname -a
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Choose an available iPhone Simulator
+        id: simulator
+        shell: bash
+        run: |
+          DEVICE_ID=$(/usr/bin/python3 - <<'PY'
+          import json
+          import subprocess
+
+          data = json.loads(subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"],
+              text=True,
+          ))
+          for runtime_devices in data.get("devices", {}).values():
+              for device in runtime_devices:
+                  if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("No available iPhone Simulator was found")
+          PY
+          )
+          echo "id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests without signing
+        run: |
+          xcodebuild test \
+            -project HLSDownloader.xcodeproj \
+            -scheme HLSDownloader \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -derivedDataPath build/simulator \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO

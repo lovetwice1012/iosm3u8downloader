@@ -20,6 +20,7 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 - MPEG-TSはFFmpegKit/FFmpegで再圧縮せずMP4へremuxし、fMP4等はAVFoundationで結合
 - 断片単体を開けない場合のplaylist単位連結再試行
 - 完成MP4の共有・「ファイル」への保存
+- URLやCookieの秘密値を残さない、コピー・共有可能な診断ログ
 
 ## GitHub Actionsで未署名IPAを作る
 
@@ -30,7 +31,7 @@ Developer Program、証明書、Provisioning Profileはビルド時に不要で�
 3. 完了したrunのArtifactsから `HLSDownloader-unsigned-iphoneos` をダウンロードします。
 4. ZIP内の `HLSDownloader-unsigned.ipa` を取り出します。
 
-ワークフローは先にSimulatorで単体テストを実行し、その後 `iphoneos`/arm64を次の条件でビルドします。
+IPAビルドとSimulatorテストは別ワークフローです。**Build unsigned iPhone IPA** はテストの完了を待たず `iphoneos`/arm64を次の条件でビルドし、**Test iOS app** は単体テストだけを実行します。`main`/`master`へのpushとPRでは両方が並行し、手動実行では必要なワークフローをそれぞれ選びます。
 
 ```text
 CODE_SIGNING_ALLOWED=NO
@@ -62,6 +63,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 
 ダウンロードとMP4化は現在foreground処理です。長い動画では完了までアプリを前面に置いてください。途中でキャンセルすると、そのジョブの一時断片と未完成MP4を削除します。
 
+候補が不足する場合や取得に失敗した場合は、画面下部の「診断ログ」を更新してコピーまたは共有できます。静的HTML、iframe、WebKit動的監視、playlist検証、ダウンロード、MP4結合の各段階と件数・失敗分類を記録します。URLは実URLの代わりに実行中だけ有効な識別子と形状情報を残し、query値、Cookie、Referer、HTML本文、タイトルは記録しません。
+
 ## プライバシーと利用条件
 
 - 署名queryや鍵URLを画面・ログへ出しません。
@@ -91,6 +94,7 @@ HLSDownloader/
 HLSDownloaderTests/
 Vendor/HLSFFmpegBridge/  pinned binary package + C shim
 .github/workflows/build-unsigned-ipa.yml
+.github/workflows/test.yml
 ```
 
 ## Macで直接確認する場合

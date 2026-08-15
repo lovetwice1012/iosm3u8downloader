@@ -80,6 +80,202 @@ struct HLSDiscoveryResult: Sendable {
     let isDirectPlaylist: Bool
 }
 
+struct DiagnosticEvent: Sendable {
+    let category: String
+    let message: String
+}
+
+typealias DiagnosticSink = @Sendable (DiagnosticEvent) -> Void
+
+final class DiagnosticLogStore: @unchecked Sendable {
+    private struct Entry {
+        let sequence: Int
+        let date: Date
+        let event: DiagnosticEvent
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private let maximumUTF8Bytes: Int
+    private var startedAt = Date()
+    private var nextSequence = 1
+    private var entries: [Entry] = []
+    private var storedUTF8Bytes = 0
+    private var droppedEntries = 0
+
+    init(capacity: Int = 600, maximumUTF8Bytes: Int = 256 * 1_024) {
+        self.capacity = max(50, capacity)
+        self.maximumUTF8Bytes = max(16 * 1_024, maximumUTF8Bytes)
+    }
+
+    var sink: DiagnosticSink {
+        { [weak self] event in self?.record(event) }
+    }
+
+    func reset() {
+        lock.lock()
+        startedAt = Date()
+        nextSequence = 1
+        entries.removeAll(keepingCapacity: true)
+        storedUTF8Bytes = 0
+        droppedEntries = 0
+        lock.unlock()
+    }
+
+    func record(_ category: String, _ message: String) {
+        record(DiagnosticEvent(category: category, message: message))
+    }
+
+    func renderedText() -> String {
+        lock.lock()
+        let start = startedAt
+        let snapshot = entries
+        let dropped = droppedEntries
+        lock.unlock()
+
+        var lines = [
+            "HLSDownloader diagnostic log",
+            "Privacy: URLs are fingerprinted; query values, cookies, Referer, HTML and titles are omitted.",
+            "Entries: \(snapshot.count), dropped: \(dropped)"
+        ]
+        lines.append(contentsOf: snapshot.map { entry in
+            let elapsed = max(0, entry.date.timeIntervalSince(start))
+            return String(
+                format: "%04d +%07.3fs [%@] %@",
+                entry.sequence,
+                elapsed,
+                entry.event.category,
+                entry.event.message
+            )
+        })
+        return lines.joined(separator: "\n")
+    }
+
+    private func record(_ event: DiagnosticEvent) {
+        let category = String(event.category.prefix(40))
+            .replacingOccurrences(of: "\n", with: " ")
+        let message = String(event.message.prefix(1_200))
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+
+        lock.lock()
+        let entry = Entry(
+            sequence: nextSequence,
+            date: Date(),
+            event: DiagnosticEvent(category: category, message: message)
+        )
+        entries.append(entry)
+        storedUTF8Bytes += category.utf8.count + message.utf8.count + 64
+        nextSequence += 1
+        while entries.count > capacity || storedUTF8Bytes > maximumUTF8Bytes {
+            let removed = entries.removeFirst()
+            storedUTF8Bytes -= removed.event.category.utf8.count + removed.event.message.utf8.count + 64
+            droppedEntries += 1
+        }
+        lock.unlock()
+    }
+}
+
+enum DiagnosticPrivacy {
+    static func urlSummary(_ url: URL) -> String {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let scheme: String
+        switch url.scheme?.lowercased() {
+        case "https": scheme = "https"
+        case "http": scheme = "http"
+        default: scheme = "other"
+        }
+        let pathDepth = url.path.split(separator: "/").count
+        let queryItems = components?.queryItems?.count ?? (components?.percentEncodedQuery == nil ? 0 : 1)
+        let pathExtension = url.pathExtension.lowercased()
+        let extensionClass = pathExtension == "m3u8" ? "m3u8" : (pathExtension.isEmpty ? "none" : "other")
+        let scope = AutomaticNavigationPolicy.isPrivateOrLocal(url) ? "local" : "public"
+
+        var fingerprintComponents = components
+        fingerprintComponents?.user = nil
+        fingerprintComponents?.password = nil
+        fingerprintComponents?.fragment = nil
+        fingerprintComponents?.percentEncodedQuery = nil
+        fingerprintComponents?.scheme = fingerprintComponents?.scheme?.lowercased()
+        fingerprintComponents?.host = fingerprintComponents?.host?.lowercased()
+        var hasher = Hasher()
+        hasher.combine(fingerprintComponents?.string ?? "\(scheme):\(pathDepth):\(extensionClass)")
+        let fingerprint = String(String(UInt(bitPattern: hasher.finalize()), radix: 16).suffix(12))
+        return "id=\(fingerprint) scheme=\(scheme) scope=\(scope) pathDepth=\(pathDepth) ext=\(extensionClass) queryItems=\(queryItems)"
+    }
+
+    static func mimeClass(_ mimeType: String?) -> String {
+        guard let mimeType = mimeType?.lowercased() else { return "unknown" }
+        if mimeType.contains("mpegurl") { return "hls" }
+        if mimeType.contains("html") { return "html" }
+        if mimeType.hasPrefix("image/") { return "image" }
+        if mimeType.contains("json") { return "json" }
+        if mimeType.hasPrefix("video/") || mimeType.hasPrefix("audio/") { return "media" }
+        return "other"
+    }
+
+    static func errorCode(_ error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        if let hlsError = error as? HLSError { return hlsErrorCode(hlsError) }
+        if let urlError = error as? URLError { return "URLError(\(urlError.code.rawValue))" }
+        let nsError = error as NSError
+        let knownDomains = [
+            "NSCocoaErrorDomain": "CocoaError",
+            "AVFoundationErrorDomain": "AVFoundationError",
+            "NSOSStatusErrorDomain": "OSStatusError",
+            "NSPOSIXErrorDomain": "POSIXError"
+        ]
+        return "\(knownDomains[nsError.domain] ?? "NSError")(\(nsError.code))"
+    }
+
+    static func errorSummary(_ error: Error) -> String {
+        guard let hlsError = error as? HLSError else { return errorCode(error) }
+        switch hlsError {
+        case .invalidMediaPayload(let stream, let number, let mimeType, let byteCount, _):
+            return "invalidMediaPayload stream=\(streamClass(stream)) segment=\(number) mime=\(mimeClass(mimeType)) bytes=\(byteCount)"
+        case .mediaOpenFailed(let stream, let number, let container, let byteCount, _):
+            let knownContainers = ["MPEG-TS", "fMP4", "AAC", "MP3", "AC-3", "E-AC-3"]
+            let containerClass = knownContainers.contains(container) ? container : "other"
+            return "mediaOpenFailed stream=\(streamClass(stream)) segment=\(number) container=\(containerClass) bytes=\(byteCount)"
+        default:
+            return hlsErrorCode(hlsError)
+        }
+    }
+
+    private static func hlsErrorCode(_ error: HLSError) -> String {
+        switch error {
+        case .invalidURL: return "invalidURL"
+        case .unsupportedScheme: return "unsupportedScheme"
+        case .network: return "network"
+        case .httpStatus(let status, _): return "httpStatus(\(status))"
+        case .noPlaylistFound: return "noPlaylistFound"
+        case .htmlTooLarge: return "htmlTooLarge"
+        case .invalidPlaylist: return "invalidPlaylist"
+        case .livePlaylistUnsupported: return "livePlaylistUnsupported"
+        case .drmUnsupported: return "drmUnsupported"
+        case .gapUnsupported: return "gapUnsupported"
+        case .invalidAESKey: return "invalidAESKey"
+        case .decryptionFailed: return "decryptionFailed"
+        case .byteRangeInvalid: return "byteRangeInvalid"
+        case .invalidMediaPayload: return "invalidMediaPayload"
+        case .mediaOpenFailed: return "mediaOpenFailed"
+        case .remuxFailed: return "remuxFailed"
+        case .noPlayableTracks: return "noPlayableTracks"
+        case .mp4ExportUnsupported: return "mp4ExportUnsupported"
+        case .exportFailed: return "exportFailed"
+        case .cancelled: return "cancelled"
+        }
+    }
+
+    private static func streamClass(_ stream: String) -> String {
+        switch stream.lowercased() {
+        case "main", "映像": return "main"
+        case "audio", "音声": return "audio"
+        default: return "other"
+        }
+    }
+}
+
 struct URLCandidates: Hashable, Sendable {
     let primary: URL
     let sameOriginQueryFallback: URL?

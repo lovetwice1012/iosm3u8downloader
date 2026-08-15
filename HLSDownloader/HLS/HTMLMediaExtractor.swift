@@ -44,10 +44,13 @@ enum HTMLMediaExtractor {
         var metadataTitle: String?
         var openGraphImage: String?
         var twitterImage: String?
-        var scriptBodies: [String] = []
+        var looseFragments: [String] = []
         var cursor = html.startIndex
 
         while let opening = html[cursor...].firstIndex(of: "<") {
+            if cursor < opening {
+                looseFragments.append(String(html[cursor..<opening]))
+            }
             if html[opening...].hasPrefix("<!--") {
                 if let end = html.range(
                     of: "-->",
@@ -72,20 +75,22 @@ enum HTMLMediaExtractor {
                 continue
             }
 
+            // Retain the original source order for broad fallback discovery in
+            // arbitrary attributes. An iframe with srcdoc is deliberately
+            // excluded here: its markup is parsed later as a child document.
+            if tag.name != "iframe" || tag.attributes["srcdoc"] == nil {
+                looseFragments.append(String(body))
+            }
+
             if tag.name == "script" || tag.name == "style" {
                 let closingPrefix = "</\(tag.name)"
                 guard let closingRange = html.range(
                     of: closingPrefix,
                     options: [.caseInsensitive],
                     range: cursor..<html.endIndex
-                ) else {
-                    if tag.name == "script" {
-                        scriptBodies.append(String(html[cursor...]))
-                    }
-                    break
-                }
+                ) else { break }
                 if tag.name == "script" {
-                    scriptBodies.append(String(html[cursor..<closingRange.lowerBound]))
+                    looseFragments.append(String(html[cursor..<closingRange.lowerBound]))
                 }
                 if let closingTagEnd = tagEnd(in: html, from: html.index(after: closingRange.lowerBound)) {
                     cursor = html.index(after: closingTagEnd)
@@ -187,21 +192,23 @@ enum HTMLMediaExtractor {
             }
         }
 
+        if cursor < html.endIndex {
+            looseFragments.append(String(html[cursor...]))
+        }
+
         var seenLoose = Set<String>()
         let structuredURLs = Set(media.map { normalizedReferenceKey($0.rawURL) })
-        for body in scriptBodies + [html] {
-            for rawURL in extractM3U8Strings(from: body) {
-                let key = normalizedReferenceKey(rawURL)
-                guard !structuredURLs.contains(key), seenLoose.insert(key).inserted else { continue }
-                media.append(
-                    ExtractedHTMLMedia(
-                        rawURL: rawURL,
-                        rawPosterURL: nil,
-                        title: nil,
-                        origin: .inlineScript
-                    )
+        for rawURL in extractM3U8Strings(from: looseFragments.joined(separator: "\n")) {
+            let key = normalizedReferenceKey(rawURL)
+            guard !structuredURLs.contains(key), seenLoose.insert(key).inserted else { continue }
+            media.append(
+                ExtractedHTMLMedia(
+                    rawURL: rawURL,
+                    rawPosterURL: nil,
+                    title: nil,
+                    origin: .inlineScript
                 )
-            }
+            )
         }
 
         return HTMLMediaExtraction(

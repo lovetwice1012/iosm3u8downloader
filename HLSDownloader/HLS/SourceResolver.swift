@@ -16,6 +16,7 @@ final class SourceResolver: Sendable {
 
     private let client: HTTPClient
     private let dynamicInspector: (any DynamicPageInspecting)?
+    private let diagnosticSink: DiagnosticSink?
     private let maximumHTMLBytes = 8 * 1_024 * 1_024
     private let maximumDocuments = 16
     private let maximumIframeDepth = 3
@@ -23,41 +24,58 @@ final class SourceResolver: Sendable {
     private let maximumCandidateReferences = 128
     private let maximumResults = 64
 
-    init(client: HTTPClient, dynamicInspector: (any DynamicPageInspecting)? = nil) {
+    init(
+        client: HTTPClient,
+        dynamicInspector: (any DynamicPageInspecting)? = nil,
+        diagnosticSink: DiagnosticSink? = nil
+    ) {
         self.client = client
         self.dynamicInspector = dynamicInspector
+        self.diagnosticSink = diagnosticSink
     }
 
     func discover(input: String) async throws -> HLSDiscoveryResult {
         let inputURL = try URIResolver.normalizeInput(input)
+        log("discovery", "start \(DiagnosticPrivacy.urlSummary(inputURL))")
         let payload: HTTPPayload
         do {
             payload = try await client.fetch(inputURL)
+            log(
+                "network",
+                "root response status=\(payload.statusCode) mime=\(DiagnosticPrivacy.mimeClass(payload.mimeType)) bytes=\(payload.data.count) redirected=\(payload.effectiveURL != inputURL) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+            )
         } catch {
             if error is CancellationError { throw HLSError.cancelled }
             if let hlsError = error as? HLSError, case .cancelled = hlsError {
                 throw hlsError
             }
+            log("network", "root failed error=\(DiagnosticPrivacy.errorCode(error)); trying WebKit fallback")
             let originalError = error
             let candidates = try await dynamicallyDiscoveredCandidates(rootURL: inputURL)
             if !candidates.isEmpty {
+                log("discovery", "finish dynamicOnly=true candidates=\(candidates.count)")
                 return HLSDiscoveryResult(candidates: candidates, isDirectPlaylist: false)
             }
+            log("discovery", "finish failed error=\(DiagnosticPrivacy.errorCode(originalError))")
             throw originalError
         }
         guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
             from: inputURL,
             to: payload.effectiveURL
         ) else {
+            log("security", "blocked root redirect to local/private target")
             throw HLSError.network("公開URLからローカルネットワークへのリダイレクトを拒否しました")
         }
         guard let text = decodeText(payload.data) else {
+            log("discovery", "root text decode failed; trying WebKit fallback")
             let candidates = try await dynamicallyDiscoveredCandidates(rootURL: payload.effectiveURL)
             guard !candidates.isEmpty else { throw HLSError.noPlaylistFound }
+            log("discovery", "finish dynamicOnly=true candidates=\(candidates.count)")
             return HLSDiscoveryResult(candidates: candidates, isDirectPlaylist: false)
         }
 
         if PlaylistParser.isPlaylist(text) {
+            log("discovery", "direct playlist accepted")
             let document = PlaylistDocument(
                 text: text,
                 effectiveURL: payload.effectiveURL,
@@ -85,8 +103,10 @@ final class SourceResolver: Sendable {
         }
 
         guard payload.data.count <= maximumHTMLBytes else {
+            log("discovery", "root HTML exceeded byte limit; trying WebKit fallback")
             let candidates = try await dynamicallyDiscoveredCandidates(rootURL: payload.effectiveURL)
             guard !candidates.isEmpty else { throw HLSError.htmlTooLarge }
+            log("discovery", "finish dynamicOnly=true candidates=\(candidates.count)")
             return HLSDiscoveryResult(candidates: candidates, isDirectPlaylist: false)
         }
         let candidates = try await discoverInHTML(
@@ -95,6 +115,7 @@ final class SourceResolver: Sendable {
             rootReferer: inputURL
         )
         guard !candidates.isEmpty else { throw HLSError.noPlaylistFound }
+        log("discovery", "finish direct=false candidates=\(candidates.count)")
         return HLSDiscoveryResult(candidates: candidates, isDirectPlaylist: false)
     }
 
@@ -109,17 +130,24 @@ final class SourceResolver: Sendable {
         var lastError: Error = HLSError.invalidPlaylist("リンク先がm3u8ではありません")
         for candidate in candidates.all {
             do {
+                log("playlist", "validate \(DiagnosticPrivacy.urlSummary(candidate))")
                 let payload = try await client.fetch(candidate, referer: referer)
                 guard let text = decodeText(payload.data), PlaylistParser.isPlaylist(text) else {
                     throw HLSError.invalidPlaylist("リンク先がm3u8ではありません")
                 }
+                log(
+                    "playlist",
+                    "accepted status=\(payload.statusCode) bytes=\(payload.data.count) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
+                )
                 return PlaylistDocument(text: text, effectiveURL: payload.effectiveURL, referer: referer)
             } catch is CancellationError {
                 throw HLSError.cancelled
             } catch let error as HLSError {
                 if case .cancelled = error { throw error }
+                log("playlist", "candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
                 lastError = error
             } catch {
+                log("playlist", "candidate failed error=\(DiagnosticPrivacy.errorCode(error))")
                 lastError = error
             }
         }
@@ -132,6 +160,10 @@ final class SourceResolver: Sendable {
         rootReferer: URL?
     ) async throws -> [HLSCandidate] {
         async let dynamicInspection = inspectDynamically(rootURL)
+        log(
+            "discovery",
+            "HTML scan start maxDocuments=\(maximumDocuments) maxDepth=\(maximumIframeDepth) maxResults=\(maximumResults)"
+        )
 
         var queue = [
             DocumentWork(
@@ -170,17 +202,27 @@ final class SourceResolver: Sendable {
                 processedDocuments += 1
 
                 do {
+                    log(
+                        "iframe",
+                        "fetch depth=\(work.iframeDepth) \(DiagnosticPrivacy.urlSummary(requestedURL))"
+                    )
                     let payload = try await client.fetch(requestedURL, referer: work.referer)
                     guard AutomaticNavigationPolicy.isAllowedNativeFrameNavigation(
                         from: rootURL,
                         to: payload.effectiveURL
-                    ) else { continue }
+                    ) else {
+                        log("iframe", "blocked by navigation policy depth=\(work.iframeDepth)")
+                        continue
+                    }
                     let effectiveKey = canonicalURLKey(payload.effectiveURL)
                     if effectiveKey != requestedKey,
                        !visitedRemoteDocuments.insert(effectiveKey).inserted {
                         continue
                     }
-                    guard let fetchedText = decodeText(payload.data) else { continue }
+                    guard let fetchedText = decodeText(payload.data) else {
+                        log("iframe", "decode failed depth=\(work.iframeDepth) bytes=\(payload.data.count)")
+                        continue
+                    }
                     if PlaylistParser.isPlaylist(fetchedText) {
                         let document = PlaylistDocument(
                             text: fetchedText,
@@ -204,20 +246,29 @@ final class SourceResolver: Sendable {
                         )
                         continue
                     }
-                    guard payload.data.count <= maximumHTMLBytes else { continue }
+                    guard payload.data.count <= maximumHTMLBytes else {
+                        log("iframe", "HTML byte limit exceeded depth=\(work.iframeDepth) bytes=\(payload.data.count)")
+                        continue
+                    }
                     html = fetchedText
                     documentURL = payload.effectiveURL
                 } catch is CancellationError {
                     throw HLSError.cancelled
                 } catch let error as HLSError {
                     if case .cancelled = error { throw error }
+                    log("iframe", "fetch failed depth=\(work.iframeDepth) error=\(DiagnosticPrivacy.errorCode(error))")
                     continue
                 } catch {
+                    log("iframe", "fetch failed depth=\(work.iframeDepth) error=\(DiagnosticPrivacy.errorCode(error))")
                     continue
                 }
             }
 
             let extraction = HTMLMediaExtractor.extract(from: html)
+            log(
+                "discovery",
+                "document depth=\(work.iframeDepth) media=\(extraction.media.count) frames=\(extraction.frames.count) base=\(extraction.baseHref != nil) poster=\(extraction.rawThumbnailURL != nil)"
+            )
             let documentBaseURL = resolvedAutomaticURL(
                 extraction.baseHref,
                 relativeTo: documentURL
@@ -268,7 +319,18 @@ final class SourceResolver: Sendable {
                 )
             }
 
-            guard work.iframeDepth < maximumIframeDepth else { continue }
+            guard work.iframeDepth < maximumIframeDepth else {
+                if !extraction.frames.isEmpty {
+                    log("iframe", "depth limit reached depth=\(work.iframeDepth) droppedFrames=\(extraction.frames.count)")
+                }
+                continue
+            }
+            if extraction.frames.count > maximumFramesPerDocument {
+                log(
+                    "iframe",
+                    "per-document frame limit reached total=\(extraction.frames.count) accepted=\(maximumFramesPerDocument)"
+                )
+            }
             for frame in extraction.frames.prefix(maximumFramesPerDocument) {
                 let inheritedTitle = limitedTitle(frame.title ?? pageTitle)
                 if let sourceDocument = frame.sourceDocument {
@@ -284,25 +346,32 @@ final class SourceResolver: Sendable {
                 } else if let frameURL = resolvedAutomaticURL(
                     frame.rawURL,
                     relativeTo: documentBaseURL
-                ), AutomaticNavigationPolicy.isAllowedNativeFrameNavigation(
-                    from: rootURL,
-                    to: frameURL
                 ) {
-                    queue.append(
-                        DocumentWork(
-                            source: .remote(frameURL),
-                            referer: documentURL,
-                            iframeDepth: work.iframeDepth + 1,
-                            inheritedTitle: inheritedTitle,
-                            inheritedThumbnailURL: pageThumbnailURL
+                    if AutomaticNavigationPolicy.isAllowedNativeFrameNavigation(
+                        from: rootURL,
+                        to: frameURL
+                    ) {
+                        queue.append(
+                            DocumentWork(
+                                source: .remote(frameURL),
+                                referer: documentURL,
+                                iframeDepth: work.iframeDepth + 1,
+                                inheritedTitle: inheritedTitle,
+                                inheritedThumbnailURL: pageThumbnailURL
+                            )
                         )
-                    )
+                    } else {
+                        log("iframe", "automatic fetch blocked by origin/private-network policy")
+                    }
+                } else if frame.rawURL != nil {
+                    log("iframe", "invalid or unsupported frame URL")
                 }
             }
         }
 
         let dynamic = await dynamicInspection
         try Task.checkCancellation()
+        log("webkit", "inspection returned references=\(dynamic.media.count) cookies=\(dynamic.cookies.count)")
         client.storeCookies(dynamic.cookies)
 
         appendDynamicCandidates(
@@ -313,12 +382,23 @@ final class SourceResolver: Sendable {
             results: &results
         )
 
+        log(
+            "discovery",
+            "HTML scan finish documents=\(processedDocuments) queued=\(queue.count) discovered=\(discoveredCandidates.count) results=\(results.count) documentLimit=\(processedDocuments >= maximumDocuments) resultLimit=\(results.count >= maximumResults)"
+        )
         return results
     }
 
     private func inspectDynamically(_ url: URL) async -> DynamicPageInspection {
-        guard let dynamicInspector else { return .empty }
-        return await dynamicInspector.inspect(url: url, seedCookies: client.cookies(for: url))
+        guard let dynamicInspector else {
+            log("webkit", "dynamic inspection unavailable")
+            return .empty
+        }
+        let seedCookies = client.cookies(for: url)
+        log("webkit", "inspection start seedCookies=\(seedCookies.count) \(DiagnosticPrivacy.urlSummary(url))")
+        let result = await dynamicInspector.inspect(url: url, seedCookies: seedCookies)
+        log("webkit", "inspection finish references=\(result.media.count) cookies=\(result.cookies.count)")
+        return result
     }
 
     private func dynamicallyDiscoveredCandidates(rootURL: URL) async throws -> [HLSCandidate] {
@@ -406,6 +486,10 @@ final class SourceResolver: Sendable {
                 iframeDepth: min(existing.iframeDepth, iframeDepth),
                 origin: existing.origin
             )
+            log(
+                "candidate",
+                "merged origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(document?.effectiveURL ?? request.primary))"
+            )
             return
         }
         results.append(
@@ -421,6 +505,14 @@ final class SourceResolver: Sendable {
                 origin: origin
             )
         )
+        log(
+            "candidate",
+            "added origin=\(origin.rawValue) depth=\(iframeDepth) thumbnail=\(thumbnailURL != nil) \(DiagnosticPrivacy.urlSummary(document?.effectiveURL ?? request.primary))"
+        )
+    }
+
+    private func log(_ category: String, _ message: String) {
+        diagnosticSink?(DiagnosticEvent(category: category, message: message))
     }
 
     private func decodeText(_ data: Data) -> String? {
