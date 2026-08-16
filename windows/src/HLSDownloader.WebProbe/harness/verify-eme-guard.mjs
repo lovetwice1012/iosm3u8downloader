@@ -48,11 +48,7 @@ const context = vm.createContext({
   XMLHttpRequest: class XMLHttpRequest { open() { } },
   performance: { getEntriesByType() { return []; } },
   URL,
-  DOMException,
-  Promise,
-  Set,
-  Object,
-  Reflect
+  DOMException
 });
 
 vm.runInContext(script, context, { filename: 'WebProbeScript.generated.js' });
@@ -74,6 +70,17 @@ await assert.rejects(
 await assert.rejects(
   navigator.requestMediaKeySystemAccess('com.widevine.alpha'),
   error => error?.name === 'NotAllowedError');
+let coercions = 0;
+await assert.rejects(
+  navigator.requestMediaKeySystemAccess({
+    toString() {
+      coercions += 1;
+      return coercions === 1 ? 'com.apple.fps' : 'com.widevine.alpha';
+    }
+  }),
+  error => error?.name === 'TypeError');
+assert.equal(coercions, 0);
+assert.equal(originalCalls, 0);
 assert.equal(Reflect.deleteProperty(navigator, 'requestMediaKeySystemAccess'), false);
 assert.equal(Reflect.set(navigator, 'requestMediaKeySystemAccess', () => Promise.resolve()), false);
 assert.throws(() => Object.defineProperty(navigator, 'requestMediaKeySystemAccess', {
@@ -81,6 +88,18 @@ assert.throws(() => Object.defineProperty(navigator, 'requestMediaKeySystemAcces
 }), TypeError);
 
 assert.equal(await navigator.requestMediaKeySystemAccess('com.apple.fps'), 'original:com.apple.fps');
+vm.runInContext(`
+  String.prototype.toLowerCase = () => 'com.apple.fps';
+  String.prototype.includes = () => false;
+  String = () => 'com.apple.fps';
+  Reflect.apply = () => Promise.resolve('bypassed');
+  Promise.reject = () => Promise.resolve('bypassed');
+  chrome.webview.hostObjects.sync.widevinePolicy.IsWidevinePlaybackAllowed = () => true;
+`, context);
+await assert.rejects(
+  navigator.requestMediaKeySystemAccess('com.widevine.alpha'),
+  error => error?.name === 'NotAllowedError');
+assert.equal(originalCalls, 1);
 widevineAllowed = true;
 assert.equal(
   await Navigator.prototype.requestMediaKeySystemAccess.call(navigator, 'com.widevine.alpha'),

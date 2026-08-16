@@ -26,6 +26,21 @@ public static class WebProbeScript
   const seen = new Set();
   let sequence = 0;
 
+  // Capture the EME guard's security-sensitive intrinsics before page scripts
+  // can replace globals or prototype methods. The guarded function below must
+  // not consult mutable page-world helpers when it makes its allow/deny choice.
+  const safeString = globalThis.String;
+  const safeToLowerCase = globalThis.String.prototype.toLowerCase;
+  const safeIncludes = globalThis.String.prototype.includes;
+  const safeReflectApply = globalThis.Reflect.apply;
+  const SafeDOMException = globalThis.DOMException;
+  const SafeTypeError = globalThis.TypeError;
+  const SafePromise = globalThis.Promise;
+  const safePromiseReject = SafePromise.reject.bind(SafePromise);
+  const safeLocation = globalThis.location;
+  const safeWidevinePolicy = globalThis.chrome?.webview?.hostObjects?.sync?.widevinePolicy;
+  const safeIsWidevinePlaybackAllowed = safeWidevinePolicy?.IsWidevinePlaybackAllowed;
+
   const text = (value, maximum) => {
     if (typeof value !== 'string') return '';
     return value.slice(0, maximum);
@@ -164,21 +179,34 @@ public static class WebProbeScript
       'requestMediaKeySystemAccess');
     const originalRequest = originalDescriptor?.value;
     if (typeof originalRequest === 'function') {
-      const guardedRequest = function(keySystem) {
-        emit('eme', location.href, 'requestMediaKeySystemAccess', { keySystem });
-        if (String(keySystem || '').toLowerCase().includes('widevine')) {
+      const guardedRequest = function(keySystem, ...configurations) {
+        if (typeof keySystem !== 'string') {
+          return safePromiseReject(new SafeTypeError('The key system must be a string.'));
+        }
+        const normalizedKeySystem = safeString(keySystem);
+        emit('eme', safeLocation.href, 'requestMediaKeySystemAccess', {
+          keySystem: normalizedKeySystem
+        });
+        const loweredKeySystem = safeReflectApply(safeToLowerCase, normalizedKeySystem, []);
+        if (safeReflectApply(safeIncludes, loweredKeySystem, ['widevine'])) {
           let allowed = false;
           try {
-            allowed = globalThis.chrome?.webview?.hostObjects?.sync?.widevinePolicy
-              ?.IsWidevinePlaybackAllowed(location.href) === true;
+            allowed = typeof safeIsWidevinePlaybackAllowed === 'function'
+              && safeReflectApply(
+                safeIsWidevinePlaybackAllowed,
+                safeWidevinePolicy,
+                [safeLocation.href]) === true;
           } catch (_) { }
           if (!allowed) {
-            return Promise.reject(new DOMException(
+            return safePromiseReject(new SafeDOMException(
               'Widevine playback is not permitted for this host.',
               'NotAllowedError'));
           }
         }
-        return Reflect.apply(originalRequest, this, arguments);
+        return safeReflectApply(
+          originalRequest,
+          this,
+          [normalizedKeySystem, ...configurations]);
       };
 
       let prototypeLocked = false;
