@@ -41,4 +41,18 @@
         DestinationFiles="@(_BackgroundWorkerFiles->'$(OutDir)worker\%(Filename)%(Extension)')"
         SkipUnchangedFiles="true" />
   </Target>
+
+  <!-- The unpackaged self-contained publish target does not copy the compiled
+       WinUI dictionaries/views on every SDK combination. Keep them beside the
+       executable so XAML initialization works in the portable artifact. -->
+  <Target Name="CopyWinUIResourcesToPublish" AfterTargets="Publish" Condition="'$(PublishDir)' != ''">
+    <ItemGroup>
+      <_WinUIPublishResource Include="$(TargetDir)*.xbf" />
+      <_WinUIPublishResource Include="$(TargetDir)$(AssemblyName).pri" />
+    </ItemGroup>
+    <Copy
+        SourceFiles="@(_WinUIPublishResource)"
+        DestinationFolder="$(PublishDir)"
+        SkipUnchangedFiles="true" />
+  </Target>
 </Project>

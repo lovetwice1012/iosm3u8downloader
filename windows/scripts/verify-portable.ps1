@@ -7,6 +7,11 @@ $ErrorActionPreference = 'Stop'
 $publish = (Resolve-Path -LiteralPath $PublishDirectory).Path
 $requiredFiles = @(
     'HLSDownloader.Windows.exe',
+    'HLSDownloader.Windows.pri',
+    'App.xbf',
+    'MainWindow.xbf',
+    'MediaPlaybackWindow.xbf',
+    'PlaybackProbeWindow.xbf',
     'worker\HLSDownloader.Worker.exe',
     'tools\ffmpeg\ffmpeg.exe',
     'tools\ffmpeg\ffprobe.exe',
