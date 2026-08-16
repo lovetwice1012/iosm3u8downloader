@@ -1379,7 +1379,9 @@ final class SourceDiscoveryTests: XCTestCase {
     }
 
     func testPersistentCookieSnapshotPreservesScopeAndExpiry() throws {
-        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let now = Date()
+        let futureExpiration = now.addingTimeInterval(60)
+        let expiredExpiration = now.addingTimeInterval(-60)
         func makeCookie(
             name: String,
             domain: String,
@@ -1404,7 +1406,7 @@ final class SourceDiscoveryTests: XCTestCase {
                 domain: "media.example.com",
                 path: "/video",
                 secure: true,
-                expires: now.addingTimeInterval(60)
+                expires: futureExpiration
             ),
             makeCookie(name: "domain", domain: ".example.com", path: "/video"),
             makeCookie(name: "hostOnlyParent", domain: "example.com", path: "/video"),
@@ -1415,7 +1417,7 @@ final class SourceDiscoveryTests: XCTestCase {
                 name: "expired",
                 domain: "media.example.com",
                 path: "/video",
-                expires: now.addingTimeInterval(-1)
+                expires: expiredExpiration
             ),
             makeCookie(name: "unobserved", domain: "unrelated.example", path: "/")
         ]
@@ -1439,7 +1441,11 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(retained.domain, "media.example.com")
         XCTAssertEqual(retained.path, "/video")
         XCTAssertTrue(retained.isSecure)
-        XCTAssertEqual(retained.expiresDate, now.addingTimeInterval(60))
+        XCTAssertEqual(
+            try XCTUnwrap(retained.expiresDate).timeIntervalSince1970,
+            futureExpiration.timeIntervalSince1970,
+            accuracy: 1
+        )
 
         let httpSnapshot = HTTPClient.snapshotCookies(
             cookies,
