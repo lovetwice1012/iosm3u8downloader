@@ -23,8 +23,17 @@ foreach ($required in $requiredFiles) {
     }
 }
 
-$ffmpegVersion = & (Join-Path $publish 'tools\ffmpeg\ffmpeg.exe') -version | Select-Object -First 1
-$ffprobeVersion = & (Join-Path $publish 'tools\ffmpeg\ffprobe.exe') -version | Select-Object -First 1
+$ffmpegVersionOutput = @(& (Join-Path $publish 'tools\ffmpeg\ffmpeg.exe') -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffmpegVersionOutput.Count -eq 0) {
+    throw 'Bundled ffmpeg could not be executed.'
+}
+$ffmpegVersion = [string]$ffmpegVersionOutput[0]
+
+$ffprobeVersionOutput = @(& (Join-Path $publish 'tools\ffmpeg\ffprobe.exe') -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffprobeVersionOutput.Count -eq 0) {
+    throw 'Bundled ffprobe could not be executed.'
+}
+$ffprobeVersion = [string]$ffprobeVersionOutput[0]
 if ($ffmpegVersion -notmatch '^ffmpeg version' -or $ffprobeVersion -notmatch '^ffprobe version') {
     throw 'Bundled FFmpeg tools could not be executed.'
 }

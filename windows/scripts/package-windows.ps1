@@ -74,8 +74,17 @@ foreach ($required in $requiredFiles) {
     }
 }
 
-& (Join-Path $toolDirectory 'ffmpeg.exe') -version | Select-Object -First 1
-& (Join-Path $toolDirectory 'ffprobe.exe') -version | Select-Object -First 1
+$ffmpegVersionOutput = @(& (Join-Path $toolDirectory 'ffmpeg.exe') -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffmpegVersionOutput.Count -eq 0) {
+    throw 'The packaged ffmpeg executable could not be started.'
+}
+Write-Host ([string]$ffmpegVersionOutput[0])
+
+$ffprobeVersionOutput = @(& (Join-Path $toolDirectory 'ffprobe.exe') -version 2>&1)
+if ($LASTEXITCODE -ne 0 -or $ffprobeVersionOutput.Count -eq 0) {
+    throw 'The packaged ffprobe executable could not be started.'
+}
+Write-Host ([string]$ffprobeVersionOutput[0])
 
 $zipPath = Join-Path $artifact 'HLSDownloader-Windows-win-x64.zip'
 if (Test-Path -LiteralPath $zipPath) {
