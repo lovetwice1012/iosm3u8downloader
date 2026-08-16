@@ -30,3 +30,30 @@ public static class WidevineDownloadPolicy
         return DownloadableHosts.Contains(uri.IdnHost);
     }
 }
+
+/// <summary>
+/// Applies the shared exact-host Widevine gate before the ordinary public
+/// network policy. BoundedHttpClient calls this policy before every request,
+/// including each redirect hop, so a rejected redirect is never transmitted.
+/// </summary>
+public sealed class DownloadableWidevineUriPolicy : IOutboundUriPolicy
+{
+    private readonly IOutboundUriPolicy _networkPolicy;
+
+    public DownloadableWidevineUriPolicy(IOutboundUriPolicy? networkPolicy = null)
+    {
+        _networkPolicy = networkPolicy ?? new PublicNetworkUriPolicy();
+    }
+
+    public async ValueTask<bool> IsAllowedAsync(
+        Uri uri,
+        CancellationToken cancellationToken = default)
+    {
+        if (!WidevineDownloadPolicy.IsDownloadableWidevineDomain(uri))
+        {
+            return false;
+        }
+
+        return await _networkPolicy.IsAllowedAsync(uri, cancellationToken).ConfigureAwait(false);
+    }
+}

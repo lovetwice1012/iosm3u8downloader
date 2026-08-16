@@ -7,6 +7,14 @@ namespace HLSDownloader.Core.Tests;
 public sealed class BoundedHttpClientTests
 {
     [Fact]
+    public void CookiePersistenceCanBeDisabledForStatelessWorkers()
+    {
+        var options = new BoundedHttpOptions(UseCookies: false);
+        Assert.False(options.UseCookies);
+        Assert.True(new BoundedHttpOptions().UseCookies);
+    }
+
+    [Fact]
     public async Task FollowsBoundedRedirectAndReturnsEffectiveUri()
     {
         var handler = new StubHandler(request => request.RequestUri!.Host == "a.example"
@@ -72,6 +80,22 @@ public sealed class BoundedHttpClientTests
         using var client = new BoundedHttpClient(handler, uriPolicy: policy);
         await Assert.ThrowsAsync<UnsafeNetworkTargetException>(() => client.FetchAsync(new Uri("https://public.example/start")));
         Assert.Contains(policy.Seen, x => x.Host == "private.example");
+    }
+
+    [Fact]
+    public async Task WidevinePolicyRejectsCrossHostRedirectBeforeSecondRequest()
+    {
+        var handler = new StubHandler(_ => Response(
+            HttpStatusCode.Redirect,
+            location: "https://example.com/stolen.mpd"));
+        using var client = new BoundedHttpClient(
+            handler,
+            uriPolicy: new DownloadableWidevineUriPolicy(new AlwaysAllowPolicy()));
+
+        await Assert.ThrowsAsync<UnsafeNetworkTargetException>(() =>
+            client.FetchAsync(new Uri("https://widevine.sprink.cloud/video/manifest.mpd")));
+
+        Assert.Single(handler.Referrers);
     }
 
     private static HttpResponseMessage Response(

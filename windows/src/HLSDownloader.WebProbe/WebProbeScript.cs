@@ -47,6 +47,7 @@ public static class WebProbeScript
   let sequence = 0;
   let allowedWidevineManifestObserved = false;
   let disallowedWidevineManifestObserved = false;
+  let widevineAccessGranted = false;
 
   // Capture the EME guard's security-sensitive intrinsics before page scripts
   // can replace globals or prototype methods. The guarded function below must
@@ -72,6 +73,8 @@ public static class WebProbeScript
   const safeURLPasswordGetter = safeGetOwnPropertyDescriptor(SafeURL.prototype, 'password')?.get;
   const safeURLHostnameGetter = safeGetOwnPropertyDescriptor(SafeURL.prototype, 'hostname')?.get;
   const safeURLPathnameGetter = safeGetOwnPropertyDescriptor(SafeURL.prototype, 'pathname')?.get;
+  const safeURLHrefGetter = safeGetOwnPropertyDescriptor(SafeURL.prototype, 'href')?.get;
+  const safeURLHashSetter = safeGetOwnPropertyDescriptor(SafeURL.prototype, 'hash')?.set;
   const SafeResponse = globalThis.Response;
   const safeResponseOkGetter = SafeResponse
     ? safeGetOwnPropertyDescriptor(SafeResponse.prototype, 'ok')?.get
@@ -92,6 +95,16 @@ public static class WebProbeScript
     : undefined;
   const safeXHRGetResponseHeader = SafeXHR?.prototype?.getResponseHeader;
   const safeEventTargetAddEventListener = globalThis.EventTarget?.prototype?.addEventListener;
+  const SafeMediaKeySession = globalThis.MediaKeySession;
+  const mediaKeySessionPrototype = SafeMediaKeySession?.prototype;
+  const originalGenerateRequestDescriptor = mediaKeySessionPrototype
+    ? safeGetOwnPropertyDescriptor(mediaKeySessionPrototype, 'generateRequest')
+    : undefined;
+  const originalUpdateDescriptor = mediaKeySessionPrototype
+    ? safeGetOwnPropertyDescriptor(mediaKeySessionPrototype, 'update')
+    : undefined;
+  const originalGenerateRequest = originalGenerateRequestDescriptor?.value;
+  const originalUpdate = originalUpdateDescriptor?.value;
 
   const lower = value => safeReflectApply(safeToLowerCase, safeString(value ?? ''), []);
 
@@ -171,11 +184,19 @@ public static class WebProbeScript
 
   const absoluteHttpUrl = value => {
     try {
-      const url = new URL(String(value || ''), document.baseURI);
-      if (url.protocol !== 'https:' && url.protocol !== 'http:') return '';
-      if (url.username || url.password || !url.hostname) return '';
-      url.hash = '';
-      return url.href.slice(0, 8192);
+      const url = new SafeURL(safeString(value || ''), safeString(document.baseURI || ''));
+      const protocol = lower(readURLPart(safeURLProtocolGetter, url));
+      const username = readURLPart(safeURLUsernameGetter, url);
+      const password = readURLPart(safeURLPasswordGetter, url);
+      const hostname = readURLPart(safeURLHostnameGetter, url);
+      if ((protocol !== 'https:' && protocol !== 'http:')
+          || username
+          || password
+          || !hostname) return '';
+      if (typeof safeURLHashSetter === 'function') {
+        safeReflectApply(safeURLHashSetter, url, ['']);
+      }
+      return safeString(readURLPart(safeURLHrefGetter, url)).slice(0, 8192);
     } catch (_) {
       return '';
     }
@@ -199,10 +220,15 @@ public static class WebProbeScript
       disallowedWidevineManifestObserved = true;
       allowedWidevineManifestObserved = false;
     }
-    if (kind !== 'media' && kind !== 'eme' && !looksLikeManifest(url, extra.mime)) return;
-    const key = `${kind}\n${url}\n${String(extra.keySystem || '')}`;
-    if (seen.has(key)) return;
-    seen.add(key);
+    if (kind !== 'media'
+        && kind !== 'eme'
+        && kind !== 'eme-lifecycle'
+        && !looksLikeManifest(url, extra.mime)) return;
+    if (kind !== 'eme-lifecycle') {
+      const key = `${kind}\n${url}\n${String(extra.keySystem || '')}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
     sequence += 1;
     try {
       globalThis.chrome?.webview?.postMessage({
@@ -217,6 +243,7 @@ public static class WebProbeScript
         thumbnail: absoluteHttpUrl(extra.thumbnail),
         title: text(extra.title || document.title, 512),
         keySystem: text(extra.keySystem, 160),
+        phase: text(extra.phase, 80),
         pageUrl: absoluteHttpUrl(location.href)
       });
     } catch (_) { }
@@ -347,10 +374,17 @@ public static class WebProbeScript
               'NotAllowedError'));
           }
         }
-        return safeReflectApply(
+        const accessPromise = safeReflectApply(
           originalRequest,
           this,
           [normalizedKeySystem, ...configurations]);
+        if (!safeReflectApply(safeIncludes, loweredKeySystem, ['widevine'])) {
+          return accessPromise;
+        }
+        return safeReflectApply(safePromiseThen, accessPromise, [access => {
+          widevineAccessGranted = true;
+          return access;
+        }]);
       };
 
       let prototypeLocked = false;
@@ -398,6 +432,58 @@ public static class WebProbeScript
       keySystem: 'com.widevine.alpha'
     });
     try { globalThis.stop?.(); } catch (_) { }
+  }
+
+  try {
+    if (mediaKeySessionPrototype
+        && typeof originalGenerateRequest === 'function'
+        && typeof originalUpdate === 'function') {
+      const canSignalWidevineLifecycle = () => widevineAccessGranted
+        && isDownloadableWidevineURL(currentFrameURL())
+        && allowedWidevineManifestObserved
+        && !disallowedWidevineManifestObserved;
+      const signalLifecycle = phase => emit(
+        'eme-lifecycle',
+        currentFrameURL(),
+        'media-key-session',
+        { keySystem: 'com.widevine.alpha', phase });
+
+      const observedGenerateRequest = function() {
+        const shouldSignal = canSignalWidevineLifecycle();
+        if (shouldSignal) signalLifecycle('generate-request-started');
+        const operation = safeReflectApply(originalGenerateRequest, this, arguments);
+        if (!shouldSignal) return operation;
+        return safeReflectApply(safePromiseThen, operation, [value => {
+          signalLifecycle('generate-request-succeeded');
+          return value;
+        }]);
+      };
+
+      const observedUpdate = function() {
+        const shouldSignal = canSignalWidevineLifecycle();
+        const operation = safeReflectApply(originalUpdate, this, arguments);
+        if (!shouldSignal) return operation;
+        return safeReflectApply(safePromiseThen, operation, [value => {
+          signalLifecycle('update-succeeded');
+          return value;
+        }]);
+      };
+
+      Object.defineProperty(mediaKeySessionPrototype, 'generateRequest', {
+        value: observedGenerateRequest,
+        enumerable: originalGenerateRequestDescriptor?.enumerable === true,
+        configurable: originalGenerateRequestDescriptor?.configurable === true,
+        writable: originalGenerateRequestDescriptor?.writable === true
+      });
+      Object.defineProperty(mediaKeySessionPrototype, 'update', {
+        value: observedUpdate,
+        enumerable: originalUpdateDescriptor?.enumerable === true,
+        configurable: originalUpdateDescriptor?.configurable === true,
+        writable: originalUpdateDescriptor?.writable === true
+      });
+    }
+  } catch (_) {
+    // Lifecycle hints are optional and never weaken the native allowlist gate.
   }
 })();
 """;

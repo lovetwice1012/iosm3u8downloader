@@ -1,7 +1,6 @@
 using HLSDownloader.Media;
 using HLSDownloader.Worker;
 using HLSDownloader.Core;
-using System.Net;
 
 string applicationData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
 string ledgerPath = GetOption(args, "--ledger") ?? Path.Combine(applicationData, "HLSDownloader", "worker", "jobs.json");
@@ -41,13 +40,14 @@ void Log(string message)
 var runner = new ExternalToolRunner(Log);
 var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
 var composer = new FFmpegMediaComposer(locator.ResolveFFmpeg(), probe, runner);
-var cookies = new CookieContainer();
 using var discoveryHttp = new BoundedHttpClient(
-    new BoundedHttpOptions(MaximumResponseBytes: 8 * 1024 * 1024),
-    cookies: cookies);
+    new BoundedHttpOptions(
+        MaximumResponseBytes: 8 * 1024 * 1024,
+        UseCookies: false));
 using var segmentHttp = new BoundedHttpClient(
-    new BoundedHttpOptions(MaximumResponseBytes: 48 * 1024 * 1024),
-    cookies: cookies);
+    new BoundedHttpOptions(
+        MaximumResponseBytes: 48 * 1024 * 1024,
+        UseCookies: false));
 var hlsCoordinator = new HlsDownloadCoordinator(
     new HlsDownloadPlanBuilder(discoveryHttp),
     segmentHttp,

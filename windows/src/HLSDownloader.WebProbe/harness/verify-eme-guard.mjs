@@ -23,6 +23,16 @@ class Navigator {
   }
 }
 
+class MediaKeySession {
+  generateRequest() {
+    return Promise.resolve(undefined);
+  }
+
+  update() {
+    return Promise.resolve(undefined);
+  }
+}
+
 const navigator = new Navigator();
 const messages = [];
 const document = {
@@ -63,6 +73,7 @@ const location = new HarnessLocation('https://example.com/player');
 const context = vm.createContext({
   Navigator,
   navigator,
+  MediaKeySession,
   document,
   location,
   chrome: {
@@ -148,6 +159,27 @@ assert.equal(
   await Navigator.prototype.requestMediaKeySystemAccess.call(navigator, 'com.widevine.alpha'),
   'original:com.widevine.alpha');
 assert.equal(originalCalls, 2);
+
+const mediaKeySession = new MediaKeySession();
+await mediaKeySession.generateRequest('cenc', new Uint8Array([1, 2, 3, 4]));
+await context.fetch('https://widevine.sprink.cloud/license?token=not-for-the-bridge', {
+  method: 'POST',
+  body: new Uint8Array([5, 6, 7, 8])
+});
+await mediaKeySession.update(new Uint8Array([9, 10, 11, 12]));
+
+const lifecycleMessages = messages.filter(message => message.kind === 'eme-lifecycle');
+assert.deepEqual(
+  lifecycleMessages.map(message => message.phase),
+  ['generate-request-started', 'generate-request-succeeded', 'update-succeeded']);
+for (const message of lifecycleMessages) {
+  assert.equal(message.keySystem, 'com.widevine.alpha');
+  assert.equal(message.url, 'https://widevine.sprink.cloud/player');
+  assert.equal('body' in message, false);
+  assert.equal('headers' in message, false);
+  assert.equal('initData' in message, false);
+  assert.equal('response' in message, false);
+}
 
 await context.fetch('https://example.com/video/manifest.mpd');
 await assert.rejects(

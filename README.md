@@ -4,6 +4,8 @@ URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の
 
 Windows版はiOSコードを残したまま [`windows`](windows/README.md) 以下へ分離しています。WinUI 3で同じURL解析・再生解析・候補一覧・HLS保存・MP4/WAV出力・診断ログを提供し、Windows用のportable ZIPビルドとテストは別々のGitHub Actionsで実行します。Android版は `android` ブランチで管理しています。
 
+iOS・Android・Windowsの再生解析ブラウザーは、それぞれアプリ専用の永続プロファイルを使用します。通常のCookie、localStorage、IndexedDBなどはサイトと各ブラウザーRuntimeが定める有効期限内でアプリ再起動後も再利用し、Safari・Chrome・Edge本体のprofileとは共有しません。Cookie値やサイトデータは診断ログへ出力せず、session cookieを永続cookieへ変換することもしません。
+
 ## 主な機能
 
 - master/media playlistの自動判別
@@ -76,7 +78,7 @@ license要求はraw binaryを標準経路とし、応答はraw SignedMessage、�
 - 終端のないlive/event playlist
 - FairPlay key format、`SAMPLE-AES-CTR`、非identity key format
 - main/audio rendition間で暗号方式が異なるSAMPLE-AES構成
-- Safari等、別アプリのログインCookieだけを必要とするページ（αブラウザ内でログインできるページは、その非永続セッションのCookieを選択後のダウンロードへ引き継ぎます）
+- Safari等、別アプリのログインCookieだけを必要とするページ（αブラウザは専用の永続WebKitプロファイルを使うため、ブラウザ内でログインしたサイトの標準Cookie・localStorage・IndexedDB等は次回起動後も利用できます。候補確定時には適合Cookieを選択後のダウンロードへ引き継ぎます）
 - Worker / Service Worker内だけでHLS URLを生成し、ページ側へURLを公開しないプレイヤー
 - `#EXT-X-GAP` を含むplaylist
 - `#EXT-X-DISCONTINUITY` を含むplaylist
@@ -89,7 +91,7 @@ license要求はraw binaryを標準経路とし、応答はraw SignedMessage、�
 ## プライバシーと利用条件
 
 - 署名queryや鍵URLを画面・ログへ出しません。
-- 動的プレイヤー解析は非永続WebKitセッションで行い、その解析中に得たCookieは対象ジョブの通信だけに使用します。
+- 動的プレイヤー解析はアプリ専用の永続WebKitプロファイルで行い、サイトが設定した有効期限・Domain・Path・Secure属性を維持します。ダウンロード通信ではSameSiteを直接再現できないため、観測済みoriginまたは明示Domain内へさらに限定します。Cookie値やサイトデータは診断ログへ出力せず、渡したCookieは対象ジョブだけに使用します。
 - αブラウザの候補表示ではURLのhost、pathの深さ、拡張子だけを示し、path・query内の署名値そのものは表示しません。
 - 公開ページからlocalhost・LANへのiframe、サムネイル、リダイレクトは自動追跡しません。
 - queryの自動引き継ぎは、通常のRFC URL解決がHTTPエラーになった場合に使う「同一origin限定」の候補です。別CDNへtokenを転送しません。

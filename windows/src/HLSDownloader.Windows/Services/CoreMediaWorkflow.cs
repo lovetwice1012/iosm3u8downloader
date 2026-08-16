@@ -10,35 +10,27 @@ namespace HLSDownloader.Windows.Services;
 /// </summary>
 public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 {
-    private readonly BoundedHttpClient _discoveryClient;
-    private readonly BoundedHttpClient _segmentClient;
-    private readonly CookieContainer _cookies;
-    private readonly BrowserCookieSnapshotSynchronizer _browserCookieSynchronizer = new();
+    private readonly IWidevineCredentialSource _widevineCredentialSource;
     private readonly object _browserCookieSnapshotLock = new();
     private readonly Dictionary<Uri, RememberedBrowserCookies> _browserCookieSnapshots = [];
+    private readonly Dictionary<Uri, RememberedBrowserCookies> _analysisCookieSnapshots = [];
+    private readonly WidevineLicenseHintCache _widevineLicenseHints = new();
     private readonly Timer _browserCookieExpiryTimer;
     private readonly SemaphoreSlim _downloadGate = new(1, 1);
     private static readonly TimeSpan BrowserCookieSnapshotLifetime = TimeSpan.FromMinutes(5);
     private bool _disposed;
-    private HlsDownloadCoordinator? _coordinator;
     private readonly object _workerStartLock = new();
     private readonly object _activeWorkerJobLock = new();
     private Guid? _activeWorkerJobId;
 
-    public CoreMediaWorkflow()
+    public CoreMediaWorkflow(IWidevineCredentialSource? widevineCredentialSource = null)
     {
         _browserCookieExpiryTimer = new Timer(
             static state => ((CoreMediaWorkflow)state!).PurgeExpiredBrowserCookieSnapshots(),
             this,
             Timeout.InfiniteTimeSpan,
             Timeout.InfiniteTimeSpan);
-        _cookies = new CookieContainer(capacity: 512, perDomainCapacity: 128, maxCookieSize: 8 * 1024);
-        _discoveryClient = new BoundedHttpClient(
-            new BoundedHttpOptions(MaximumResponseBytes: 8 * 1024 * 1024),
-            cookies: _cookies);
-        _segmentClient = new BoundedHttpClient(
-            new BoundedHttpOptions(MaximumResponseBytes: 48 * 1024 * 1024),
-            cookies: _cookies);
+        _widevineCredentialSource = widevineCredentialSource ?? new WvdCredentialStore();
     }
 
     public event Action<string>? DiagnosticGenerated;
@@ -51,9 +43,37 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             return true;
         }
 
-        reason = candidate.CanDownload
-            ? "このビルドではWidevine L3保存providerが未接続です"
-            : "許可されていないhostのWidevineは再生・保存できません";
+        if (!candidate.CanDownload
+            || !WidevineDownloadPolicy.IsDownloadableWidevineDomain(candidate.RequestedUri ?? candidate.Uri)
+            || !WidevineDownloadPolicy.IsDownloadableWidevineDomain(candidate.Uri))
+        {
+            reason = "許可されていないhostのWidevineは再生・保存できません";
+            return false;
+        }
+
+        if (!_widevineCredentialSource.IsAvailable)
+        {
+            reason = "Widevine保存には有効なL3 WVDファイルの読み込みが必要です";
+            return false;
+        }
+
+        try
+        {
+            // UI availability checks must not create a long-lived provider/client.
+            // The real provider is constructed inside the candidate download scope.
+            var locator = new FFmpegToolLocator();
+            _ = locator.ResolveFFmpeg();
+            _ = locator.ResolveFFprobe();
+            reason = "Widevine L3を復号してMP4/WAVへ保存できます";
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            // Availability is a UI hint only. The download path performs the
+            // same checks again and reports a redacted, fail-closed error.
+        }
+
+        reason = "Widevine保存に必要なWVDまたはFFmpegを利用できません";
         return false;
     }
 
@@ -77,6 +97,82 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             }
 
             _browserCookieSnapshots[candidateUri] = new RememberedBrowserCookies(snapshot, now);
+            ScheduleBrowserCookieExpiryLocked(now);
+        }
+    }
+
+    public void RememberObservedWidevineLicense(
+        Uri manifestUri,
+        Uri licenseUri,
+        BrowserCookieSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(manifestUri);
+        ArgumentNullException.ThrowIfNull(licenseUri);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_browserCookieSnapshotLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            PurgeExpiredBrowserCookieSnapshotsLocked(now);
+            // The endpoint (including any required query) and its cookie scope stay
+            // in process memory only. They are removed before the first network I/O.
+            _widevineLicenseHints.Remember(
+                manifestUri,
+                licenseUri,
+                snapshot,
+                now);
+            ScheduleBrowserCookieExpiryLocked(now);
+        }
+    }
+
+    private void RememberAnalysisCookies(
+        IReadOnlyList<MediaCandidate> candidates,
+        CookieContainer analysisCookies)
+    {
+        var captured = candidates.Select(candidate =>
+        {
+            Uri[] scopes = new[] { candidate.RequestedUri, candidate.Uri, candidate.PageUri }
+                .OfType<Uri>()
+                .Where(uri => uri.IsAbsoluteUri
+                              && (uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                                  || uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                              && string.IsNullOrEmpty(uri.UserInfo))
+                .DistinctBy(uri => uri.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return (candidate.Uri, Snapshot: BrowserCookieImporter.CaptureHostOnlySnapshot(analysisCookies, scopes));
+        }).ToArray();
+
+        lock (_browserCookieSnapshotLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            PurgeExpiredBrowserCookieSnapshotsLocked(now);
+            foreach (var entry in captured)
+            {
+                // A new analysis supersedes any older capability for the same candidate,
+                // including when the new response produced no applicable cookies.
+                _analysisCookieSnapshots.Remove(entry.Uri);
+                if (entry.Snapshot.Cookies.Count == 0)
+                {
+                    continue;
+                }
+
+                if (_analysisCookieSnapshots.Count >= 128)
+                {
+                    _analysisCookieSnapshots.Remove(_analysisCookieSnapshots.Keys.First());
+                }
+
+                _analysisCookieSnapshots[entry.Uri] = new RememberedBrowserCookies(entry.Snapshot, now);
+            }
+
             ScheduleBrowserCookieExpiryLocked(now);
         }
     }
@@ -173,8 +269,13 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var resolver = new MediaSourceResolver(_discoveryClient);
+        var analysisCookies = CreateCookieContainer();
+        using var discoveryClient = new BoundedHttpClient(
+            new BoundedHttpOptions(MaximumResponseBytes: 8 * 1024 * 1024),
+            cookies: analysisCookies);
+        var resolver = new MediaSourceResolver(discoveryClient);
         var resolution = await resolver.ResolveAsync(input, cancellationToken).ConfigureAwait(false);
+        RememberAnalysisCookies(resolution.Candidates, analysisCookies);
         return resolution.Candidates;
     }
 
@@ -192,32 +293,59 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         try
         {
             BrowserCookieSnapshot? snapshot = null;
+            BrowserCookieSnapshot? analysisSnapshot = null;
+            BrowserCookieSnapshot? licenseSnapshot = null;
+            Uri? observedWidevineLicenseUri = null;
             lock (_browserCookieSnapshotLock)
             {
-                PurgeExpiredBrowserCookieSnapshotsLocked(DateTimeOffset.UtcNow);
+                var now = DateTimeOffset.UtcNow;
+                PurgeExpiredBrowserCookieSnapshotsLocked(now);
                 if (_browserCookieSnapshots.Remove(candidate.Uri, out var remembered)
-                    && DateTimeOffset.UtcNow - remembered.CapturedAt <= BrowserCookieSnapshotLifetime)
+                    && now - remembered.CapturedAt <= BrowserCookieSnapshotLifetime)
                 {
                     // A browser credential snapshot is a short-lived, single-use capability.
                     // Removing it before network I/O prevents replay after this attempt.
                     snapshot = remembered.Snapshot;
                 }
 
-                ScheduleBrowserCookieExpiryLocked(DateTimeOffset.UtcNow);
+                if (_analysisCookieSnapshots.Remove(candidate.Uri, out var rememberedAnalysis)
+                    && now - rememberedAnalysis.CapturedAt <= BrowserCookieSnapshotLifetime)
+                {
+                    analysisSnapshot = rememberedAnalysis.Snapshot;
+                }
+
+                if (_widevineLicenseHints.TryTake(candidate.Uri, now, out var rememberedLicense)
+                    && rememberedLicense is not null)
+                {
+                    observedWidevineLicenseUri = rememberedLicense.LicenseUri;
+                    licenseSnapshot = rememberedLicense.CookieSnapshot;
+                }
+
+                ScheduleBrowserCookieExpiryLocked(now);
             }
 
-            _browserCookieSynchronizer.Replace(_cookies, snapshot);
-            try
+            if (candidate.Kind == MediaCandidateKind.WidevineDash)
             {
-                return await DownloadWithCoordinatorAsync(candidate, progress, cancellationToken)
-                    .ConfigureAwait(false);
+                // The short-lived store is authoritative. Never retain a URI copied
+                // into a UI candidate after the corresponding capability has expired.
+                candidate = candidate with
+                {
+                    ObservedWidevineLicenseUri = observedWidevineLicenseUri
+                };
             }
-            finally
-            {
-                // Browser credentials are candidate-scoped and memory-only. Do not leave
-                // them active for later analysis or for a different candidate.
-                _browserCookieSynchronizer.Replace(_cookies, null);
-            }
+
+            var jobCookies = CreateCookieContainer();
+            // Both the importer index and the cookie jar are job-scoped. Imported browser
+            // values and response Set-Cookie state become unreachable after this attempt.
+            new BrowserCookieSnapshotSynchronizer().Replace(jobCookies, analysisSnapshot);
+            new BrowserCookieSnapshotSynchronizer().Replace(jobCookies, snapshot);
+            new BrowserCookieSnapshotSynchronizer().Replace(jobCookies, licenseSnapshot);
+            return await DownloadWithCoordinatorAsync(
+                    candidate,
+                    jobCookies,
+                    progress,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -227,6 +355,7 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     private async Task<CompletedMedia> DownloadWithCoordinatorAsync(
         MediaCandidate candidate,
+        CookieContainer jobCookies,
         IProgress<DownloadProgress> progress,
         CancellationToken cancellationToken)
     {
@@ -243,7 +372,7 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
         Directory.CreateDirectory(outputDirectory);
         var outputBasePath = Path.Combine(outputDirectory, CreateOutputName(candidate));
-        if (CanUseBackgroundWorker(candidate))
+        if (CanUseBackgroundWorker(candidate, jobCookies))
         {
             return await DownloadWithBackgroundWorkerAsync(
                 candidate,
@@ -252,8 +381,8 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
                 cancellationToken).ConfigureAwait(false);
         }
 
-        var coordinator = _coordinator ??= CreateCoordinator();
-        var result = await coordinator.DownloadAsync(
+        using var job = CreateDownloadJob(candidate, jobCookies);
+        var result = await job.Coordinator.DownloadAsync(
             candidate,
             outputBasePath,
             progress,
@@ -409,30 +538,75 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         }
     }
 
-    private bool CanUseBackgroundWorker(MediaCandidate candidate)
+    private bool CanUseBackgroundWorker(MediaCandidate candidate, CookieContainer jobCookies)
         => candidate.Kind == MediaCandidateKind.Hls
            && candidate.Origin == MediaCandidateOrigin.Direct
-           && _cookies.Count == 0
+           && jobCookies.Count == 0
            && string.IsNullOrEmpty(candidate.RequestedUri?.Query)
            && string.IsNullOrEmpty(candidate.Uri.Query)
            && string.IsNullOrEmpty(candidate.PageUri.Query)
            && File.Exists(GetWorkerExecutablePath());
 
-    private HlsDownloadCoordinator CreateCoordinator()
+    private DownloadJob CreateDownloadJob(MediaCandidate candidate, CookieContainer jobCookies)
     {
-        var runner = new ExternalToolRunner(message => DiagnosticGenerated?.Invoke(message));
-        var locator = new FFmpegToolLocator();
-        var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
-        var composer = new FFmpegMediaComposer(locator.ResolveFFmpeg(), probe, runner);
-        var planner = new HlsDownloadPlanBuilder(_discoveryClient);
-        var coordinator = new HlsDownloadCoordinator(
-            planner,
-            _segmentClient,
-            composer,
-            options: new HlsMediaDownloadOptions(MaximumConcurrentRequests: 2));
-        coordinator.CleanupAbandonedJobs(TimeSpan.FromDays(1));
-        return coordinator;
+        BoundedHttpClient? discoveryClient = null;
+        BoundedHttpClient? segmentClient = null;
+        WidevineRawLicenseTransport? licenseTransport = null;
+        try
+        {
+            IOutboundUriPolicy contentPolicy = candidate.Kind == MediaCandidateKind.WidevineDash
+                ? new DownloadableWidevineUriPolicy()
+                : new PublicNetworkUriPolicy();
+            discoveryClient = new BoundedHttpClient(
+                new BoundedHttpOptions(MaximumResponseBytes: 8 * 1024 * 1024),
+                contentPolicy,
+                jobCookies);
+            segmentClient = new BoundedHttpClient(
+                new BoundedHttpOptions(MaximumResponseBytes: 48 * 1024 * 1024),
+                contentPolicy,
+                jobCookies);
+
+            var runner = new ExternalToolRunner(message => DiagnosticGenerated?.Invoke(message));
+            var locator = new FFmpegToolLocator();
+            var ffmpegPath = locator.ResolveFFmpeg();
+            var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
+            var composer = new FFmpegMediaComposer(ffmpegPath, probe, runner);
+            var planner = new HlsDownloadPlanBuilder(discoveryClient);
+            IWidevineL3MediaProvider? widevineProvider = null;
+            if (candidate.Kind == MediaCandidateKind.WidevineDash)
+            {
+                var widevinePolicy = new DownloadableWidevineUriPolicy();
+                licenseTransport = new WidevineRawLicenseTransport(jobCookies, widevinePolicy);
+                widevineProvider = new WidevineL3MediaProvider(
+                    discoveryClient,
+                    segmentClient,
+                    _widevineCredentialSource,
+                    licenseTransport,
+                    ffmpegPath,
+                    probe,
+                    runner);
+            }
+
+            var coordinator = new HlsDownloadCoordinator(
+                planner,
+                segmentClient,
+                composer,
+                widevineProvider: widevineProvider,
+                options: new HlsMediaDownloadOptions(MaximumConcurrentRequests: 2));
+            coordinator.CleanupAbandonedJobs(TimeSpan.FromDays(1));
+            return new DownloadJob(coordinator, discoveryClient, segmentClient, licenseTransport);
+        }
+        catch
+        {
+            licenseTransport?.Dispose();
+            segmentClient?.Dispose();
+            discoveryClient?.Dispose();
+            throw;
+        }
     }
+
+    private static CookieContainer CreateCookieContainer()
+        => new(capacity: 512, perDomainCapacity: 128, maxCookieSize: 8 * 1024);
 
     private static string CreateOutputName(MediaCandidate candidate)
     {
@@ -457,16 +631,15 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     public void Dispose()
     {
-        _browserCookieSynchronizer.Replace(_cookies, null);
         lock (_browserCookieSnapshotLock)
         {
             _disposed = true;
             _browserCookieSnapshots.Clear();
+            _analysisCookieSnapshots.Clear();
+            _widevineLicenseHints.Clear();
         }
 
         _browserCookieExpiryTimer.Dispose();
-        _discoveryClient.Dispose();
-        _segmentClient.Dispose();
     }
 
     private void PurgeExpiredBrowserCookieSnapshots()
@@ -493,6 +666,15 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         {
             _browserCookieSnapshots.Remove(expired);
         }
+
+        foreach (var expired in _analysisCookieSnapshots
+                     .Where(pair => now - pair.Value.CapturedAt >= BrowserCookieSnapshotLifetime)
+                     .Select(pair => pair.Key)
+                     .ToArray())
+        {
+            _analysisCookieSnapshots.Remove(expired);
+        }
+        _widevineLicenseHints.PurgeExpired(now);
     }
 
     private void ScheduleBrowserCookieExpiryLocked(DateTimeOffset now)
@@ -502,14 +684,22 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             return;
         }
 
-        if (_browserCookieSnapshots.Count == 0)
+        if (_browserCookieSnapshots.Count == 0
+            && _analysisCookieSnapshots.Count == 0
+            && _widevineLicenseHints.Count == 0)
         {
             _browserCookieExpiryTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
             return;
         }
 
-        var earliest = _browserCookieSnapshots.Values.Min(entry => entry.CapturedAt)
-                       + BrowserCookieSnapshotLifetime;
+        var earliest = _browserCookieSnapshots.Values
+                           .Select(entry => entry.CapturedAt)
+                           .Concat(_analysisCookieSnapshots.Values.Select(entry => entry.CapturedAt))
+                           .Select(capturedAt => capturedAt + BrowserCookieSnapshotLifetime)
+                           .Concat(_widevineLicenseHints.NextExpiry is { } hintExpiry
+                               ? [hintExpiry]
+                               : [])
+                           .Min();
         var dueTime = earliest > now ? earliest - now : TimeSpan.Zero;
         _browserCookieExpiryTimer.Change(dueTime, Timeout.InfiniteTimeSpan);
     }
@@ -517,5 +707,21 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
     private sealed record RememberedBrowserCookies(
         BrowserCookieSnapshot Snapshot,
         DateTimeOffset CapturedAt);
+
+    private sealed class DownloadJob(
+        HlsDownloadCoordinator coordinator,
+        BoundedHttpClient discoveryClient,
+        BoundedHttpClient segmentClient,
+        WidevineRawLicenseTransport? licenseTransport) : IDisposable
+    {
+        public HlsDownloadCoordinator Coordinator { get; } = coordinator;
+
+        public void Dispose()
+        {
+            licenseTransport?.Dispose();
+            segmentClient.Dispose();
+            discoveryClient.Dispose();
+        }
+    }
 
 }

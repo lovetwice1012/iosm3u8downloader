@@ -54,6 +54,11 @@ public sealed class HlsDownloadCoordinator
         ArgumentException.ThrowIfNullOrWhiteSpace(outputBasePath);
         if (candidate.Kind == MediaCandidateKind.WidevineDash)
         {
+            progress?.Report(new DownloadProgress(
+                DownloadPhase.Resolving,
+                0,
+                0,
+                "Widevine MPDとライセンス条件を検証しています"));
             Uri requestedManifestUri = candidate.RequestedUri ?? candidate.Uri;
             if (!WidevineDownloadPolicy.IsDownloadableWidevineDomain(requestedManifestUri) ||
                 !WidevineDownloadPolicy.IsDownloadableWidevineDomain(candidate.Uri))
@@ -72,14 +77,25 @@ public sealed class HlsDownloadCoordinator
                 requestedManifestUri,
                 candidate.Uri,
                 outputBasePath,
-                WidevineDownloadPolicy.IsDownloadableWidevineDomain);
+                WidevineDownloadPolicy.IsDownloadableWidevineDomain,
+                candidate.ObservedWidevineLicenseUri);
             if (!request.IsPermittedManifestUri(request.RequestedManifestUri) ||
                 !request.IsPermittedManifestUri(request.InitialEffectiveManifestUri))
             {
                 throw new WidevineL3ProviderUnavailableException("The Widevine manifest host failed the final download policy check.");
             }
 
-            return await _widevineProvider.DownloadAndComposeAsync(request, cancellationToken).ConfigureAwait(false);
+            MediaComposeResult result = await _widevineProvider
+                .DownloadAndComposeAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+            progress?.Report(new DownloadProgress(
+                DownloadPhase.Completed,
+                1,
+                1,
+                result.OutputFormat == MediaOutputFormat.Wav
+                    ? "復号済みWAVを保存しました"
+                    : "復号済みMP4を保存しました"));
+            return result;
         }
 
         progress?.Report(new DownloadProgress(DownloadPhase.Resolving, 0, 0, "HLSプレイリストを解析しています"));

@@ -557,7 +557,7 @@ private struct PlaybackCaptureBrowser: View {
                     .foregroundStyle(.secondary)
             }
 
-            Text("ページ内の再生ボタンを押して動画を少し再生してください。MPD、Widevine EME、ライセンス要求の試行も自動で観測します。候補が増えたら「解析を終了」を押します。")
+            Text("ページ内の再生ボタンを押して動画を少し再生してください。MPD、Widevine EME、ライセンス要求の試行も自動で観測します。このブラウザーの標準Cookieとサイトデータは端末内の永続プロファイルに保存され、サイトが定めた期限内は次回もログイン状態を利用できます。候補が増えたら「解析を終了」を押します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 

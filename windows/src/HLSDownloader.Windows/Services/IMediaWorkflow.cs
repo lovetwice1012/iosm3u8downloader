@@ -10,6 +10,11 @@ public interface IMediaWorkflow
 
     void RememberBrowserCookies(Uri candidateUri, BrowserCookieSnapshot snapshot);
 
+    void RememberObservedWidevineLicense(
+        Uri manifestUri,
+        Uri licenseUri,
+        BrowserCookieSnapshot snapshot);
+
     Task<CompletedMedia?> ResumeLatestBackgroundJobAsync(
         IProgress<DownloadProgress> progress,
         CancellationToken cancellationToken);

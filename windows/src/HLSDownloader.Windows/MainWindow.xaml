@@ -204,7 +204,7 @@
                         <TextBlock
                             x:Name="WvdStatusText"
                             Style="{StaticResource CaptionStyle}"
-                            Text="WVDは未設定です。認証情報は安全に保管できますが、このビルドのWidevine保存providerは未接続です。" />
+                            Text="WVDは未設定です。許可hostのWidevine保存には、L3 WVDファイルを読み込んでください。" />
                         <StackPanel Orientation="Horizontal" Spacing="8">
                             <Button Click="ImportWvdButton_OnClick" Content="WVDを読み込む" />
                             <Button x:Name="RemoveWvdButton" Click="RemoveWvdButton_OnClick" Content="WVDを削除" IsEnabled="False" />
@@ -247,7 +247,7 @@
                             Text="通常HLS、identity AES-128 / SAMPLE-AES、MPEG-TS / fMP4、HTML / iframe解析に対応します。実際の音声trackだけの入力はPCM WAV、映像を含む入力はMP4として保存します。" />
                         <TextBlock
                             Style="{StaticResource CaptionStyle}"
-                            Text="再生解析は表示中のページだけを観測します。Authorizationや本文は取り込まず、適合Cookieは保存中だけメモリ共有してログ・ファイルには残しません。FairPlayの復号済み書き出しと、このビルドでのWidevine L3保存providerには未対応です。" />
+                            Text="再生解析は表示中のページだけを観測します。Authorizationや本文は取り込まず、適合Cookieは保存中だけメモリ共有してログ・ファイルには残しません。許可hostの対応Widevine L3はWVDを使ってMP4/WAVへ保存できます。FairPlayの復号済み書き出しには対応しません。" />
                     </StackPanel>
                 </Border>
             </StackPanel>

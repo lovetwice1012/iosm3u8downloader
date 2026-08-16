@@ -95,6 +95,79 @@ public sealed class FFmpegIntegrationTests
 
     [Fact]
     [Trait("Category", "Integration")]
+    public async Task RealIdentitySampleAesAacIsDecryptedAndExportedAsWavWithoutLoggingTheKey()
+    {
+        using var scope = new TestFileScope();
+        var locator = new FFmpegToolLocator();
+        var log = new List<string>();
+        var runner = new ExternalToolRunner(log.Add);
+        byte[] key = Enumerable.Range(0x30, 16).Select(value => (byte)value).ToArray();
+        byte[] initializationVector = new byte[16];
+        string protectedAac = await IdentitySampleAesFixture.CreateProtectedAacAsync(
+            locator.ResolveFFmpeg(), runner, scope.DirectoryPath, key, initializationVector);
+
+        var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
+        var composer = new FFmpegMediaComposer(locator.ResolveFFmpeg(), probe, runner);
+        var sampleAesComposer = new SampleAesMediaComposer(
+            new SampleAesLocalPackageBuilder(scope.PathFor("sample-aes-jobs")),
+            composer);
+        MediaComposeResult result = await sampleAesComposer.ComposeAsync(
+            new SampleAesPlaylistPackage([
+                new SampleAesSegment(protectedAac, 0.6, new SampleAesKey(key, Convert.ToHexString(initializationVector)))
+            ]),
+            scope.PathFor("sample-aes-audio-result"),
+            TimeSpan.FromSeconds(30));
+
+        Assert.Equal(MediaOutputFormat.Wav, result.OutputFormat);
+        Assert.False(result.Tracks.HasVideo);
+        Assert.True(result.Tracks.HasAudio);
+        Assert.True(MediaOutputValidator.IsValidPcm16Wav(result.OutputPath));
+        Assert.DoesNotContain(log, line => line.Contains(Convert.ToHexString(key), StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
+    public async Task RealIdentitySampleAesH264AndAacAreDecryptedAndExportedAsMp4()
+    {
+        using var scope = new TestFileScope();
+        var locator = new FFmpegToolLocator();
+        var runner = new ExternalToolRunner();
+        byte[] key = Enumerable.Range(0x50, 16).Select(value => (byte)value).ToArray();
+        byte[] initializationVector = new byte[16];
+        string protectedTransportStream = await IdentitySampleAesFixture.CreateProtectedAudioVideoTransportStreamAsync(
+            locator.ResolveFFmpeg(), runner, scope.DirectoryPath, key, initializationVector);
+
+        var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
+        var composer = new FFmpegMediaComposer(locator.ResolveFFmpeg(), probe, runner);
+        var sampleAesComposer = new SampleAesMediaComposer(
+            new SampleAesLocalPackageBuilder(scope.PathFor("sample-aes-video-jobs")),
+            composer);
+        MediaComposeResult result = await sampleAesComposer.ComposeAsync(
+            new SampleAesPlaylistPackage([
+                new SampleAesSegment(protectedTransportStream, 2.4, new SampleAesKey(key, Convert.ToHexString(initializationVector)))
+            ]),
+            scope.PathFor("sample-aes-video-result"),
+            TimeSpan.FromSeconds(30));
+
+        Assert.Equal(MediaOutputFormat.Mp4, result.OutputFormat);
+        Assert.True(result.Tracks.HasVideo);
+        Assert.True(result.Tracks.HasAudio);
+        Assert.True(MediaOutputValidator.IsValidMp4(result.OutputPath));
+        MediaTrackInfo outputTracks = await probe.ProbeAsync(result.OutputPath, TimeSpan.FromSeconds(30));
+        Assert.True(outputTracks.HasVideo);
+        Assert.True(outputTracks.HasAudio);
+        ExternalToolResult decodeResult = await runner.RunAsync(new ExternalToolInvocation(
+            locator.ResolveFFmpeg(),
+            [
+                "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+                "-i", result.OutputPath, "-map", "0:v:0", "-f", "null", "-"
+            ],
+            TimeSpan.FromSeconds(30)));
+        Assert.True(decodeResult.ExitCode == 0, decodeResult.StandardError);
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
     public async Task RealExternalAudioRenditionIsMuxedWithVideoAsMp4()
     {
         using var scope = new TestFileScope();

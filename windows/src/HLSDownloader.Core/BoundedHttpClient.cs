@@ -19,7 +19,8 @@ public sealed record BoundedHttpOptions(
     int MaximumResponseBytes = 8 * 1024 * 1024,
     int MaximumRedirects = 5,
     TimeSpan? RequestTimeout = null,
-    string UserAgent = "HLSDownloader-Windows/1.0")
+    string UserAgent = "HLSDownloader-Windows/1.0",
+    bool UseCookies = true)
 {
     internal TimeSpan EffectiveTimeout => RequestTimeout ?? TimeSpan.FromSeconds(30);
     internal void Validate()
@@ -65,7 +66,7 @@ public sealed class BoundedHttpClient : IResourceDownloader, ITextResourceFetche
         {
             AllowAutoRedirect = false,
             AutomaticDecompression = DecompressionMethods.All,
-            UseCookies = true,
+            UseCookies = _options.UseCookies,
             CookieContainer = cookies ?? new CookieContainer(),
             MaxConnectionsPerServer = 6
         };

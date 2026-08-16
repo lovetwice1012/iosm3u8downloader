@@ -10,7 +10,8 @@ iOS版と同じ「URL入力 → 解析 → 候補選択 → 再生または保�
   - document-startでDOMとMutationObserverを監視
   - `fetch` / XHR / Performance Resource Timingを監視
   - EME要求と`encrypted`イベントを検出
-  - host側のWebResourceRequested / WebResourceResponseReceivedでもm3u8 / MPDを捕捉
+  - host側の全WebResource context、redirect先、response MIMEでもm3u8 / MPDを捕捉
+  - Content-Lengthが512 KiB以下の拡張子なしtext/XML/octet-stream応答だけ、先頭32 KiBを最大64応答・2並列・3秒で確認
 - サムネイル、検出元、保存可否を含む候補一覧
 - 通常HLS、identity AES-128 / SAMPLE-AES、MPEG-TS / fMP4のローカル化とFFmpeg合成
 - 実際のtrackをffprobeで確認し、映像ありはMP4、音声だけはPCM 16-bit WAVへ自動出力
@@ -60,11 +61,19 @@ page scriptからnative bridgeへ送るのは、検出元、公開URL、frameの
 
 native側では256-bit nonce、schema version、payload長、signal件数、http(s) scheme、userinfo不在を検証します。候補として必要な署名付きURLはメモリ上の候補に保持しますが、診断ログではqueryとfragmentを伏せます。検出URLとframe URLに適合するWebView2 Cookie（HttpOnlyを含む）はCookieManagerから取得し、domain/path/secure/SameSite属性を検証します。Cookie snapshotは候補ごとにメモリ内だけで最大5分保持し、選択時に一度だけforeground download用CookieContainerへ反映して処理後に消去します。Cookie値はUI・ログ・job台帳・ファイルへ出力しません。静的HTTP解析はprivate/local network宛てとHTTPSからHTTPへのdowngrade redirectを拒否します。
 
+高度解析はアプリ内WebView2のnative resource eventで完結し、WindowsのVPN・system proxy・証明書storeを変更しません。HTTPSのCA MITMや自己署名証明書のinstallも行いません。非復号のloopback CONNECT proxyではhost以外の取得情報が増えず、DRMやcertificate pinningとの互換性を落とすためです。
+
+再生解析ブラウザーのCookie、localStorage、IndexedDBなどは、`LocalApplicationData/HLSDownloader.Windows/WebView2Profile` の専用profileへ保持します。すべての再生解析windowが同じ明示的なWebView2 environmentを共有するため、サイトとWebView2 Runtimeが定める有効期限内では、アプリ更新や再起動後もログイン状態を再利用できます。session cookieを永続cookieへ変更するものではありません。portable EXEの隣へ暗黙profileを作るfallbackや、通常のEdge profileとの共有は行いません。profile pathやCookie値は診断ログへ出力しません。
+
 ## Widevine / WVD
 
 WebView2上のサービス提供playerによるWidevine再生は、サイト側実装とインストール済みEdge WebView2 Runtimeの対応範囲に依存します。保存可否と再生可否のdomain判定はCoreの共通policyへ集約しています。再生解析画面では、許可hostから成功応答したMPDを同一frameで確認し、かつ実際にEMEを呼ぶplayer frame自体も許可hostである場合だけWidevine EMEを許可します。外部ページ内の許可host iframeは対象ですが、別hostのframeが許可MPDだけを読む構成はfail-closedで拒否します。
 
-WVDは現在のWindowsユーザーに紐づけて暗号化保管できます。ただし、この時点のWindowsビルドにはWVDを使うWidevine L3 download providerは接続していません。したがって、WVDを読み込んでもWidevineの復号済みMP4/WAV保存を成功扱いにはせず、明示的な「provider未設定」エラーで停止します。通常HLSの保存にはWVDを使いません。
+license endpointは、`MediaKeySession.generateRequest`の開始・成功から`update`成功までの30秒以内にnative WebView2が確認した2xx `POST`から自動関連付けします。同じ再生解析windowで許可MPDとPOST URIがそれぞれ1件に確定した場合だけ採用し、複数候補は拒否します。MPDにLaurlがあれば観測URIとの一致が必須で、Laurlが0件の場合だけ観測URIをhintとして使います。hintとlicense scopeのCookieはメモリ内だけで5分保持し、最初の保存試行で消費します。query値、Cookie値、request/response header、challenge/license bytesはbridge・診断ログ・job台帳へ出力しません。
+
+WVDは現在のWindowsユーザーに紐づけて暗号化保管し、許可hostのWidevine L3 VODにだけ使用します。providerはstatic single-period MPD、Widevine ContentProtection/PSSH、CENC/CBCS、映像・音声representation、SegmentTemplate/Timeline/List、raw binary offline licenseに対応し、実trackに映像があればMP4、音声だけならPCM 16-bit WAVへ保存します。requested/effective manifest、license、全segmentと最終公開直前で共通のexact HTTPS host policyを再確認し、license redirect、key rotation、PIFF、dynamic/multi-period MPD、期限・更新・出力制約を持つlicenseはfail-closedで拒否します。通常HLSの保存にはWVDを使いません。
+
+実FFmpeg CENC fixtureでは映像→MP4と音声のみ→WAVを確認しています。CBCS経路はparser・fMP4検証・FFmpeg引数まで実装していますが、この開発環境のFFmpegでは暗号化CBCS fixtureを生成できないため実暗号E2Eは未確認です。保存時は観測したPOSTを再送せず、WVD providerが生成したraw binary `SignedMessage`を新しく送信します。再生時POSTのbody/headerは意図的に取得しないため、実配信側がJSON/form wrapper、Authorization、独自header、privacy-mode service certificateを要求する場合は保存できません。
 
 ## portable UIの制約
 

@@ -1,6 +1,9 @@
 import Foundation
 
 final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    var cookieHeaderProvider: ((URL, URL?) -> String?)?
+    var responseCookieObserver: ((HTTPURLResponse) -> Void)?
+
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -8,6 +11,7 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        responseCookieObserver?(response)
         guard let sourceURL = response.url,
               let targetURL = request.url,
               !(sourceURL.scheme?.lowercased() == "https"
@@ -21,6 +25,10 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
         }
 
         var sanitizedRequest = request
+        // A proposed redirect request can retain a manually supplied Cookie
+        // header. Always discard it and rebuild against the redirect target so
+        // Domain/Path/Secure/expiry and site-context checks cannot be bypassed.
+        sanitizedRequest.setValue(nil, forHTTPHeaderField: "Cookie")
         if !Self.isSameOrigin(sourceURL, targetURL) {
             sanitizedRequest.setValue(nil, forHTTPHeaderField: "Authorization")
             sanitizedRequest.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
@@ -29,6 +37,15 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
                 Self.originString(sourceURL),
                 forHTTPHeaderField: "Referer"
             )
+        }
+        // Keep the top-level site context stable for the entire redirect
+        // chain. A redirecting CDN must not become a new first-party context.
+        let originalSiteContext = task.originalRequest?
+            .value(forHTTPHeaderField: "Referer")
+            .flatMap { URL(string: $0) }
+        if let originalSiteContext,
+           let cookieHeader = cookieHeaderProvider?(targetURL, originalSiteContext) {
+            sanitizedRequest.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         }
         completionHandler(sanitizedRequest)
     }
@@ -83,20 +100,29 @@ struct HTTPPayload: Sendable {
 
 final class HTTPClient: @unchecked Sendable {
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0"
+    private static let maximumTransientResponseCookies = 512
 
     private let session: URLSession
     private let redirectDelegate: HTTPRedirectDelegate
-    private let cookieStorage: HTTPCookieStorage?
+    private let transportProtocolClasses: [AnyClass]?
+    private let transportConnectionProxyDictionary: [AnyHashable: Any]?
     private let importedCookieLock = NSLock()
     private var importedCookies: [HTTPCookie] = []
+    private var transientResponseCookies: [HTTPCookie] = []
 
     init(configuration: URLSessionConfiguration = .default) {
+        transportProtocolClasses = configuration.protocolClasses
+        transportConnectionProxyDictionary = configuration.connectionProxyDictionary
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 120
         configuration.waitsForConnectivity = true
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieAcceptPolicy = .always
-        configuration.httpShouldSetCookies = true
+        // Response cookies are ingested explicitly and request cookies are
+        // rebuilt through the same Domain/Path/Secure/site-context gate. This
+        // prevents URLSession's automatic jar from bypassing that gate.
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
         configuration.httpMaximumConnectionsPerHost = max(
             configuration.httpMaximumConnectionsPerHost,
             6
@@ -106,7 +132,6 @@ final class HTTPClient: @unchecked Sendable {
             "User-Agent": Self.userAgent,
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.6"
         ]
-        cookieStorage = configuration.httpCookieStorage
         let redirectDelegate = HTTPRedirectDelegate()
         self.redirectDelegate = redirectDelegate
         session = URLSession(
@@ -114,6 +139,12 @@ final class HTTPClient: @unchecked Sendable {
             delegate: redirectDelegate,
             delegateQueue: nil
         )
+        redirectDelegate.cookieHeaderProvider = { [weak self] targetURL, referer in
+            self?.redirectCookieHeader(for: targetURL, referer: referer)
+        }
+        redirectDelegate.responseCookieObserver = { [weak self] response in
+            self?.storeResponseCookies(from: response)
+        }
     }
 
     deinit {
@@ -121,13 +152,13 @@ final class HTTPClient: @unchecked Sendable {
     }
 
     func cookies(for url: URL) -> [HTTPCookie] {
-        let stored = cookieStorage?.cookies(for: url) ?? []
         importedCookieLock.lock()
-        let imported = importedCookies.filter { cookie($0, matches: url) }
+        let imported = importedCookies.filter { Self.cookie($0, matches: url) }
+        let stored = transientResponseCookies.filter { Self.cookie($0, matches: url) }
         importedCookieLock.unlock()
 
         var seen = Set<String>()
-        return (imported + stored).filter {
+        return (stored + imported).filter {
             seen.insert("\($0.name)\n\($0.domain)\n\($0.path)").inserted
         }
     }
@@ -136,6 +167,66 @@ final class HTTPClient: @unchecked Sendable {
         importedCookieLock.lock()
         importedCookies = cookies.filter { $0.expiresDate.map { $0 > Date() } ?? true }
         importedCookieLock.unlock()
+    }
+
+    /// Creates a download-only client with a fresh ephemeral URLSession cookie
+    /// jar. Browser cookies and response cookies acquired while resolving the
+    /// selected candidate are copied only when their original scope applies to
+    /// one of the supplied page/media/license URLs. Set-Cookie responses made
+    /// by the returned client remain in that client's private jar and disappear
+    /// when the download job releases the client.
+    func makeIsolatedDownloadClient(scopedTo observedURLs: [URL]) -> HTTPClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = transportProtocolClasses
+        configuration.connectionProxyDictionary = transportConnectionProxyDictionary
+        let result = HTTPClient(configuration: configuration)
+
+        importedCookieLock.lock()
+        let imported = importedCookies
+        let native = transientResponseCookies
+        importedCookieLock.unlock()
+        var identities = Set<String>()
+        let scoped = Self.snapshotCookies(
+            native + imported,
+            matching: observedURLs
+        ).filter { candidate in
+            identities.insert(
+                "\(candidate.name)\n\(candidate.domain)\n\(candidate.path)"
+            ).inserted
+        }
+        result.storeCookies(scoped)
+        return result
+    }
+
+    /// The long-lived resolver client must not carry a server response cookie
+    /// from one user-initiated discovery into the next discovery. Imported
+    /// WebKit cookies are intentionally retained; their persistent source of
+    /// truth is WKWebsiteDataStore and `storeCookies` replaces their snapshot.
+    func resetTransientResponseCookies() {
+        importedCookieLock.lock()
+        transientResponseCookies.removeAll(keepingCapacity: false)
+        importedCookieLock.unlock()
+    }
+
+    /// Filters a persistent browser profile down to cookies that are actually
+    /// applicable to an observed page, media, or license URL. The returned
+    /// HTTPCookie instances are not reconstructed, so their browser-provided
+    /// Domain/Path/Secure/Expires/host-only representation remains intact.
+    /// Path is intentionally evaluated only for the eventual request: a page
+    /// can observe a manifest under /video while its authenticated segments or
+    /// keys use a narrower /segments path on the same cookie host/domain.
+    static func snapshotCookies(
+        _ cookies: [HTTPCookie],
+        matching observedURLs: [URL],
+        now: Date = Date()
+    ) -> [HTTPCookie] {
+        let safeObservedURLs = observedURLs.filter { Self.isSafeHTTPURL($0) }
+        guard !safeObservedURLs.isEmpty else { return [] }
+        return cookies.filter { candidate in
+            safeObservedURLs.contains { observedURL in
+                cookieMatchesObservedOrigin(candidate, url: observedURL, now: now)
+            }
+        }
     }
 
     func fetch(
@@ -173,7 +264,7 @@ final class HTTPClient: @unchecked Sendable {
                 if let referer = safeReferer(referer, target: url) {
                     request.setValue(referer, forHTTPHeaderField: "Referer")
                 }
-                if let cookieHeader = importedCookieHeader(for: url) {
+                if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
                     request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
                 }
                 if let byteRange {
@@ -185,6 +276,7 @@ final class HTTPClient: @unchecked Sendable {
                 guard let http = response as? HTTPURLResponse else {
                     throw HLSError.network("HTTPレスポンスを受信できませんでした")
                 }
+                storeResponseCookies(from: http)
                 let effectiveURL = http.url ?? url
 
                 guard (200...299).contains(http.statusCode) else {
@@ -259,7 +351,7 @@ final class HTTPClient: @unchecked Sendable {
                 if let referer = safeReferer(referer, target: url) {
                     request.setValue(referer, forHTTPHeaderField: "Referer")
                 }
-                if let cookieHeader = importedCookieHeader(for: url) {
+                if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
                     request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
                 }
 
@@ -267,6 +359,7 @@ final class HTTPClient: @unchecked Sendable {
                 guard let http = response as? HTTPURLResponse else {
                     throw HLSError.network("HTTPレスポンスを受信できませんでした")
                 }
+                storeResponseCookies(from: http)
                 let effectiveURL = http.url ?? url
                 guard (200...299).contains(http.statusCode) else {
                     let error = HLSError.httpStatus(http.statusCode, effectiveURL.host ?? "サーバー")
@@ -350,7 +443,7 @@ final class HTTPClient: @unchecked Sendable {
                 if let referer = safeReferer(referer, target: url) {
                     request.setValue(referer, forHTTPHeaderField: "Referer")
                 }
-                if let cookieHeader = importedCookieHeader(for: url) {
+                if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
                     request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
                 }
                 if let byteRange {
@@ -362,6 +455,7 @@ final class HTTPClient: @unchecked Sendable {
                 guard let http = response as? HTTPURLResponse else {
                     throw HLSError.network("DASH断片のHTTP応答を受信できませんでした")
                 }
+                storeResponseCookies(from: http)
                 let effectiveURL = http.url ?? url
                 guard scheme != "https"
                         || effectiveURL.scheme?.lowercased() == "https" else {
@@ -484,7 +578,7 @@ final class HTTPClient: @unchecked Sendable {
            let origin = safeOrigin(referer, target: url) {
             request.setValue(origin, forHTTPHeaderField: "Origin")
         }
-        if let cookieHeader = importedCookieHeader(for: url) {
+        if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
             request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         }
 
@@ -494,8 +588,8 @@ final class HTTPClient: @unchecked Sendable {
         configuration.waitsForConnectivity = true
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.httpCookieAcceptPolicy = .always
-        configuration.httpShouldSetCookies = true
-        configuration.httpCookieStorage = cookieStorage
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
         configuration.httpAdditionalHeaders = [
             "User-Agent": Self.userAgent,
             "Accept-Language": "ja,en-US;q=0.8,en;q=0.6"
@@ -513,6 +607,7 @@ final class HTTPClient: @unchecked Sendable {
             guard let http = response as? HTTPURLResponse else {
                 throw HLSError.network("WidevineライセンスサーバーからHTTP応答を受信できませんでした")
             }
+            storeResponseCookies(from: http)
             let effectiveURL = http.url ?? url
             guard (200...299).contains(http.statusCode) else {
                 throw HLSError.httpStatus(
@@ -706,27 +801,92 @@ final class HTTPClient: @unchecked Sendable {
         }
     }
 
-    private func importedCookieHeader(for url: URL) -> String? {
+    private func requestCookieHeader(for url: URL, referer: URL?) -> String? {
         importedCookieLock.lock()
-        let matching = importedCookies.filter { cookie($0, matches: url) }
+        let imported = importedCookies
+        let stored = transientResponseCookies
         importedCookieLock.unlock()
+
+        var identities = Set<String>()
+        // A Set-Cookie received later in this job supersedes the seed snapshot
+        // for the same name/domain/path identity.
+        let matching = (stored + imported).filter { candidate in
+            let identity = "\(candidate.name)\n\(candidate.domain)\n\(candidate.path)"
+            return identities.insert(identity).inserted
+                && Self.cookie(candidate, matches: url)
+                && Self.cookieIsAllowedBySiteContext(
+                    candidate,
+                    target: url,
+                    referer: referer
+                )
+        }
         guard !matching.isEmpty else { return nil }
         return HTTPCookie.requestHeaderFields(with: matching)["Cookie"]
     }
 
-    private func cookie(_ cookie: HTTPCookie, matches url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else { return false }
-        let rawCookieDomain = cookie.domain.lowercased()
-        let isDomainCookie = rawCookieDomain.hasPrefix(".")
-        let cookieDomain = rawCookieDomain.trimmingCharacters(
-            in: CharacterSet(charactersIn: ".")
+    private func redirectCookieHeader(for url: URL, referer: URL?) -> String? {
+        requestCookieHeader(for: url, referer: referer)
+    }
+
+    private func storeResponseCookies(from response: HTTPURLResponse) {
+        guard let responseURL = response.url else { return }
+        var fields: [String: String] = [:]
+        for (rawName, rawValue) in response.allHeaderFields {
+            guard let name = rawName as? String else { continue }
+            fields[name] = String(describing: rawValue)
+        }
+        let received = HTTPCookie.cookies(
+            withResponseHeaderFields: fields,
+            for: responseURL
         )
-        guard !cookieDomain.isEmpty else { return false }
-        guard host == cookieDomain || (isDomainCookie && host.hasSuffix(".\(cookieDomain)")) else {
+        guard !received.isEmpty else { return }
+
+        let now = Date()
+        importedCookieLock.lock()
+        transientResponseCookies.removeAll { existing in
+            existing.expiresDate.map { $0 <= now } ?? false
+        }
+        for cookie in received {
+            transientResponseCookies.removeAll {
+                Self.cookieIdentity($0) == Self.cookieIdentity(cookie)
+            }
+            if !Self.isDeletionCookie(cookie, now: now) {
+                transientResponseCookies.append(cookie)
+            }
+        }
+        if transientResponseCookies.count > Self.maximumTransientResponseCookies {
+            transientResponseCookies.removeFirst(
+                transientResponseCookies.count - Self.maximumTransientResponseCookies
+            )
+        }
+        importedCookieLock.unlock()
+    }
+
+    private static func cookieIdentity(_ cookie: HTTPCookie) -> String {
+        "\(cookie.name)\n\(cookie.domain)\n\(cookie.path)"
+    }
+
+    private static func isDeletionCookie(_ cookie: HTTPCookie, now: Date) -> Bool {
+        if cookie.expiresDate.map({ $0 <= now }) == true { return true }
+        guard let rawMaximumAge = cookie.properties?[.maximumAge] else { return false }
+        if let value = rawMaximumAge as? NSNumber {
+            return cookie.value.isEmpty && value.intValue <= 0
+        }
+        if let value = rawMaximumAge as? String,
+           let seconds = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return cookie.value.isEmpty && seconds <= 0
+        }
+        return false
+    }
+
+    private static func cookie(
+        _ cookie: HTTPCookie,
+        matches url: URL,
+        now: Date = Date()
+    ) -> Bool {
+        guard cookieMatchesObservedOrigin(cookie, url: url, now: now) else {
             return false
         }
-        if cookie.isSecure, url.scheme?.lowercased() != "https" { return false }
-        if let expires = cookie.expiresDate, expires <= Date() { return false }
 
         let requestPath = url.path.isEmpty ? "/" : url.path
         let cookiePath = cookie.path.isEmpty ? "/" : cookie.path
@@ -734,6 +894,86 @@ final class HTTPClient: @unchecked Sendable {
         if requestPath.count > cookiePath.count,
            !cookiePath.hasSuffix("/"),
            requestPath.dropFirst(cookiePath.count).first != "/" {
+            return false
+        }
+        return true
+    }
+
+    private static func cookieMatchesObservedOrigin(
+        _ cookie: HTTPCookie,
+        url: URL,
+        now: Date
+    ) -> Bool {
+        guard isSafeHTTPURL(url),
+              let host = url.host?.lowercased(),
+              let domain = normalizedCookieDomain(cookie) else {
+            return false
+        }
+        guard domainMatches(host, domain: domain.value, includeSubdomains: domain.isDomainCookie) else {
+            return false
+        }
+        if cookie.isSecure, url.scheme?.lowercased() != "https" { return false }
+        if let expires = cookie.expiresDate, expires <= now { return false }
+        return true
+    }
+
+    /// URLSession does not enforce browser SameSite semantics for a Cookie
+    /// header supplied by the app. Treat a direct URL as its own top-level
+    /// context, but otherwise require a schemeful exact-host relationship. A
+    /// browser-identified Domain cookie may cross sibling hosts only when both
+    /// hosts are inside that cookie's declared domain. Unknown host-only state
+    /// is therefore handled as host-only and fails closed across hosts.
+    private static func cookieIsAllowedBySiteContext(
+        _ cookie: HTTPCookie,
+        target: URL,
+        referer: URL?
+    ) -> Bool {
+        let siteContext = referer ?? target
+        guard isSafeHTTPURL(target),
+              isSafeHTTPURL(siteContext),
+              target.scheme?.lowercased() == siteContext.scheme?.lowercased(),
+              let targetHost = target.host?.lowercased(),
+              let contextHost = siteContext.host?.lowercased(),
+              let domain = normalizedCookieDomain(cookie) else {
+            return false
+        }
+
+        if domain.isDomainCookie {
+            return domainMatches(targetHost, domain: domain.value, includeSubdomains: true)
+                && domainMatches(contextHost, domain: domain.value, includeSubdomains: true)
+        }
+        return targetHost == domain.value && contextHost == targetHost
+    }
+
+    private static func normalizedCookieDomain(
+        _ cookie: HTTPCookie
+    ) -> (value: String, isDomainCookie: Bool)? {
+        let raw = cookie.domain.lowercased()
+        let isDomainCookie = raw.hasPrefix(".")
+        let value = isDomainCookie ? String(raw.dropFirst()) : raw
+        guard !value.isEmpty,
+              !value.hasPrefix("."),
+              !value.hasSuffix("."),
+              !value.contains(where: { $0.isWhitespace }) else {
+            return nil
+        }
+        return (value, isDomainCookie)
+    }
+
+    private static func domainMatches(
+        _ host: String,
+        domain: String,
+        includeSubdomains: Bool
+    ) -> Bool {
+        host == domain || (includeSubdomains && host.hasSuffix(".\(domain)"))
+    }
+
+    private static func isSafeHTTPURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil,
+              url.user == nil,
+              url.password == nil else {
             return false
         }
         return true

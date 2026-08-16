@@ -205,6 +205,82 @@ public sealed class BrowserCookieImporterTests
         Assert.False(ContainsCookie(cookies, new Uri("https://page.example.test/next")));
     }
 
+    [Fact]
+    public void FreshCandidateContainerDoesNotInheritImportedOrResponseCookies()
+    {
+        var scope = new Uri("https://page.example.test/watch");
+        var firstJobCookies = new CookieContainer();
+        new BrowserCookieSnapshotSynchronizer().Replace(
+            firstJobCookies,
+            new BrowserCookieSnapshot(
+                [scope],
+                [CreateCookie(scope, "page.example.test", isDomainCookie: false)]));
+        firstJobCookies.SetCookies(scope, "server_session=response-only; Path=/; Secure; HttpOnly");
+
+        var secondJobCookies = new CookieContainer();
+        new BrowserCookieSnapshotSynchronizer().Replace(secondJobCookies, null);
+
+        Assert.Equal(2, firstJobCookies.GetCookies(scope).Count);
+        Assert.Empty(secondJobCookies.GetCookies(scope).Cast<Cookie>());
+    }
+
+    [Fact]
+    public void AnalysisSnapshotKeepsApplicableAttributesAndNarrowsDomainToCandidateHost()
+    {
+        var source = new CookieContainer();
+        var candidateUri = new Uri("https://media.example.test/video/master.m3u8");
+        var expiry = DateTimeOffset.UtcNow.AddHours(1);
+        source.Add(new Cookie("analysis_auth", "opaque", "/video", ".example.test")
+        {
+            Secure = true,
+            HttpOnly = true,
+            Expires = expiry.UtcDateTime
+        });
+        source.Add(new Cookie("wrong_path", "opaque", "/account", ".example.test")
+        {
+            Secure = true
+        });
+
+        BrowserCookieSnapshot snapshot = BrowserCookieImporter.CaptureHostOnlySnapshot(
+            source,
+            [candidateUri]);
+        var destination = new CookieContainer();
+        new BrowserCookieSnapshotSynchronizer().Replace(destination, snapshot);
+
+        Cookie imported = Assert.Single(destination.GetCookies(
+            new Uri("https://media.example.test/video/segment.m4s")).Cast<Cookie>());
+        Assert.Equal("analysis_auth", imported.Name);
+        Assert.Equal("/video", imported.Path);
+        Assert.True(imported.Secure);
+        Assert.True(imported.HttpOnly);
+        Assert.InRange(imported.Expires.ToUniversalTime(), expiry.UtcDateTime.AddSeconds(-1), expiry.UtcDateTime.AddSeconds(1));
+        Assert.Empty(destination.GetCookies(new Uri("https://other.example.test/video/segment.m4s")).Cast<Cookie>());
+        Assert.Empty(destination.GetCookies(new Uri("https://media.example.test/account")).Cast<Cookie>());
+        Assert.Empty(destination.GetCookies(new Uri("http://media.example.test/video/segment.m4s")).Cast<Cookie>());
+    }
+
+    [Fact]
+    public void AnalysisSnapshotContainsOnlyCookiesApplicableToCapturedCandidateScope()
+    {
+        var source = new CookieContainer();
+        source.SetCookies(
+            new Uri("https://media.example.test/"),
+            "root_cookie=one; Path=/; Secure; HttpOnly");
+        source.SetCookies(
+            new Uri("https://media.example.test/account"),
+            "account_cookie=two; Path=/account; Secure; HttpOnly");
+
+        BrowserCookieSnapshot snapshot = BrowserCookieImporter.CaptureHostOnlySnapshot(
+            source,
+            [new Uri("https://media.example.test/video/master.m3u8")]);
+
+        BrowserSessionCookie cookie = Assert.Single(snapshot.Cookies);
+        Assert.Equal("root_cookie", cookie.Name);
+        Assert.Equal("media.example.test", cookie.Domain);
+        Assert.False(cookie.IsDomainCookie);
+        Assert.Equal("BrowserCookieSnapshot { redacted }", snapshot.ToString());
+    }
+
     private static BrowserSessionCookie CreateCookie(
         Uri capturedForUri,
         string domain,

@@ -46,6 +46,85 @@ internal sealed record BrowserCookieIdentity(
 
 public static class BrowserCookieImporter
 {
+    /// <summary>
+    /// Captures only cookies that the source jar would send to one of the supplied
+    /// candidate scopes. Domain cookies are deliberately narrowed to host-only cookies
+    /// so an analysis response cannot grant a later job access to sibling hosts.
+    /// </summary>
+    public static BrowserCookieSnapshot CaptureHostOnlySnapshot(
+        CookieContainer source,
+        IReadOnlyList<Uri> candidateScopes)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(candidateScopes);
+        if (candidateScopes.Count is < 1 or > 8)
+        {
+            return new BrowserCookieSnapshot([], []);
+        }
+
+        var scopes = candidateScopes
+            .Where(IsSafeHttpScope)
+            .DistinctBy(scope => scope.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToArray();
+        var captured = new List<BrowserSessionCookie>();
+        var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var scope in scopes)
+        {
+            CookieCollection applicable;
+            try
+            {
+                applicable = source.GetCookies(scope);
+            }
+            catch (CookieException)
+            {
+                continue;
+            }
+
+            foreach (Cookie cookie in applicable)
+            {
+                if (captured.Count >= 128)
+                {
+                    break;
+                }
+
+                DateTimeOffset? expires = cookie.Expires == DateTime.MinValue
+                    ? null
+                    : new DateTimeOffset(cookie.Expires.ToUniversalTime());
+                if (cookie.Expired
+                    || expires is { } expiry && expiry <= DateTimeOffset.UtcNow
+                    || string.IsNullOrWhiteSpace(cookie.Path)
+                    || !cookie.Path.StartsWith("/", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var identity = $"{scope.Scheme}://{scope.IdnHost}:{scope.Port}\n{cookie.Name}\n{cookie.Path}";
+                if (!identities.Add(identity))
+                {
+                    continue;
+                }
+
+                captured.Add(new BrowserSessionCookie(
+                    [scope],
+                    scope,
+                    cookie.Name,
+                    cookie.Value,
+                    scope.IdnHost,
+                    IsDomainCookie: false,
+                    cookie.Path,
+                    cookie.Secure,
+                    cookie.HttpOnly,
+                    // CookieContainer does not expose SameSite. Lax with an exact-host
+                    // site context is the conservative representation for re-import.
+                    BrowserCookieSameSite.Lax,
+                    expires));
+            }
+        }
+
+        return new BrowserCookieSnapshot(scopes, captured);
+    }
+
     public static bool TryImport(CookieContainer destination, BrowserSessionCookie source)
     {
         ArgumentNullException.ThrowIfNull(destination);

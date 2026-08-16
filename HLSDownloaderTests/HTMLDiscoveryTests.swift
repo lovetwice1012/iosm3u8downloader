@@ -1,4 +1,5 @@
 import XCTest
+import WebKit
 @testable import HLSDownloader
 
 final class HTMLMediaExtractorTests: XCTestCase {
@@ -358,6 +359,18 @@ private final class DiscoveryRequestRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+}
+
+final class PlaybackCapturePersistenceTests: XCTestCase {
+    @MainActor
+    func testPlaybackCaptureUsesPersistentWebsiteDataStore() async throws {
+        let session = PlaybackCaptureSession(
+            url: try XCTUnwrap(URL(string: "https://example.com/login"))
+        )
+
+        XCTAssertTrue(session.webView.configuration.websiteDataStore.isPersistent)
+        _ = await session.snapshotAndStop()
     }
 }
 
@@ -1224,6 +1237,266 @@ final class SourceDiscoveryTests: XCTestCase {
         )
     }
 
+    func testImportedCookieGateUsesSchemefulRefererContext() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let hostOnly = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "hostOnly",
+                .value: "exact",
+                .domain: "cdn.example.com",
+                .path: "/"
+            ])
+        )
+        let domain = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "domain",
+                .value: "shared",
+                .domain: ".example.com",
+                .path: "/"
+            ])
+        )
+        client.storeCookies([hostOnly, domain])
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(request, body: "ok", mimeType: "text/plain")
+        }
+
+        let target = try XCTUnwrap(URL(string: "https://cdn.example.com/media/master.m3u8"))
+        _ = try await client.fetch(
+            target,
+            referer: URL(string: "https://page.example.com/watch")
+        )
+        _ = try await client.fetch(
+            target,
+            referer: URL(string: "https://cdn.example.com/watch")
+        )
+        _ = try await client.fetch(
+            target,
+            referer: URL(string: "https://page.example.com.evil/watch")
+        )
+        _ = try await client.fetch(
+            target,
+            referer: URL(string: "http://page.example.com/watch")
+        )
+
+        let requests = recorder.snapshot()
+        XCTAssertEqual(requests.count, 4)
+        let siblingHeader = requests[0].value(forHTTPHeaderField: "Cookie")
+        XCTAssertEqual(siblingHeader, "domain=shared")
+        let exactHeader = try XCTUnwrap(requests[1].value(forHTTPHeaderField: "Cookie"))
+        XCTAssertTrue(exactHeader.contains("hostOnly=exact"))
+        XCTAssertTrue(exactHeader.contains("domain=shared"))
+        XCTAssertNil(requests[2].value(forHTTPHeaderField: "Cookie"))
+        XCTAssertNil(requests[3].value(forHTTPHeaderField: "Cookie"))
+    }
+
+    func testIsolatedDownloadCookieJarKeepsDiscoveryAndJobCookiesWithoutCrossJobLeak() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let analysisClient = HTTPClient(configuration: configuration)
+        let browserCookie = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "browser",
+                .value: "persistent",
+                .domain: "media.example.com",
+                .path: "/",
+                .secure: "TRUE"
+            ])
+        )
+        analysisClient.storeCookies([browserCookie])
+        let pageURL = try XCTUnwrap(URL(string: "https://media.example.com/watch"))
+        let manifestURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/video/master.m3u8")
+        )
+        let segmentURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/segments/0001.ts")
+        )
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            let headers: [String: String]
+            switch request.url?.path {
+            case "/watch":
+                headers = [
+                    "Content-Type": "text/html",
+                    "Set-Cookie": "discovery=one; Path=/; Secure; HttpOnly"
+                ]
+            case "/video/master.m3u8":
+                headers = [
+                    "Content-Type": "application/vnd.apple.mpegurl",
+                    "Set-Cookie": "download=one; Path=/segments; Secure; HttpOnly"
+                ]
+            default:
+                headers = ["Content-Type": "video/mp2t"]
+            }
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: headers
+                )
+            )
+            return (response, Data("ok".utf8))
+        }
+
+        _ = try await analysisClient.fetch(pageURL)
+        let firstJob = analysisClient.makeIsolatedDownloadClient(
+            scopedTo: [pageURL, manifestURL]
+        )
+        _ = try await firstJob.fetch(manifestURL, referer: pageURL)
+        _ = try await firstJob.fetch(segmentURL, referer: manifestURL)
+
+        let firstRequests = recorder.snapshot()
+        let manifestCookies = try XCTUnwrap(
+            firstRequests.first { $0.url == manifestURL }?
+                .value(forHTTPHeaderField: "Cookie")
+        )
+        XCTAssertTrue(manifestCookies.contains("browser=persistent"))
+        XCTAssertTrue(manifestCookies.contains("discovery=one"))
+        let segmentCookies = try XCTUnwrap(
+            firstRequests.first { $0.url == segmentURL }?
+                .value(forHTTPHeaderField: "Cookie")
+        )
+        XCTAssertTrue(segmentCookies.contains("browser=persistent"))
+        XCTAssertTrue(segmentCookies.contains("discovery=one"))
+        XCTAssertTrue(segmentCookies.contains("download=one"))
+
+        analysisClient.resetTransientResponseCookies()
+        let secondJob = analysisClient.makeIsolatedDownloadClient(
+            scopedTo: [pageURL, manifestURL]
+        )
+        _ = try await secondJob.fetch(segmentURL, referer: manifestURL)
+        let secondJobCookies = try XCTUnwrap(
+            recorder.snapshot().last?.value(forHTTPHeaderField: "Cookie")
+        )
+        XCTAssertTrue(secondJobCookies.contains("browser=persistent"))
+        XCTAssertFalse(secondJobCookies.contains("discovery=one"))
+        XCTAssertFalse(secondJobCookies.contains("download=one"))
+    }
+
+    func testPersistentCookieSnapshotPreservesScopeAndExpiry() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        func makeCookie(
+            name: String,
+            domain: String,
+            path: String,
+            secure: Bool = false,
+            expires: Date? = nil
+        ) throws -> HTTPCookie {
+            var properties: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: "secret",
+                .domain: domain,
+                .path: path
+            ]
+            if secure { properties[.secure] = "TRUE" }
+            if let expires { properties[.expires] = expires }
+            return try XCTUnwrap(HTTPCookie(properties: properties))
+        }
+
+        let cookies = try [
+            makeCookie(
+                name: "valid",
+                domain: "media.example.com",
+                path: "/video",
+                secure: true,
+                expires: now.addingTimeInterval(60)
+            ),
+            makeCookie(name: "domain", domain: ".example.com", path: "/video"),
+            makeCookie(name: "hostOnlyParent", domain: "example.com", path: "/video"),
+            makeCookie(name: "lookalike", domain: ".example.com.evil", path: "/video"),
+            makeCookie(name: "wrongPath", domain: "media.example.com", path: "/account"),
+            makeCookie(name: "pathBoundary", domain: "media.example.com", path: "/vid"),
+            makeCookie(
+                name: "expired",
+                domain: "media.example.com",
+                path: "/video",
+                expires: now.addingTimeInterval(-1)
+            ),
+            makeCookie(name: "unobserved", domain: "unrelated.example", path: "/")
+        ]
+        let httpsURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/video/master.m3u8")
+        )
+        let httpURL = try XCTUnwrap(
+            URL(string: "http://media.example.com/video/master.m3u8")
+        )
+
+        let httpsSnapshot = HTTPClient.snapshotCookies(
+            cookies,
+            matching: [httpsURL],
+            now: now
+        )
+        XCTAssertEqual(
+            Set(httpsSnapshot.map(\.name)),
+            Set(["valid", "domain", "wrongPath", "pathBoundary"])
+        )
+        let retained = try XCTUnwrap(httpsSnapshot.first { $0.name == "valid" })
+        XCTAssertEqual(retained.domain, "media.example.com")
+        XCTAssertEqual(retained.path, "/video")
+        XCTAssertTrue(retained.isSecure)
+        XCTAssertEqual(retained.expiresDate, now.addingTimeInterval(60))
+
+        let httpSnapshot = HTTPClient.snapshotCookies(
+            cookies,
+            matching: [httpURL],
+            now: now
+        )
+        XCTAssertEqual(
+            Set(httpSnapshot.map(\.name)),
+            Set(["domain", "wrongPath", "pathBoundary"])
+        )
+    }
+
+    func testSnapshotRetainsSegmentPathButRequestGateEnforcesIt() async throws {
+        let manifestURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/video/master.m3u8")
+        )
+        let segmentCookie = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "segment",
+                .value: "secret",
+                .domain: "media.example.com",
+                .path: "/segments",
+                .secure: "TRUE"
+            ])
+        )
+        let snapshot = HTTPClient.snapshotCookies(
+            [segmentCookie],
+            matching: [manifestURL]
+        )
+        XCTAssertEqual(snapshot.map(\.name), ["segment"])
+        XCTAssertEqual(snapshot.first?.path, "/segments")
+
+        let recorder = DiscoveryRequestRecorder()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        client.storeCookies(snapshot)
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return Self.response(request, body: "ok", mimeType: "text/plain")
+        }
+
+        _ = try await client.fetch(
+            URL(string: "https://media.example.com/segments/0001.ts")!,
+            referer: manifestURL
+        )
+        _ = try await client.fetch(
+            URL(string: "https://media.example.com/other/0001.ts")!,
+            referer: manifestURL
+        )
+
+        let requests = recorder.snapshot()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Cookie"), "segment=secret")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "Cookie"))
+    }
+
     func testRedirectDelegateRejectsPublicToPrivateBeforeFollowing() throws {
         let sourceURL = URL(string: "https://public.example/frame")!
         let privateURL = URL(string: "http://127.0.0.1/player")!
@@ -1254,6 +1527,103 @@ final class SourceDiscoveryTests: XCTestCase {
 
         XCTAssertTrue(receivedDecision)
         XCTAssertNil(redirectedRequest)
+    }
+
+    func testRedirectDelegateRebuildsCookieForTargetPath() throws {
+        let sourceURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/segments/0001.ts")
+        )
+        let targetURL = try XCTUnwrap(
+            URL(string: "https://media.example.com/other/0001.ts")
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let manifestContext = try XCTUnwrap(
+            URL(string: "https://media.example.com/video/master.m3u8")
+        )
+        var originalRequest = URLRequest(url: sourceURL)
+        originalRequest.setValue(
+            manifestContext.absoluteString,
+            forHTTPHeaderField: "Referer"
+        )
+        let task = session.dataTask(with: originalRequest)
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: sourceURL,
+                statusCode: 302,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": targetURL.absoluteString]
+            )
+        )
+        var proposed = URLRequest(url: targetURL)
+        proposed.setValue("segment=secret", forHTTPHeaderField: "Cookie")
+        proposed.setValue(
+            "https://media.example.com/video/master.m3u8",
+            forHTTPHeaderField: "Referer"
+        )
+        let delegate = HTTPRedirectDelegate()
+        var providerTarget: URL?
+        var providerContext: URL?
+        delegate.cookieHeaderProvider = { target, context in
+            providerTarget = target
+            providerContext = context
+            return nil
+        }
+        var redirectedRequest: URLRequest?
+
+        delegate.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: proposed
+        ) {
+            redirectedRequest = $0
+        }
+
+        XCTAssertEqual(providerTarget, targetURL)
+        XCTAssertEqual(providerContext, manifestContext)
+        XCTAssertNil(redirectedRequest?.value(forHTTPHeaderField: "Cookie"))
+    }
+
+    func testRedirectDelegateKeepsOriginalCrossSiteCookieContext() throws {
+        let originalURL = try XCTUnwrap(URL(string: "https://a.example.com/start"))
+        let originalContext = try XCTUnwrap(URL(string: "https://outside.invalid/watch"))
+        let targetURL = try XCTUnwrap(URL(string: "https://b.example.com/media"))
+        var originalRequest = URLRequest(url: originalURL)
+        originalRequest.setValue(originalContext.absoluteString, forHTTPHeaderField: "Referer")
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: originalRequest)
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: originalURL,
+                statusCode: 302,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": targetURL.absoluteString]
+            )
+        )
+        var proposed = URLRequest(url: targetURL)
+        proposed.setValue("domain=secret", forHTTPHeaderField: "Cookie")
+        let delegate = HTTPRedirectDelegate()
+        var providerContext: URL?
+        delegate.cookieHeaderProvider = { _, context in
+            providerContext = context
+            return nil
+        }
+        var redirectedRequest: URLRequest?
+
+        delegate.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: proposed
+        ) {
+            redirectedRequest = $0
+        }
+
+        XCTAssertEqual(providerContext, originalContext)
+        XCTAssertNil(redirectedRequest?.value(forHTTPHeaderField: "Cookie"))
     }
 
     private static let widevineMPD = #"""

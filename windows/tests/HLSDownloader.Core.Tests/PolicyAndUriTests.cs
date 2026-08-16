@@ -56,4 +56,31 @@ public sealed class PolicyAndUriTests
         Assert.False(candidate.CanDownload);
         Assert.True((candidate with { RequestedUri = allowed }).CanDownload);
     }
+
+    [Fact]
+    public async Task WidevineOutboundPolicyChecksExactHostBeforeNetworkPolicy()
+    {
+        var inner = new RecordingOutboundPolicy();
+        var policy = new DownloadableWidevineUriPolicy(inner);
+
+        Assert.False(await policy.IsAllowedAsync(new Uri("https://example.com/video/manifest.mpd")));
+        Assert.Equal(0, inner.CallCount);
+
+        Assert.True(await policy.IsAllowedAsync(
+            new Uri("https://widevine.sprink.cloud/video/manifest.mpd")));
+        Assert.Equal(1, inner.CallCount);
+    }
+
+    private sealed class RecordingOutboundPolicy : IOutboundUriPolicy
+    {
+        public int CallCount { get; private set; }
+
+        public ValueTask<bool> IsAllowedAsync(
+            Uri uri,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return ValueTask.FromResult(true);
+        }
+    }
 }

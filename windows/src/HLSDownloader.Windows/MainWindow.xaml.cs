@@ -6,6 +6,7 @@ using HLSDownloader.Windows.Services;
 using HLSDownloader.Windows.ViewModels;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.Web.WebView2.Core;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
 using Windows.Storage.Pickers;
@@ -369,9 +370,26 @@ public sealed partial class MainWindow : Window
             Environment.NewLine,
             Diagnostics.Reverse().Select(entry => DiagnosticRedactor.Redact(entry.Display)));
 
-    private void OpenProbe(Uri input)
+    private async void OpenProbe(Uri input)
     {
-        var window = new PlaybackProbeWindow(input);
+        CoreWebView2Environment environment;
+        try
+        {
+            environment = await ProbeBrowserEnvironment.GetAsync().WaitAsync(_lifetimeCancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            var safeMessage = SafeMessage(exception.Message);
+            ShowStatus($"再生解析用ブラウザーを初期化できませんでした: {safeMessage}", InfoBarSeverity.Error);
+            AddDiagnostic("ERROR", safeMessage);
+            return;
+        }
+
+        var window = new PlaybackProbeWindow(input, environment);
         _probeWindows.Add(window);
         window.CandidateDetected += ProbeWindow_OnCandidateDetected;
         window.DiagnosticGenerated += ProbeWindow_OnDiagnosticGenerated;
@@ -396,7 +414,17 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            _workflow.RememberBrowserCookies(signal.Url, detected.CookieSnapshot);
+            if (detected.ObservedWidevineLicenseUri is { } observedLicenseUri)
+            {
+                _workflow.RememberObservedWidevineLicense(
+                    signal.Url,
+                    observedLicenseUri,
+                    detected.CookieSnapshot);
+            }
+            else
+            {
+                _workflow.RememberBrowserCookies(signal.Url, detected.CookieSnapshot);
+            }
 
             var pageUri = signal.PageUrl ?? TryGetInputUriSilently() ?? signal.Url;
             var candidate = new MediaCandidate(
@@ -405,7 +433,8 @@ public sealed partial class MainWindow : Window
                 signal.Source == "dom" ? MediaCandidateOrigin.Video : MediaCandidateOrigin.InlineScript,
                 pageUri,
                 PosterUri: signal.ThumbnailUrl,
-                Title: signal.Title);
+                Title: signal.Title,
+                ObservedWidevineLicenseUri: detected.ObservedWidevineLicenseUri);
             AddCandidate(candidate);
         });
     }
@@ -421,13 +450,26 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (Candidates.Any(existing => Uri.Compare(
+        var existing = Candidates.FirstOrDefault(existing => Uri.Compare(
                 existing.Candidate.Uri,
                 candidate.Uri,
                 UriComponents.HttpRequestUrl,
                 UriFormat.SafeUnescaped,
-                StringComparison.OrdinalIgnoreCase) == 0))
+                StringComparison.OrdinalIgnoreCase) == 0);
+        if (existing is not null)
         {
+            if (candidate.ObservedWidevineLicenseUri is not null)
+            {
+                existing.UpdateCandidate(existing.Candidate with
+                {
+                    ObservedWidevineLicenseUri = candidate.ObservedWidevineLicenseUri
+                });
+                var existingCanDownload = _workflow.CanDownload(
+                    existing.Candidate,
+                    out var existingDownloadHint);
+                existing.UpdateDownloadCapability(existingCanDownload, existingDownloadHint);
+            }
+
             return;
         }
 
@@ -498,9 +540,14 @@ public sealed partial class MainWindow : Window
     {
         var available = _wvdStore.HasCredential;
         WvdStatusText.Text = available
-            ? "WVDは現在のWindowsユーザー用に暗号化して保存済みです。Widevine保存providerの接続後に利用できます。"
-            : "WVDは未設定です。認証情報は安全に保管できますが、このビルドのWidevine保存providerは未接続です。";
+            ? "WVDは現在のWindowsユーザー用に暗号化して保存済みです。許可hostの対応Widevine VODをMP4/WAVとして保存できます。"
+            : "WVDは未設定です。許可hostのWidevine保存には、L3 WVDファイルを読み込んでください。";
         RemoveWvdButton.IsEnabled = available;
+        foreach (var item in Candidates)
+        {
+            var canDownload = _workflow.CanDownload(item.Candidate, out var downloadHint);
+            item.UpdateDownloadCapability(canDownload, downloadHint);
+        }
     }
 
     private void ShowStatus(string message, InfoBarSeverity severity)

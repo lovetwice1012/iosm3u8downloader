@@ -21,5 +21,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/HLSDownloader.Core/HLSDownloader.Core.csproj" />
+    <ProjectReference Include="../../src/HLSDownloader.WebProbe/HLSDownloader.WebProbe.csproj" />
   </ItemGroup>
 </Project>

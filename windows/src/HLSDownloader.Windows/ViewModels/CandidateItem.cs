@@ -8,15 +8,17 @@ namespace HLSDownloader.Windows.ViewModels;
 public sealed class CandidateItem : INotifyPropertyChanged
 {
     private BitmapImage? _thumbnail;
+    private bool _canDownload;
+    private string _downloadHint;
 
     public CandidateItem(MediaCandidate candidate, bool canDownload, string downloadHint)
     {
         Candidate = candidate;
-        CanDownload = canDownload;
-        DownloadHint = downloadHint;
+        _canDownload = canDownload;
+        _downloadHint = downloadHint;
     }
 
-    public MediaCandidate Candidate { get; }
+    public MediaCandidate Candidate { get; private set; }
 
     public string Url
     {
@@ -69,9 +71,45 @@ public sealed class CandidateItem : INotifyPropertyChanged
 
     public bool HasThumbnail => Thumbnail is not null;
 
-    public bool CanDownload { get; }
+    public bool CanDownload => _canDownload;
 
-    public string DownloadHint { get; }
+    public string DownloadHint => _downloadHint;
+
+    public void UpdateDownloadCapability(bool canDownload, string downloadHint)
+    {
+        if (_canDownload != canDownload)
+        {
+            _canDownload = canDownload;
+            OnPropertyChanged(nameof(CanDownload));
+        }
+
+        if (!string.Equals(_downloadHint, downloadHint, StringComparison.Ordinal))
+        {
+            _downloadHint = downloadHint;
+            OnPropertyChanged(nameof(DownloadHint));
+        }
+    }
+
+    public void UpdateCandidate(MediaCandidate candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        if (Uri.Compare(
+                Candidate.Uri,
+                candidate.Uri,
+                UriComponents.HttpRequestUrl,
+                UriFormat.SafeUnescaped,
+                StringComparison.OrdinalIgnoreCase) != 0)
+        {
+            throw new ArgumentException("Candidate URI cannot be changed in place.", nameof(candidate));
+        }
+
+        Candidate = candidate;
+        OnPropertyChanged(nameof(Candidate));
+        OnPropertyChanged(nameof(Url));
+        OnPropertyChanged(nameof(Kind));
+        OnPropertyChanged(nameof(Origin));
+        OnPropertyChanged(nameof(Title));
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 

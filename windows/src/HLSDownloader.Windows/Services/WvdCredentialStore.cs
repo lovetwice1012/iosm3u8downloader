@@ -1,16 +1,37 @@
+using System.Security.Cryptography;
+using HLSDownloader.Media;
 using Windows.Security.Cryptography;
 using Windows.Security.Cryptography.DataProtection;
 
 namespace HLSDownloader.Windows.Services;
 
-public sealed class WvdCredentialStore
+public sealed class WvdCredentialStore : IWidevineCredentialSource
 {
     private readonly string _path = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "HLSDownloader.Windows",
         "widevine.wvd.protected");
 
-    public bool HasCredential => File.Exists(_path) && new FileInfo(_path).Length > 0;
+    public bool HasCredential
+    {
+        get
+        {
+            try
+            {
+                return File.Exists(_path) && new FileInfo(_path).Length > 0;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+    }
+
+    bool IWidevineCredentialSource.IsAvailable => HasCredential;
 
     public async Task ImportAsync(string sourcePath, CancellationToken cancellationToken)
     {
@@ -30,6 +51,10 @@ public sealed class WvdCredentialStore
         try
         {
             WvdFileValidator.Validate(clearBytes);
+            using (var client = new WidevineL3Client(clearBytes))
+            {
+                // Constructor validation proves the certificate and RSA private key match.
+            }
             var protector = new DataProtectionProvider("LOCAL=user");
             var encrypted = await protector.ProtectAsync(CryptographicBuffer.CreateFromByteArray(clearBytes));
             CryptographicBuffer.CopyToByteArray(encrypted, out var encryptedBytes);
@@ -38,11 +63,25 @@ public sealed class WvdCredentialStore
         }
         finally
         {
-            Array.Clear(clearBytes);
+            CryptographicOperations.ZeroMemory(clearBytes);
         }
     }
 
-    public async Task<byte[]> LoadAsync(CancellationToken cancellationToken)
+    async Task<WidevineCredentialLease> IWidevineCredentialSource.LoadAsync(
+        CancellationToken cancellationToken)
+    {
+        var clearBytes = await LoadClearBytesAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return new WidevineCredentialLease(clearBytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(clearBytes);
+        }
+    }
+
+    private async Task<byte[]> LoadClearBytesAsync(CancellationToken cancellationToken)
     {
         var encryptedBytes = await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false);
         try
@@ -53,17 +92,21 @@ public sealed class WvdCredentialStore
             try
             {
                 WvdFileValidator.Validate(clearBytes);
+                using (var client = new WidevineL3Client(clearBytes))
+                {
+                    // Reject corrupted or mismatched credentials before leasing them.
+                }
                 return clearBytes;
             }
             catch
             {
-                Array.Clear(clearBytes);
+                CryptographicOperations.ZeroMemory(clearBytes);
                 throw;
             }
         }
         finally
         {
-            Array.Clear(encryptedBytes);
+            CryptographicOperations.ZeroMemory(encryptedBytes);
         }
     }
 

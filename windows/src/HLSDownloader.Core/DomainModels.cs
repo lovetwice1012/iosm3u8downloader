@@ -50,7 +50,8 @@ public sealed record MediaCandidate(
     int IframeDepth = 0,
     Uri? PosterUri = null,
     string? Title = null,
-    Uri? RequestedUri = null)
+    Uri? RequestedUri = null,
+    Uri? ObservedWidevineLicenseUri = null)
 {
     public bool CanDownload => Kind == MediaCandidateKind.Hls ||
         (WidevineDownloadPolicy.IsDownloadableWidevineDomain(RequestedUri ?? Uri) &&

@@ -44,31 +44,35 @@ private actor SegmentProgressTracker {
 final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private let client: HTTPClient
     private let sourceResolver: SourceResolver
-    private let planBuilder: DownloadPlanBuilder
-    private let segmentDownloader: SegmentDownloader
     private let composer = MP4Composer()
     private let sampleAESComposer = SampleAESFFmpegComposer()
     private let fileStore = FileStore()
     private let diagnostics: DiagnosticLogStore
     private let widevineCredentialStore: any WidevineCredentialStoring
     private let widevineProcessor: any WidevineProcessingProviding
+    private let widevineProcessorFactory: ((HTTPClient) -> any WidevineProcessingProviding)?
 
     @MainActor
     convenience init() {
         let configuration = URLSessionConfiguration.ephemeral
         let client = HTTPClient(configuration: configuration)
         let diagnostics = DiagnosticLogStore()
-        let widevineProcessor = WidevineDASHDownloadProvider(
-            segmentFetcher: HTTPDASHSegmentFetcher(client: client),
-            keyAcquirer: WidevineL3KeyAcquirer(transport: client),
-            mediaComposer: FFmpegWidevineMediaComposer()
-        )
+        let widevineProcessorFactory: (HTTPClient) -> any WidevineProcessingProviding = {
+            jobClient in
+            WidevineDASHDownloadProvider(
+                segmentFetcher: HTTPDASHSegmentFetcher(client: jobClient),
+                keyAcquirer: WidevineL3KeyAcquirer(transport: jobClient),
+                mediaComposer: FFmpegWidevineMediaComposer()
+            )
+        }
+        let widevineProcessor = widevineProcessorFactory(client)
         self.init(
             client: client,
             dynamicInspector: WebPageInspector(diagnosticSink: diagnostics.sink),
             diagnostics: diagnostics,
             widevineCredentialStore: KeychainWidevineCredentialStore(),
-            widevineProcessor: widevineProcessor
+            widevineProcessor: widevineProcessor,
+            widevineProcessorFactory: widevineProcessorFactory
         )
     }
 
@@ -77,23 +81,35 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         dynamicInspector: (any DynamicPageInspecting)? = nil,
         diagnostics: DiagnosticLogStore = DiagnosticLogStore(),
         widevineCredentialStore: any WidevineCredentialStoring = KeychainWidevineCredentialStore(),
-        widevineProcessor: any WidevineProcessingProviding = UnconfiguredWidevineProcessingProvider()
+        widevineProcessor: any WidevineProcessingProviding = UnconfiguredWidevineProcessingProvider(),
+        widevineProcessorFactory: ((HTTPClient) -> any WidevineProcessingProviding)? = nil
     ) {
         self.client = client
         self.diagnostics = diagnostics
         self.widevineCredentialStore = widevineCredentialStore
         self.widevineProcessor = DomainRestrictedWidevineProcessingProvider(base: widevineProcessor)
+        if let widevineProcessorFactory {
+            self.widevineProcessorFactory = { jobClient in
+                DomainRestrictedWidevineProcessingProvider(
+                    base: widevineProcessorFactory(jobClient)
+                )
+            }
+        } else {
+            self.widevineProcessorFactory = nil
+        }
         let resolver = SourceResolver(
             client: client,
             dynamicInspector: dynamicInspector,
             diagnosticSink: diagnostics.sink
         )
         sourceResolver = resolver
-        planBuilder = DownloadPlanBuilder(resolver: resolver)
-        segmentDownloader = SegmentDownloader(client: client)
     }
 
     func discover(input: String) async throws -> HLSDiscoveryResult {
+        // Keep native Set-Cookie state inside one user-initiated discovery.
+        // Persistent browser authentication is held separately by WebKit and
+        // re-imported after each inspection.
+        client.resetTransientResponseCookies()
         do {
             let result = try await sourceResolver.discover(input: input)
             diagnostics.record(
@@ -181,7 +197,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
     func download(input: String, progress: @escaping ProgressHandler) async throws -> DownloadResult {
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
-        let discovery = try await sourceResolver.discover(input: input)
+        let discovery = try await discover(input: input)
         guard let candidate = discovery.candidates.first else {
             throw HLSError.noPlaylistFound
         }
@@ -197,36 +213,53 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             "candidate selected origin=\(candidate.origin.rawValue) depth=\(candidate.iframeDepth) \(DiagnosticPrivacy.urlSummary(candidate.playlistURL))"
         )
         await progress(DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0))
+        let jobClient = client.makeIsolatedDownloadClient(
+            scopedTo: downloadCookieScope(for: candidate)
+        )
+        let jobResolver = SourceResolver(
+            client: jobClient,
+            diagnosticSink: diagnostics.sink
+        )
+        let jobPlanBuilder = DownloadPlanBuilder(resolver: jobResolver)
+        let jobSegmentDownloader = SegmentDownloader(client: jobClient)
+        let jobWidevineProcessor = widevineProcessorFactory?(jobClient) ?? widevineProcessor
+
         if candidate.kind == .widevineDASH {
             guard isDownloadableWidevineDomain(candidate.playlistURL) else {
                 diagnostics.record("widevine", "download start rejected by domain policy")
                 throw WidevineProcessingError.domainNotAllowed
             }
-            guard widevineProcessor.isConfigured else {
+            guard jobWidevineProcessor.isConfigured else {
                 diagnostics.record("widevine", "download start rejected because processor is unconfigured")
                 throw WidevineProcessingError.unconfigured
             }
-            guard let document = candidate.document else {
+            guard let discoveredDocument = candidate.document else {
                 diagnostics.record("widevine", "download start rejected because validated MPD is missing")
                 throw HLSError.invalidPlaylist("Widevine MPDを再検証できません")
+            }
+            let document: PlaylistDocument
+            if widevineProcessorFactory == nil {
+                document = discoveredDocument
+            } else {
+                document = try await reloadWidevineDocument(candidate, using: jobClient)
             }
             return try await downloadWidevineWithBackgroundExecution(
                 document: document,
                 playbackContext: candidate.widevinePlaybackContext,
+                processor: jobWidevineProcessor,
                 progress: progress
             )
         }
 
         let document: PlaylistDocument
         do {
-            if let discoveredDocument = candidate.document {
-                document = discoveredDocument
-            } else {
-                document = try await sourceResolver.load(
-                    candidate.request,
-                    referer: candidate.requestReferer
-                )
-            }
+            // Refetch the selected playlist inside the job jar so Set-Cookie
+            // issued by the playlist is available to variants, keys and
+            // segments, but never returns to the resolver client.
+            document = try await jobResolver.load(
+                candidate.request,
+                referer: candidate.requestReferer
+            )
         } catch {
             let code = DiagnosticPrivacy.errorCode(error)
             diagnostics.record(
@@ -238,8 +271,65 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         return try await downloadWithBackgroundExecution(
             document: document,
             requestedPlaylistURL: candidate.request.primary,
+            planBuilder: jobPlanBuilder,
+            segmentDownloader: jobSegmentDownloader,
             progress: progress
         )
+    }
+
+    private func downloadCookieScope(for candidate: HLSCandidate) -> [URL] {
+        var urls = candidate.request.all + [candidate.pageURL]
+        if let referer = candidate.requestReferer { urls.append(referer) }
+        if let effectiveURL = candidate.document?.effectiveURL { urls.append(effectiveURL) }
+        if let playbackContext = candidate.widevinePlaybackContext {
+            urls.append(playbackContext.pageURL)
+            urls.append(playbackContext.licenseServerURL)
+        }
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.absoluteString).inserted }
+    }
+
+    private func reloadWidevineDocument(
+        _ candidate: HLSCandidate,
+        using jobClient: HTTPClient
+    ) async throws -> PlaylistDocument {
+        guard isDownloadableWidevineDomain(candidate.request.primary) else {
+            throw WidevineProcessingError.domainNotAllowed
+        }
+        let payload = try await jobClient.fetch(
+            candidate.request,
+            referer: candidate.requestReferer
+        )
+        guard isDownloadableWidevineDomain(payload.effectiveURL) else {
+            throw WidevineProcessingError.domainNotAllowed
+        }
+        let manifest = try DASHManifestParser.parse(
+            data: payload.data,
+            effectiveURL: payload.effectiveURL
+        )
+        guard manifest.isWidevine,
+              let text = Self.decodeManifestText(payload.data) else {
+            throw HLSError.invalidPlaylist("Widevine MPD could not be validated")
+        }
+        return PlaylistDocument(
+            text: text,
+            effectiveURL: payload.effectiveURL,
+            referer: candidate.requestReferer
+        )
+    }
+
+    private static func decodeManifestText(_ data: Data) -> String? {
+        for encoding in [
+            String.Encoding.utf8,
+            .utf16,
+            .utf16LittleEndian,
+            .utf16BigEndian
+        ] {
+            if let value = String(data: data, encoding: encoding) {
+                return value
+            }
+        }
+        return nil
     }
 
     func thumbnailData(for candidate: HLSCandidate) async -> Data? {
@@ -269,6 +359,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func downloadWidevineWithBackgroundExecution(
         document: PlaylistDocument,
         playbackContext: WidevinePlaybackContext?,
+        processor: any WidevineProcessingProviding,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         try await BackgroundExecutionCoordinator.shared.run(
@@ -281,7 +372,8 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             )
             return try await downloadWidevine(
                 document: document,
-                playbackContext: playbackContext
+                playbackContext: playbackContext,
+                processor: processor
             ) { update in
                 await backgroundProgress.report(update)
                 await progress(update)
@@ -292,6 +384,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func downloadWidevine(
         document: PlaylistDocument,
         playbackContext: WidevinePlaybackContext?,
+        processor: any WidevineProcessingProviding,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         guard isDownloadableWidevineDomain(document.effectiveURL) else {
@@ -336,7 +429,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         guard isDownloadableWidevineDomain(document.effectiveURL) else {
             throw WidevineProcessingError.domainNotAllowed
         }
-        let processed = try await widevineProcessor.process(
+        let processed = try await processor.process(
             manifest: WidevineManifestDocument(
                 sourceURL: document.effectiveURL,
                 data: manifestData
@@ -415,6 +508,8 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func downloadWithBackgroundExecution(
         document: PlaylistDocument,
         requestedPlaylistURL: URL,
+        planBuilder: DownloadPlanBuilder,
+        segmentDownloader: SegmentDownloader,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         try await BackgroundExecutionCoordinator.shared.run(
@@ -427,7 +522,9 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             )
             return try await download(
                 document: document,
-                requestedPlaylistURL: requestedPlaylistURL
+                requestedPlaylistURL: requestedPlaylistURL,
+                planBuilder: planBuilder,
+                segmentDownloader: segmentDownloader
             ) { update in
                 await backgroundProgress.report(update)
                 await progress(update)
@@ -438,6 +535,8 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func download(
         document: PlaylistDocument,
         requestedPlaylistURL: URL,
+        planBuilder: DownloadPlanBuilder,
+        segmentDownloader: SegmentDownloader,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         let jobDirectory = try fileStore.makeJobDirectory()
@@ -462,6 +561,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 return try await downloadSampleAES(
                     preparedPlan,
                     jobDirectory: jobDirectory,
+                    segmentDownloader: segmentDownloader,
                     progress: progress
                 )
             }
@@ -563,6 +663,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func downloadSampleAES(
         _ prepared: PreparedDownloadPlan,
         jobDirectory: URL,
+        segmentDownloader: SegmentDownloader,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         try prepared.validateSampleAESPermit()

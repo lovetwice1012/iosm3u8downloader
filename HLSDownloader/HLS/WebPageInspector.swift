@@ -57,6 +57,32 @@ struct DynamicPageInspection: @unchecked Sendable {
     static let empty = DynamicPageInspection(media: [], cookies: [])
 }
 
+private func observedCookieURLs(
+    rootURL: URL,
+    media: [DynamicMediaReference],
+    licenseRequests: [DynamicLicenseReference],
+    additionalPageURLs: [URL]
+) -> [URL] {
+    var result: [URL] = []
+    var seen = Set<String>()
+    let candidates = [rootURL]
+        + additionalPageURLs
+        + media.flatMap { [$0.pageURL, $0.url] }
+        + licenseRequests.flatMap { [$0.pageURL, $0.url] }
+    for url in candidates {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              seen.insert(url.absoluteString).inserted else {
+            continue
+        }
+        result.append(url)
+    }
+    return result
+}
+
 struct PlaybackLicenseProbePayload {
     let rawURL: String
     let metadata: WidevineLicenseRequestMetadata
@@ -193,7 +219,11 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     private let seedCookies: [HTTPCookie]
     private let diagnosticSink: DiagnosticSink?
     private let messageNonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-    private let websiteDataStore = WKWebsiteDataStore.nonPersistent()
+    // Use WebKit's persistent profile so authenticated pages keep their
+    // standard cookies, localStorage, IndexedDB and caches across inspections
+    // and app launches. Cookie expiry and SameSite/Secure semantics remain
+    // controlled by WebKit and the origin server.
+    private let websiteDataStore = WKWebsiteDataStore.default()
     private var webView: WKWebView?
     private var continuation: CheckedContinuation<DynamicPageInspection, Never>?
     private var hardTimeoutTask: Task<Void, Never>?
@@ -296,12 +326,13 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         }
     }
 
-    private func allCookies() async -> [HTTPCookie] {
-        await withCheckedContinuation { continuation in
+    private func cookies(matching observedURLs: [URL]) async -> [HTTPCookie] {
+        let allCookies: [HTTPCookie] = await withCheckedContinuation { continuation in
             websiteDataStore.httpCookieStore.getAllCookies {
                 continuation.resume(returning: $0)
             }
         }
+        return HTTPClient.snapshotCookies(allCookies, matching: observedURLs)
     }
 
     private func scheduleSettle(
@@ -331,6 +362,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         hardTimeoutTask = nil
         settleTask = nil
 
+        let currentPageURL = webView?.url
         if let webView {
             webView.stopLoading()
             webView.navigationDelegate = nil
@@ -342,8 +374,16 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         }
         webView = nil
 
-        let cookies = await allCookies()
         let media = referenceOrder.compactMap { references[$0] }
+        let cookies = await cookies(
+            matching: observedCookieURLs(
+                rootURL: rootURL,
+                media: media,
+                licenseRequests: licenseRequests,
+                additionalPageURLs: navigationContexts.values.map { $0.pageURL }
+                    + [currentPageURL].compactMap { $0 }
+            )
+        )
         log(
             "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
         )
@@ -1323,7 +1363,10 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         self.seedCookies = seedCookies
         self.diagnosticSink = diagnosticSink
 
-        let websiteDataStore = WKWebsiteDataStore.nonPersistent()
+        // The visible capture browser behaves like a normal browser profile.
+        // Do not clear this store when a capture ends; users must be able to
+        // stay signed in between capture sessions and app launches.
+        let websiteDataStore = WKWebsiteDataStore.default()
         self.websiteDataStore = websiteDataStore
         let contentController = WKUserContentController()
         self.contentController = contentController
@@ -1425,7 +1468,15 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         startupTask?.cancel()
         startupTask = nil
         webView.stopLoading()
-        let cookies = await allCookies()
+        let cookies = await cookies(
+            matching: observedCookieURLs(
+                rootURL: rootURL,
+                media: references,
+                licenseRequests: licenseRequests,
+                additionalPageURLs: navigationContexts.values.map { $0.pageURL }
+                    + [currentURL, webView.url].compactMap { $0 }
+            )
+        )
         let snapshot = DynamicPageInspection(
             media: references,
             cookies: cookies,
@@ -1802,12 +1853,13 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         }
     }
 
-    private func allCookies() async -> [HTTPCookie] {
-        await withCheckedContinuation { continuation in
+    private func cookies(matching observedURLs: [URL]) async -> [HTTPCookie] {
+        let allCookies: [HTTPCookie] = await withCheckedContinuation { continuation in
             websiteDataStore.httpCookieStore.getAllCookies {
                 continuation.resume(returning: $0)
             }
         }
+        return HTTPClient.snapshotCookies(allCookies, matching: observedURLs)
     }
 
     private func cleanup() {

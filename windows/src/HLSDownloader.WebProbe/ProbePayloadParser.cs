@@ -46,6 +46,7 @@ public static class ProbePayloadParser
             var title = Limit(ReadString(root, "title"), MaximumTextLength);
             var keySystem = Limit(ReadString(root, "keySystem"), 160);
             var sequence = Math.Max(0, ReadInt64(root, "seq") ?? 0);
+            var emePhase = ParseEmePhase(ReadString(root, "phase"));
 
             Uri? thumbnail = null;
             if (TryNormalizeHttpUrl(ReadString(root, "thumbnail"), out var parsedThumbnail))
@@ -59,8 +60,29 @@ public static class ProbePayloadParser
                 pageUrl = parsedPageUrl;
             }
 
-            var parsed = new ProbeSignal(kind, url!, source, mime, thumbnail, title, keySystem, sequence, pageUrl);
-            if (!parsed.IsManifest && kind is not ProbeSignalKind.MediaElement and not ProbeSignalKind.EncryptedMedia)
+            var parsed = new ProbeSignal(
+                kind,
+                url!,
+                source,
+                mime,
+                thumbnail,
+                title,
+                keySystem,
+                sequence,
+                pageUrl,
+                emePhase);
+            if (!parsed.IsManifest
+                && kind is not ProbeSignalKind.MediaElement
+                    and not ProbeSignalKind.EncryptedMedia
+                    and not ProbeSignalKind.EncryptedMediaLifecycle)
+            {
+                return false;
+            }
+
+            if (kind == ProbeSignalKind.EncryptedMediaLifecycle
+                && (emePhase is null
+                    || sequence <= 0
+                    || !string.Equals(keySystem, "com.widevine.alpha", StringComparison.OrdinalIgnoreCase)))
             {
                 return false;
             }
@@ -127,7 +149,16 @@ public static class ProbePayloadParser
         "manifest" => ProbeSignalKind.Manifest,
         "media" => ProbeSignalKind.MediaElement,
         "eme" => ProbeSignalKind.EncryptedMedia,
+        "eme-lifecycle" => ProbeSignalKind.EncryptedMediaLifecycle,
         _ => ProbeSignalKind.Network
+    };
+
+    private static ProbeEmeLifecyclePhase? ParseEmePhase(string? raw) => raw switch
+    {
+        "generate-request-started" => ProbeEmeLifecyclePhase.GenerateRequestStarted,
+        "generate-request-succeeded" => ProbeEmeLifecyclePhase.GenerateRequestSucceeded,
+        "update-succeeded" => ProbeEmeLifecyclePhase.UpdateSucceeded,
+        _ => null
     };
 
     private static string? ReadString(JsonElement root, string name)

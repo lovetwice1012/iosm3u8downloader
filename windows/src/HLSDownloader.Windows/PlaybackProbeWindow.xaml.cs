@@ -1,3 +1,4 @@
+using System.Globalization;
 using HLSDownloader.Core;
 using HLSDownloader.WebProbe;
 using HLSDownloader.Windows.Services;
@@ -13,20 +14,33 @@ namespace HLSDownloader.Windows;
 
 public sealed record PlaybackProbeCandidate(
     ProbeSignal Signal,
-    BrowserCookieSnapshot CookieSnapshot);
+    BrowserCookieSnapshot CookieSnapshot,
+    Uri? ObservedWidevineLicenseUri = null);
 
 public sealed partial class PlaybackProbeWindow : Window
 {
-    private readonly ProbeSession _session = new();
-    private readonly Uri _initialUri;
-    private int _manifestCount;
+    private const int MaximumResponseSniffAttempts = 64;
+    private static readonly TimeSpan ResponseSniffTimeout = TimeSpan.FromSeconds(3);
 
-    public PlaybackProbeWindow(Uri initialUri)
+    private readonly ProbeSession _session = new();
+    private readonly WidevineLicenseObservationTracker _widevineLicenseTracker = new(
+        WidevineDownloadPolicy.DownloadableWidevineHosts);
+    private readonly Dictionary<string, ProbeSignal> _manifestSignals = new(StringComparer.Ordinal);
+    private readonly Uri _initialUri;
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private readonly SemaphoreSlim _responseSniffSlots = new(2, 2);
+    private int _browserInitializationFailureReported;
+    private int _manifestCount;
+    private int _responseSniffAttempts;
+
+    public PlaybackProbeWindow(Uri initialUri, CoreWebView2Environment environment)
     {
+        ArgumentNullException.ThrowIfNull(environment);
         _initialUri = initialUri;
         InitializeComponent();
         AddressTextBox.Text = initialUri.AbsoluteUri;
         Closed += OnClosed;
+        _ = InitializeBrowserAsync(environment);
 
         if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
@@ -38,12 +52,30 @@ public sealed partial class PlaybackProbeWindow : Window
 
     public event EventHandler<string>? DiagnosticGenerated;
 
+    private async Task InitializeBrowserAsync(CoreWebView2Environment environment)
+    {
+        try
+        {
+            // Explicitly inject the shared LocalAppData-backed environment before
+            // the window is activated. Never fall back to the portable EXE folder.
+            await Browser.EnsureCoreWebView2Async(environment);
+        }
+        catch (Exception exception)
+        {
+            ReportBrowserInitializationFailure(exception.Message);
+        }
+    }
+
     private async void Browser_OnCoreWebView2Initialized(WebView2 sender, CoreWebView2InitializedEventArgs args)
     {
+        if (_lifetimeCancellation.IsCancellationRequested)
+        {
+            return;
+        }
+
         if (args.Exception is not null || sender.CoreWebView2 is null)
         {
-            BrowserProgress.IsActive = false;
-            ShowError($"WebView2を初期化できませんでした: {args.Exception?.Message}");
+            ReportBrowserInitializationFailure(args.Exception?.Message ?? "CoreWebView2を利用できません。");
             return;
         }
 
@@ -56,17 +88,9 @@ public sealed partial class PlaybackProbeWindow : Window
         core.WebResourceResponseReceived += Core_OnWebResourceResponseReceived;
         core.NewWindowRequested += Core_OnNewWindowRequested;
 
-        foreach (var context in new[]
-                 {
-                     CoreWebView2WebResourceContext.Media,
-                     CoreWebView2WebResourceContext.XmlHttpRequest,
-                     CoreWebView2WebResourceContext.Fetch,
-                     CoreWebView2WebResourceContext.Document,
-                     CoreWebView2WebResourceContext.Other
-                 })
-        {
-            core.AddWebResourceRequestedFilter("*", context);
-        }
+        // Includes script, text-track, manifest, websocket handshake, ping and
+        // future contexts that were missed by the previous hand-picked list.
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
 
         try
         {
@@ -79,7 +103,7 @@ public sealed partial class PlaybackProbeWindow : Window
         catch (Exception exception)
         {
             BrowserProgress.IsActive = false;
-            ShowError($"再生解析を開始できませんでした: {DiagnosticRedactor.Redact(exception.Message)}");
+            ShowError($"再生解析を開始できませんでした: {SafeMessage(exception.Message)}");
         }
     }
 
@@ -125,22 +149,75 @@ public sealed partial class PlaybackProbeWindow : Window
         }
     }
 
-    private void Core_OnWebResourceResponseReceived(
+    private async void Core_OnWebResourceResponseReceived(
         object? sender,
         CoreWebView2WebResourceResponseReceivedEventArgs args)
     {
-        string? contentType = null;
         try
         {
-            contentType = args.Response.Headers.GetHeader("Content-Type");
+            await ProcessWebResourceResponseAsync(args);
         }
-        catch (ArgumentException)
+        catch (OperationCanceledException)
         {
-            // Missing header is expected for some responses.
+        }
+        catch (Exception)
+        {
+            // A response can disappear while WebView2 is closing. Never log its details.
+        }
+    }
+
+    private async Task ProcessWebResourceResponseAsync(
+        CoreWebView2WebResourceResponseReceivedEventArgs args)
+    {
+        if (!ProbePayloadParser.TryNormalizeHttpUrl(args.Request.Uri, out var responseUri)
+            || responseUri is null)
+        {
+            return;
+        }
+
+        var contentType = TryGetResponseHeader(args, "Content-Type");
+        var statusCode = args.Response.StatusCode;
+        var requestMethod = args.Request.Method;
+        var isDeclaredManifest = ResourceClassifier.IsManifest(responseUri, contentType);
+
+        // Only method, normalized URI and status are observed. Request/response
+        // headers and bodies are never inspected for license correlation.
+        if (!isDeclaredManifest)
+        {
+            _widevineLicenseTracker.ObserveSuccessfulPost(
+                responseUri,
+                requestMethod,
+                statusCode,
+                DateTimeOffset.UtcNow);
+        }
+
+        if (statusCode is >= 200 and < 300
+            && isDeclaredManifest
+            && (responseUri.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase)
+                || contentType?.Contains("dash+xml", StringComparison.OrdinalIgnoreCase) == true))
+        {
+            _widevineLicenseTracker.ObserveManifest(responseUri);
+        }
+
+        if (statusCode is >= 300 and < 400
+            && ManifestResponseSniffer.TryResolveRedirectTarget(
+                responseUri,
+                TryGetResponseHeader(args, "Location"),
+                out var redirectTarget)
+            && redirectTarget is not null
+            && ProbePayloadParser.TryCreateHostSignal(
+                redirectTarget.AbsoluteUri,
+                "webview-redirect",
+                null,
+                _session,
+                out var redirectSignal)
+            && redirectSignal is not null)
+        {
+            HandleSignal(redirectSignal);
         }
 
         if (ProbePayloadParser.TryCreateHostSignal(
-                args.Request.Uri,
+                responseUri.AbsoluteUri,
                 "webview-response",
                 contentType,
                 _session,
@@ -148,7 +225,95 @@ public sealed partial class PlaybackProbeWindow : Window
             && signal is not null)
         {
             HandleSignal(signal);
+            return;
         }
+
+        var declaredContentLength = TryParseContentLength(TryGetResponseHeader(args, "Content-Length"));
+        if (!string.Equals(requestMethod, "GET", StringComparison.OrdinalIgnoreCase)
+            || !ManifestResponseSniffer.ShouldInspect(
+                responseUri,
+                contentType,
+                declaredContentLength,
+                statusCode)
+            || !await _responseSniffSlots.WaitAsync(0))
+        {
+            return;
+        }
+
+        try
+        {
+            if (Interlocked.Increment(ref _responseSniffAttempts) > MaximumResponseSniffAttempts)
+            {
+                return;
+            }
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                _lifetimeCancellation.Token);
+            timeout.CancelAfter(ResponseSniffTimeout);
+
+            var contentOperation = args.Response.GetContentAsync();
+            using var cancellationRegistration = timeout.Token.Register(contentOperation.Cancel);
+            using var randomAccessContent = await contentOperation;
+            using var content = randomAccessContent.AsStreamForRead();
+            var kind = await ManifestResponseSniffer.ClassifyPrefixAsync(
+                content,
+                timeout.Token);
+            var sniffedContentType = kind switch
+            {
+                SniffedManifestKind.Hls => "application/vnd.apple.mpegurl",
+                SniffedManifestKind.Dash => "application/dash+xml",
+                _ => null
+            };
+            if (sniffedContentType is not null
+                && ProbePayloadParser.TryCreateHostSignal(
+                    responseUri.AbsoluteUri,
+                    "webview-response-sniff",
+                    sniffedContentType,
+                    _session,
+                    out var sniffedSignal)
+                && sniffedSignal is not null)
+            {
+                if (kind == SniffedManifestKind.Dash)
+                {
+                    _widevineLicenseTracker.ObserveManifest(responseUri);
+                }
+
+                HandleSignal(sniffedSignal);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Closing the window or exceeding the short inspection deadline is expected.
+        }
+        catch (Exception)
+        {
+            // A response body can be unavailable. Never emit response details or headers.
+        }
+        finally
+        {
+            _responseSniffSlots.Release();
+        }
+    }
+
+    private static string? TryGetResponseHeader(
+        CoreWebView2WebResourceResponseReceivedEventArgs args,
+        string name)
+    {
+        try
+        {
+            return args.Response.Headers.GetHeader(name);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static long? TryParseContentLength(string? raw)
+    {
+        return long.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
     }
 
     private void Core_OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs args)
@@ -179,6 +344,19 @@ public sealed partial class PlaybackProbeWindow : Window
 
     private async void HandleSignal(ProbeSignal signal)
     {
+        if (signal.Kind == ProbeSignalKind.EncryptedMediaLifecycle)
+        {
+            if (signal.EmePhase is { } phase
+                && _widevineLicenseTracker.ObserveLifecycle(
+                    phase,
+                    DateTimeOffset.UtcNow) is { } association)
+            {
+                await PublishWidevineLicenseAssociationAsync(association);
+            }
+
+            return;
+        }
+
         if (signal.IsDash)
         {
             if (!WidevineDownloadPolicy.IsDownloadableWidevineDomain(signal.Url))
@@ -201,6 +379,8 @@ public sealed partial class PlaybackProbeWindow : Window
             return;
         }
 
+        RememberManifestSignal(signal);
+
         _manifestCount++;
         ProbeInfoBar.Severity = InfoBarSeverity.Success;
         ProbeInfoBar.Message = $"ページ内の再生を解析中です。候補 {_manifestCount} 件";
@@ -209,11 +389,48 @@ public sealed partial class PlaybackProbeWindow : Window
         CandidateDetected?.Invoke(this, new PlaybackProbeCandidate(signal, cookieSnapshot));
     }
 
-    private async Task<BrowserCookieSnapshot> CaptureCookiesAsync(ProbeSignal signal)
+    private void RememberManifestSignal(ProbeSignal signal)
+    {
+        var key = signal.Url.AbsoluteUri;
+        if (!_manifestSignals.TryGetValue(key, out var existing)
+            || (existing.PageUrl is null && signal.PageUrl is not null)
+            || (existing.ThumbnailUrl is null && signal.ThumbnailUrl is not null))
+        {
+            _manifestSignals[key] = signal;
+        }
+    }
+
+    private async Task PublishWidevineLicenseAssociationAsync(
+        WidevineLicenseAssociation association)
+    {
+        if (!_manifestSignals.TryGetValue(association.ManifestUri.AbsoluteUri, out var signal))
+        {
+            signal = new ProbeSignal(
+                ProbeSignalKind.Manifest,
+                association.ManifestUri,
+                "webview-response",
+                "application/dash+xml",
+                PageUrl: Browser.Source ?? _initialUri);
+            RememberManifestSignal(signal);
+        }
+
+        var cookieSnapshot = await CaptureCookiesAsync(signal, association.LicenseUri);
+        CandidateDetected?.Invoke(
+            this,
+            new PlaybackProbeCandidate(signal, cookieSnapshot, association.LicenseUri));
+        DiagnosticGenerated?.Invoke(
+            this,
+            "Widevine license endpointを再生時の通信から関連付けました（URI・query・bodyはログへ出力しません）。");
+    }
+
+    private async Task<BrowserCookieSnapshot> CaptureCookiesAsync(
+        ProbeSignal signal,
+        params Uri[] additionalScopes)
     {
         var requestedScopes = new[] { signal.Url, signal.PageUrl }
             .Where(uri => uri is not null)
             .Cast<Uri>()
+            .Concat(additionalScopes.Where(uri => uri is not null))
             .DistinctBy(uri => uri.AbsoluteUri)
             .Take(8)
             .ToArray();
@@ -333,13 +550,43 @@ public sealed partial class PlaybackProbeWindow : Window
         DiagnosticGenerated?.Invoke(this, message);
     }
 
+    private void ReportBrowserInitializationFailure(string message)
+    {
+        if (_lifetimeCancellation.IsCancellationRequested
+            || Interlocked.Exchange(ref _browserInitializationFailureReported, 1) != 0)
+        {
+            return;
+        }
+
+        BrowserProgress.IsActive = false;
+        ShowError($"WebView2を初期化できませんでした: {SafeMessage(message)}");
+    }
+
     private static string RedactForLog(Uri uri)
     {
         return DiagnosticRedactor.SummarizeUri(uri);
     }
 
+    private static string SafeMessage(string? message)
+    {
+        var safe = DiagnosticRedactor.Redact(message);
+        foreach (var path in new[]
+                 {
+                     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                     Path.GetTempPath(),
+                     AppContext.BaseDirectory
+                 }.Where(path => !string.IsNullOrWhiteSpace(path)).OrderByDescending(path => path.Length))
+        {
+            safe = safe.Replace(path, "[local-path]", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return safe;
+    }
+
     private void OnClosed(object sender, WindowEventArgs args)
     {
+        _lifetimeCancellation.Cancel();
         if (Browser.CoreWebView2 is { } core)
         {
             core.WebMessageReceived -= Core_OnWebMessageReceived;
