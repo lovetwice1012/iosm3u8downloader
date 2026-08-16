@@ -1,0 +1,14 @@
+<Window
+    x:Class="HLSDownloader.Windows.MediaPlaybackWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="HLS再生">
+    <Grid Background="Black">
+        <MediaPlayerElement
+            x:Name="Player"
+            AreTransportControlsEnabled="True"
+            AutoPlay="True"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch" />
+    </Grid>
+</Window>

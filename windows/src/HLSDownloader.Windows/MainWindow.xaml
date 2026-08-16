@@ -1,0 +1,256 @@
+<Window
+    x:Class="HLSDownloader.Windows.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:HLSDownloader.Windows"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="HLS Downloader">
+
+    <Grid Background="{ThemeResource PageBackgroundBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="48" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Padding="16,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <FontIcon VerticalAlignment="Center" FontSize="19" Glyph="&#xE714;" />
+            <TextBlock
+                Grid.Column="1"
+                Margin="10,0,0,0"
+                VerticalAlignment="Center"
+                FontSize="14"
+                FontWeight="SemiBold"
+                Text="HLS Downloader" />
+        </Grid>
+
+        <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel
+                MaxWidth="960"
+                Padding="24,20,24,40"
+                HorizontalAlignment="Stretch"
+                Spacing="16">
+                <StackPanel Spacing="5">
+                    <TextBlock FontSize="30" FontWeight="Bold" Text="動画を解析して保存" />
+                    <TextBlock
+                        Style="{StaticResource CaptionStyle}"
+                        Text="m3u8 / MPD の直接URLまたは動画ページを解析します。ページ内の候補はサムネイル付き一覧から選べます。" />
+                </StackPanel>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="14">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="URL解析" />
+                        <TextBox
+                            x:Name="InputTextBox"
+                            MinHeight="48"
+                            PlaceholderText="https://example.com/video/master.m3u8"
+                            TextChanged="InputTextBox_OnTextChanged" />
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Button Click="PasteButton_OnClick" Content="貼り付け" />
+                            <Button
+                                x:Name="AnalyzeButton"
+                                Grid.Column="1"
+                                HorizontalAlignment="Stretch"
+                                Click="AnalyzeButton_OnClick"
+                                Content="解析" />
+                            <Button
+                                x:Name="ProbeButton"
+                                Grid.Column="2"
+                                Click="ProbeButton_OnClick"
+                                Content="再生解析（α）" />
+                        </Grid>
+                        <InfoBar
+                            x:Name="StatusInfoBar"
+                            IsClosable="False"
+                            IsOpen="False"
+                            Severity="Informational" />
+                    </StackPanel>
+                </Border>
+
+                <Border x:Name="CandidatesCard" Visibility="Collapsed" Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="12">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="動画候補" />
+                            <TextBlock
+                                x:Name="CandidateCountText"
+                                Grid.Column="1"
+                                VerticalAlignment="Center"
+                                Style="{StaticResource CaptionStyle}" />
+                        </Grid>
+                        <ListView
+                            x:Name="CandidateList"
+                            IsItemClickEnabled="False"
+                            ItemsSource="{x:Bind Candidates}"
+                            SelectionMode="None">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <Border
+                                        Margin="0,0,0,10"
+                                        Padding="12"
+                                        Background="{ThemeResource SecondaryCardBrush}"
+                                        BorderBrush="{ThemeResource SubtleBorderBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="12">
+                                        <Grid ColumnSpacing="14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="150" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Border
+                                                Width="150"
+                                                Height="90"
+                                                Background="{ThemeResource PlaceholderFillBrush}"
+                                                CornerRadius="9">
+                                                <Grid>
+                                                    <FontIcon
+                                                        HorizontalAlignment="Center"
+                                                        VerticalAlignment="Center"
+                                                        FontSize="28"
+                                                        Foreground="{ThemeResource TertiaryTextBrush}"
+                                                        Glyph="&#xE714;" />
+                                                    <Image Source="{Binding Thumbnail}" Stretch="UniformToFill" />
+                                                </Grid>
+                                            </Border>
+                                            <StackPanel Grid.Column="1" Spacing="7">
+                                                <TextBlock
+                                                    FontSize="16"
+                                                    FontWeight="SemiBold"
+                                                    Text="{Binding Kind}" />
+                                                <TextBlock
+                                                    Foreground="{ThemeResource SecondaryTextBrush}"
+                                                    Text="{Binding Origin}" />
+                                                <TextBlock
+                                                    MaxLines="2"
+                                                    Text="{Binding Url}"
+                                                    TextTrimming="CharacterEllipsis"
+                                                    TextWrapping="Wrap" />
+                                                <TextBlock
+                                                    FontSize="12"
+                                                    Foreground="{ThemeResource SecondaryTextBrush}"
+                                                    Text="{Binding DownloadHint}"
+                                                    TextWrapping="Wrap" />
+                                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                                    <Button
+                                                        Click="CandidatePlayButton_OnClick"
+                                                        Content="再生"
+                                                        Tag="{Binding}" />
+                                                    <Button
+                                                        Click="CandidateDownloadButton_OnClick"
+                                                        Content="ダウンロード・保存"
+                                                        IsEnabled="{Binding CanDownload}"
+                                                        Tag="{Binding}" />
+                                                    <Button
+                                                        Click="CandidateCopyUrlButton_OnClick"
+                                                        Content="URLをコピー"
+                                                        Tag="{Binding}" />
+                                                </StackPanel>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </StackPanel>
+                </Border>
+
+                <Border x:Name="ProgressCard" Visibility="Collapsed" Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="12">
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <ProgressRing x:Name="WorkProgressRing" Width="28" Height="28" IsActive="True" />
+                            <StackPanel Grid.Column="1" Spacing="3">
+                                <TextBlock x:Name="ProgressTitle" FontWeight="SemiBold" Text="ダウンロード中" />
+                                <TextBlock x:Name="ProgressDetail" Style="{StaticResource CaptionStyle}" />
+                            </StackPanel>
+                            <Button Grid.Column="2" Click="CancelButton_OnClick" Content="取消" />
+                        </Grid>
+                        <ProgressBar x:Name="WorkProgressBar" IsIndeterminate="True" />
+                    </StackPanel>
+                </Border>
+
+                <Border x:Name="CompletionCard" Visibility="Collapsed" Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="12">
+                        <TextBlock x:Name="CompletionTitle" Style="{StaticResource SectionTitleStyle}" Text="保存が完了しました" />
+                        <TextBlock x:Name="CompletionPath" Style="{StaticResource CaptionStyle}" TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Click="OpenCompletedButton_OnClick" Content="ファイルを開く" />
+                            <Button Click="ShowCompletedButton_OnClick" Content="フォルダーで表示" />
+                            <Button Click="SaveAsButton_OnClick" Content="名前を付けて保存" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Widevine L3 認証情報" />
+                        <TextBlock
+                            x:Name="WvdStatusText"
+                            Style="{StaticResource CaptionStyle}"
+                            Text="WVDは未設定です。認証情報は安全に保管できますが、このビルドのWidevine保存providerは未接続です。" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Click="ImportWvdButton_OnClick" Content="WVDを読み込む" />
+                            <Button x:Name="RemoveWvdButton" Click="RemoveWvdButton_OnClick" Content="WVDを削除" IsEnabled="False" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <Expander Header="診断ログ">
+                        <StackPanel Margin="0,12,0,0" Spacing="10">
+                            <TextBlock
+                                Style="{StaticResource CaptionStyle}"
+                                Text="Cookie、Authorization、リクエスト本文、WVD内容はログへ保存しません。" />
+                            <ListView x:Name="DiagnosticList" MaxHeight="280" ItemsSource="{x:Bind Diagnostics}">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock
+                                            FontFamily="Cascadia Mono,Consolas"
+                                            FontSize="12"
+                                            IsTextSelectionEnabled="True"
+                                            Text="{Binding Display}"
+                                            TextWrapping="Wrap" />
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Click="CopyLogButton_OnClick" Content="ログをコピー" />
+                                <Button Click="SaveLogButton_OnClick" Content="ログを保存" />
+                                <Button Click="ClearLogButton_OnClick" Content="ログを消去" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Expander>
+                </Border>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="対応範囲" />
+                        <TextBlock
+                            Style="{StaticResource CaptionStyle}"
+                            Text="通常HLS、identity AES-128 / SAMPLE-AES、MPEG-TS / fMP4、HTML / iframe解析に対応します。実際の音声trackだけの入力はPCM WAV、映像を含む入力はMP4として保存します。" />
+                        <TextBlock
+                            Style="{StaticResource CaptionStyle}"
+                            Text="再生解析は表示中のページだけを観測します。Authorizationや本文は取り込まず、適合Cookieは保存中だけメモリ共有してログ・ファイルには残しません。FairPlayの復号済み書き出しと、このビルドでのWidevine L3保存providerには未対応です。" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Window>

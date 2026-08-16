@@ -1,0 +1,79 @@
+name: Build Windows portable app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: windows
+
+jobs:
+  build:
+    name: Build self-contained win-x64 ZIP
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.301
+
+      - name: Install pinned FFmpeg
+        shell: powershell
+        run: choco install ffmpeg --yes --no-progress --version=8.1.2
+
+      - name: Verify pinned SDK
+        shell: powershell
+        run: |
+          if ((dotnet --version).Trim() -ne '8.0.301') {
+            throw "Expected .NET SDK 8.0.301, got $(dotnet --version)."
+          }
+
+      - name: Restore production projects
+        shell: powershell
+        run: |
+          dotnet restore src/HLSDownloader.Windows/HLSDownloader.Windows.csproj --runtime win-x64
+          dotnet restore src/HLSDownloader.Worker/HLSDownloader.Worker.csproj --runtime win-x64
+
+      - name: Publish unpackaged WinUI app
+        shell: powershell
+        run: |
+          dotnet publish src/HLSDownloader.Windows/HLSDownloader.Windows.csproj `
+            --configuration Release --runtime win-x64 --self-contained true --no-restore `
+            -p:Platform=x64 -p:WindowsPackageType=None `
+            --output artifacts/publish
+
+      - name: Publish background worker beside app
+        shell: powershell
+        run: |
+          dotnet publish src/HLSDownloader.Worker/HLSDownloader.Worker.csproj `
+            --configuration Release --runtime win-x64 --self-contained true --no-restore `
+            --output artifacts/publish/worker
+
+      - name: Package and verify portable app
+        shell: powershell
+        run: |
+          ./scripts/package-windows.ps1 `
+            -PublishDirectory artifacts/publish `
+            -ArtifactDirectory artifacts/package
+          ./scripts/verify-portable.ps1 `
+            -PublishDirectory artifacts/publish
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v6
+        with:
+          name: HLSDownloader-Windows-win-x64
+          path: |
+            windows/artifacts/package/HLSDownloader-Windows-win-x64.zip
+            windows/artifacts/package/HLSDownloader-Windows-win-x64.sha256
+          if-no-files-found: error

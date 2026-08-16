@@ -2,6 +2,8 @@
 
 URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして、映像を含む配信はMP4、音声のみの配信はPCM WAVへまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
 
+Windows版はiOSコードを残したまま [`windows`](windows/README.md) 以下へ分離しています。WinUI 3で同じURL解析・再生解析・候補一覧・HLS保存・MP4/WAV出力・診断ログを提供し、Windows用のportable ZIPビルドとテストは別々のGitHub Actionsで実行します。Android版は `android` ブランチで管理しています。
+
 ## 主な機能
 
 - master/media playlistの自動判別
@@ -124,6 +126,9 @@ HLSDownloaderTests/
 Vendor/HLSFFmpegBridge/  pinned binary package + C shim
 .github/workflows/build-unsigned-ipa.yml
 .github/workflows/test.yml
+windows/                    WinUI 3 app, Core, Media, Worker, tests
+.github/workflows/windows-build.yml
+.github/workflows/windows-test.yml
 ```
 
 ## Macで直接確認する場合

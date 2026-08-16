@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <WindowsSdkPackageVersion>10.0.19041.57</WindowsSdkPackageVersion>
+    <RootNamespace>HLSDownloader.Windows</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HLSDownloader.Core\HLSDownloader.Core.csproj" />
+    <ProjectReference Include="..\HLSDownloader.Media\HLSDownloader.Media.csproj" />
+    <ProjectReference Include="..\HLSDownloader.WebProbe\HLSDownloader.WebProbe.csproj" />
+    <ProjectReference Include="..\HLSDownloader.Worker\HLSDownloader.Worker.csproj" />
+  </ItemGroup>
+
+  <Target Name="CopyBackgroundWorker" AfterTargets="Build">
+    <PropertyGroup>
+      <_BackgroundWorkerBaseDirectory>$(MSBuildProjectDirectory)\..\HLSDownloader.Worker\bin\$(Platform)\$(Configuration)\net8.0</_BackgroundWorkerBaseDirectory>
+      <_BackgroundWorkerBaseDirectory Condition="!Exists('$(_BackgroundWorkerBaseDirectory)')">$(MSBuildProjectDirectory)\..\HLSDownloader.Worker\bin\$(Configuration)\net8.0</_BackgroundWorkerBaseDirectory>
+      <_BackgroundWorkerOutputDirectory>$(_BackgroundWorkerBaseDirectory)</_BackgroundWorkerOutputDirectory>
+      <_BackgroundWorkerOutputDirectory Condition="'$(RuntimeIdentifier)' != '' and Exists('$(_BackgroundWorkerBaseDirectory)\$(RuntimeIdentifier)')">$(_BackgroundWorkerBaseDirectory)\$(RuntimeIdentifier)</_BackgroundWorkerOutputDirectory>
+    </PropertyGroup>
+    <ItemGroup>
+      <_BackgroundWorkerFiles Include="$(_BackgroundWorkerOutputDirectory)\*" />
+    </ItemGroup>
+    <Copy
+        SourceFiles="@(_BackgroundWorkerFiles)"
+        DestinationFiles="@(_BackgroundWorkerFiles->'$(OutDir)worker\%(Filename)%(Extension)')"
+        SkipUnchangedFiles="true" />
+  </Target>
+</Project>
