@@ -37,6 +37,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -92,10 +93,12 @@ fun HlsDownloaderScreen(
     onCancel: () -> Unit,
     onLoadThumbnail: (HlsCandidate) -> Unit,
     onRefreshLog: () -> Unit,
+    onClearBrowserData: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var diagnosticExpanded by remember { mutableStateOf(false) }
+    var showClearBrowserDataConfirmation by remember { mutableStateOf(false) }
 
     DisposableEffect(lifecycleOwner, state.playbackCaptureSession) {
         val observer = LifecycleEventObserver { _, event ->
@@ -185,8 +188,42 @@ fun HlsDownloaderScreen(
                     )
                 }
             }
-            item { CompatibilityCard() }
+            item {
+                CompatibilityCard(
+                    isBusy = state.isBusy,
+                    isClearingBrowserData = state.isClearingBrowserData,
+                    browserDataMessage = state.browserDataMessage,
+                    onClearBrowserData = { showClearBrowserDataConfirmation = true },
+                )
+            }
         }
+    }
+
+    if (showClearBrowserDataConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showClearBrowserDataConfirmation = false },
+            title = { Text("ブラウザデータを消去") },
+            text = {
+                Text(
+                    "再生解析ブラウザのCookie、ログイン状態、localStorage、IndexedDB、" +
+                        "キャッシュをすべて消去します。この操作は元に戻せません。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearBrowserDataConfirmation = false
+                        onClearBrowserData()
+                    },
+                    enabled = !state.isBusy,
+                ) { Text("消去する") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearBrowserDataConfirmation = false }) {
+                    Text("キャンセル")
+                }
+            },
+        )
     }
 
     state.playbackCaptureSession?.let { session ->
@@ -449,11 +486,29 @@ private fun DiagnosticCard(
 }
 
 @Composable
-private fun CompatibilityCard() = AppCard {
+private fun CompatibilityCard(
+    isBusy: Boolean,
+    isClearingBrowserData: Boolean,
+    browserDataMessage: String?,
+    onClearBrowserData: () -> Unit,
+) = AppCard {
     Text("ⓘ  対応範囲", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
     Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128に対応します。")
-    SecondaryText("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。Chromeのログイン状態、Worker内だけの通信、ライブ配信、Widevineには対応できない場合があります。")
+    SecondaryText("再生操作後にURLが生成されるページはアルファ版の再生解析を試せます。Worker内だけの通信、ライブ配信、Widevineには対応できない場合があります。")
+    SecondaryText("再生解析ブラウザのCookie・ログイン状態・localStorage・IndexedDB・キャッシュは、通常の有効期限に従ってアプリ内の専用プロファイルへ保持されます。Chromeとは共有されません。")
     SecondaryText("再生解析は前面表示中だけ動作します。候補選択後の保存はバックグラウンド処理へ引き継ぎますが、OSや端末の省電力設定により停止される場合があります。")
+    OutlinedButton(
+        onClick = onClearBrowserData,
+        enabled = !isBusy,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        if (isClearingBrowserData) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            Spacer(Modifier.width(8.dp))
+        }
+        Text(if (isClearingBrowserData) "消去中" else "ブラウザデータを消去")
+    }
+    browserDataMessage?.let { SecondaryText(it) }
     SecondaryText("保存する権利または許可のあるコンテンツにだけ使用してください。")
     SecondaryText("MPEG-TSのMP4化にはFFmpegKit / FFmpeg（LGPL-3.0）を使用します。")
 }

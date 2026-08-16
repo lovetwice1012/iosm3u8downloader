@@ -92,9 +92,28 @@ data class DynamicMediaReference(
     val origin: HlsCandidateOrigin = HlsCandidateOrigin.RUNTIME,
 )
 
+/**
+ * A short-lived cookie copied from WebView for one download attempt. WebView
+ * does not expose the original Domain, Path, SameSite or expiry attributes, so
+ * the URL at which the cookie header was observed is retained and requests
+ * must match its exact scheme, host and port.
+ */
+data class OriginBoundCookie(
+    val origin: HttpUrl,
+    val cookie: Cookie,
+) {
+    fun hasOrigin(url: HttpUrl): Boolean =
+        origin.scheme == url.scheme && origin.host == url.host && origin.port == url.port
+
+    fun matches(url: HttpUrl): Boolean = hasOrigin(url) && cookie.matches(url)
+
+    override fun toString(): String =
+        "OriginBoundCookie(origin=${origin.scheme}://${origin.host}:${origin.port}, name=${cookie.name})"
+}
+
 data class DynamicPageInspection(
     val media: List<DynamicMediaReference>,
-    val cookies: List<Cookie>,
+    val cookies: List<OriginBoundCookie>,
 ) {
     companion object {
         val EMPTY = DynamicPageInspection(emptyList(), emptyList())

@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
                     onCancel = viewModel::cancel,
                     onLoadThumbnail = viewModel::loadThumbnail,
                     onRefreshLog = viewModel::refreshDiagnosticLog,
+                    onClearBrowserData = viewModel::clearBrowserData,
                 )
             }
         }

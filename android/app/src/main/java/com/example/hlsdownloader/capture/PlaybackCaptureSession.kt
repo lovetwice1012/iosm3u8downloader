@@ -19,6 +19,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.example.hlsdownloader.core.DiagnosticPrivacy
+import com.example.hlsdownloader.core.OriginBoundCookie
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -60,7 +61,7 @@ data class CapturedMediaReference(
 
 data class PlaybackCaptureSnapshot(
     val media: List<CapturedMediaReference>,
-    val cookies: List<Cookie>,
+    val cookies: List<OriginBoundCookie>,
 )
 
 data class PlaybackCaptureState(
@@ -89,6 +90,7 @@ class PlaybackCaptureSession private constructor(
         private const val MAXIMUM_RAW_MESSAGES = 4_096
         private const val MAXIMUM_URL_LENGTH = 8_192
         private const val MAXIMUM_LOGGED_REFERENCES = 64
+        private const val BRIDGED_COOKIE_LIFETIME_MILLIS = 10 * 60 * 1_000L
         private const val BRIDGE_NAME = "HlsDiscoveryBridge"
 
         suspend fun create(
@@ -142,8 +144,6 @@ class PlaybackCaptureSession private constructor(
     private fun configureWebView(view: WebView) {
         view.settings.apply {
             javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
             loadsImagesAutomatically = true
             mediaPlaybackRequiresUserGesture = interactive
             javaScriptCanOpenWindowsAutomatically = false
@@ -156,10 +156,7 @@ class PlaybackCaptureSession private constructor(
         view.addJavascriptInterface(bridge, BRIDGE_NAME)
         view.webViewClient = CaptureWebViewClient()
         view.webChromeClient = CaptureChromeClient()
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-            setAcceptThirdPartyCookies(view, true)
-        }
+        PersistentWebProfile.configureStorage(view)
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             documentStartScript = WebViewCompat.addDocumentStartJavaScript(
                 view,
@@ -177,7 +174,7 @@ class PlaybackCaptureSession private constructor(
         seedCookies.forEach { cookie ->
             CookieManager.getInstance().setCookie(rootUrl.toString(), cookie.toString())
         }
-        CookieManager.getInstance().flush()
+        PersistentWebProfile.flushCookies()
         log("capture start seedCookies=${seedCookies.size} ${DiagnosticPrivacy.urlSummary(rootUrl)}")
         webView.loadUrl(rootUrl.toString())
     }
@@ -216,10 +213,12 @@ class PlaybackCaptureSession private constructor(
 
     suspend fun snapshotAndStop(): PlaybackCaptureSnapshot = withContext(Dispatchers.Main.immediate) {
         if (!stopped.compareAndSet(false, true)) {
+            PersistentWebProfile.flushCookies()
             return@withContext PlaybackCaptureSnapshot(references.values.toList(), collectCookies())
         }
         _state.value = _state.value.copy(isStopping = true)
         webView.stopLoading()
+        PersistentWebProfile.flushCookies()
         val cookies = collectCookies()
         log(
             "capture finish rawMessages=$rawMessageCount invalid=$invalidMessageCount " +
@@ -241,16 +240,19 @@ class PlaybackCaptureSession private constructor(
     /** Called after Compose/AndroidView has released the visible WebView. */
     fun dispose() {
         val destroy = Runnable {
+            PersistentWebProfile.flushCookies()
             (webView.parent as? ViewGroup)?.removeView(webView)
             webView.destroy()
         }
         if (Looper.myLooper() == Looper.getMainLooper()) destroy.run() else webView.post(destroy)
     }
 
-    private fun collectCookies(): List<Cookie> {
+    private fun collectCookies(): List<OriginBoundCookie> {
         val manager = CookieManager.getInstance()
-        val cookies = LinkedHashMap<String, Cookie>()
+        val cookies = LinkedHashMap<String, OriginBoundCookie>()
+        val bridgeExpiry = System.currentTimeMillis() + BRIDGED_COOKIE_LIFETIME_MILLIS
         knownCookieUrls.forEach { url ->
+            val origin = url.originUrl()
             manager.getCookie(url.toString())
                 ?.split(';')
                 ?.map(String::trim)
@@ -264,12 +266,16 @@ class PlaybackCaptureSession private constructor(
                         Cookie.Builder()
                             .name(name)
                             .value(value)
-                            .hostOnlyDomain(url.host)
-                            .path("/")
-                            .apply { if (url.isHttps) secure() }
+                            .hostOnlyDomain(origin.host)
+                            .path(url.conservativeCookiePath())
+                            .expiresAt(bridgeExpiry)
+                            .apply { if (origin.isHttps) secure() }
                             .build()
                     }.getOrNull()?.let { cookie ->
-                        cookies["${cookie.domain}\n${cookie.path}\n${cookie.name}"] = cookie
+                        val captured = OriginBoundCookie(origin, cookie)
+                        cookies[
+                            "${origin.scheme}\n${origin.host}\n${origin.port}\n${cookie.path}\n${cookie.name}"
+                        ] = captured
                     }
                 }
         }
@@ -425,6 +431,7 @@ class PlaybackCaptureSession private constructor(
             _state.value = _state.value.copy(currentUrl = parsed ?: _state.value.currentUrl, isLoading = false)
             injectFallback(view)
             updateNavigationState()
+            PersistentWebProfile.flushCookies()
             firstNavigationFinished.complete(Unit)
             log("capture navigation finished")
         }
@@ -505,6 +512,12 @@ class PlaybackCaptureSession private constructor(
 
     private fun canonical(url: HttpUrl): String = url.newBuilder().fragment(null).build().toString()
 
+    private fun HttpUrl.originUrl(): HttpUrl = newBuilder()
+        .encodedPath("/")
+        .query(null)
+        .fragment(null)
+        .build()
+
     private fun Uri.toSafeHttpUrl(): HttpUrl? {
         val parsed = toString().toHttpUrlOrNull() ?: return null
         return parsed.takeIf(HttpUrl::isSafeWebUrl)
@@ -516,6 +529,12 @@ class PlaybackCaptureSession private constructor(
 
 private fun HttpUrl.isSafeWebUrl(): Boolean =
     (scheme == "http" || scheme == "https") && encodedUsername.isEmpty() && encodedPassword.isEmpty()
+
+internal fun HttpUrl.conservativeCookiePath(): String {
+    if (encodedPath.endsWith('/')) return encodedPath
+    val directoryEnd = encodedPath.lastIndexOf('/')
+    return if (directoryEnd <= 0) "/" else encodedPath.substring(0, directoryEnd + 1)
+}
 
 private object DiscoveryScript {
     fun source(interactive: Boolean): String = TEMPLATE.replace("__INTERACTIVE__", interactive.toString())

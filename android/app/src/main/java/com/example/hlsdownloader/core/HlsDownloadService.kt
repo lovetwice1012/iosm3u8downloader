@@ -64,6 +64,11 @@ class HlsDownloadService(
 
     fun cookiesFor(url: HttpUrl): List<Cookie> = client.cookiesFor(url)
 
+    fun clearCookies() {
+        sourceResolver.clearCapturedCookieGrants()
+        client.clearCookies()
+    }
+
     fun resetDiagnosticLog() {
         diagnostics.reset()
         diagnostics.record("session", "started")
@@ -94,9 +99,14 @@ class HlsDownloadService(
         outputDirectory: File,
         progress: ProgressHandler = {},
     ): DownloadResult {
-        progress(DownloadProgress(DownloadPhase.RESOLVING, 0, 0))
-        val document = sourceResolver.resolve(input)
-        return downloadDocument(document, outputDirectory, progress)
+        sourceResolver.clearCapturedCookieScope()
+        return try {
+            progress(DownloadProgress(DownloadPhase.RESOLVING, 0, 0))
+            val document = sourceResolver.resolve(input)
+            downloadDocument(document, outputDirectory, progress)
+        } finally {
+            sourceResolver.clearCapturedCookieScope()
+        }
     }
 
     suspend fun download(
@@ -104,14 +114,19 @@ class HlsDownloadService(
         outputDirectory: File,
         progress: ProgressHandler = {},
     ): DownloadResult {
-        diagnostics.record(
-            "service",
-            "candidate selected origin=${candidate.origin.name.lowercase()} depth=${candidate.iframeDepth} " +
-                DiagnosticPrivacy.urlSummary(candidate.playlistUrl),
-        )
-        progress(DownloadProgress(DownloadPhase.RESOLVING, 0, 0))
-        val document = candidate.document ?: sourceResolver.load(candidate.request, candidate.requestReferer)
-        return downloadDocument(document, outputDirectory, progress)
+        sourceResolver.activateCapturedCookieScope(candidate)
+        return try {
+            diagnostics.record(
+                "service",
+                "candidate selected origin=${candidate.origin.name.lowercase()} depth=${candidate.iframeDepth} " +
+                    DiagnosticPrivacy.urlSummary(candidate.playlistUrl),
+            )
+            progress(DownloadProgress(DownloadPhase.RESOLVING, 0, 0))
+            val document = candidate.document ?: sourceResolver.load(candidate.request, candidate.requestReferer)
+            downloadDocument(document, outputDirectory, progress)
+        } finally {
+            sourceResolver.clearCapturedCookieScope()
+        }
     }
 
     private suspend fun downloadDocument(

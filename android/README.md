@@ -47,6 +47,25 @@ not a persistent download manager: force-stopping the app, process eviction,
 or reboot interrupts the operation and it is not resumed automatically. The
 visible WebView playback analysis itself is foreground-only.
 
+The visible playback browser uses the app's normal persistent WebView profile.
+Cookies (subject to each site's normal expiry), login state, `localStorage`,
+IndexedDB and the WebView cache therefore remain available after an Activity
+recreation or app restart. This profile is private to the app and is not the
+user's Chrome profile. Finishing a capture flushes cookies but does not clear
+the profile. The **Clear browser data** action is the only in-app path that
+removes those values, and requires confirmation. Cookie values are imported
+only into the request cookie jar; they are not placed in candidate records or
+diagnostic logs.
+
+Android WebView exposes a cookie header but not each cookie's original Path,
+Domain, SameSite or expiry attributes. When a captured cookie is temporarily
+bridged into the downloader, it is therefore restricted to the exact observed
+scheme, host and port and to the observed URL's directory. The grant expires
+after ten minutes and is consumed by one download attempt. A stream that uses
+the same cookie across unrelated URL directories can fail authentication by
+design; revisit the playback page and capture again rather than broadening the
+cookie scope.
+
 ## Pinned FFmpegKit binary
 
 The build downloads a fixed LGPL shared-library AAR before compilation and

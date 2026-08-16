@@ -23,10 +23,25 @@ import kotlin.coroutines.resumeWithException
 
 class InMemoryCookieJar : CookieJar {
     private val cookies = mutableListOf<Cookie>()
+    private val scopedCookies = mutableListOf<OriginBoundCookie>()
 
     @Synchronized
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         val now = System.currentTimeMillis()
+        val activeOriginCookies = scopedCookies.filter { it.hasOrigin(url) }
+        if (activeOriginCookies.isNotEmpty()) {
+            val scopeExpiry = activeOriginCookies.maxOf { it.cookie.expiresAt }
+            scopedCookies.removeAll { existing ->
+                existing.cookie.expiresAt <= now ||
+                    (existing.hasOrigin(url) && cookies.any { incoming ->
+                        incoming.sameScopedIdentity(existing.cookie)
+                    })
+            }
+            scopedCookies += cookies
+                .filter { it.expiresAt > now }
+                .map { OriginBoundCookie(activeOriginCookies.first().origin, it.forScopedOrigin(url, scopeExpiry)) }
+            return
+        }
         this.cookies.removeAll { existing ->
             existing.expiresAt <= now || cookies.any { incoming -> incoming.sameIdentity(existing) }
         }
@@ -37,7 +52,11 @@ class InMemoryCookieJar : CookieJar {
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         val now = System.currentTimeMillis()
         cookies.removeAll { it.expiresAt <= now }
-        return cookies.filter { it.matches(url) }
+        scopedCookies.removeAll { it.cookie.expiresAt <= now }
+        val scopedMatches = scopedCookies.filter { it.matches(url) }.map { it.cookie }
+        return cookies.filter { base ->
+            base.matches(url) && scopedMatches.none { scoped -> scoped.sameIdentity(base) }
+        } + scopedMatches
     }
 
     @Synchronized
@@ -49,8 +68,41 @@ class InMemoryCookieJar : CookieJar {
         this.cookies += cookies.filter { it.expiresAt > now }
     }
 
+    @Synchronized
+    fun clear() {
+        cookies.clear()
+        scopedCookies.clear()
+    }
+
+    @Synchronized
+    fun replaceScoped(cookies: List<OriginBoundCookie>) {
+        val now = System.currentTimeMillis()
+        scopedCookies.clear()
+        scopedCookies += cookies.filter { it.cookie.expiresAt > now }
+    }
+
+    @Synchronized
+    fun clearScoped() {
+        scopedCookies.clear()
+    }
+
     private fun Cookie.sameIdentity(other: Cookie): Boolean =
         name == other.name && domain == other.domain && path == other.path
+
+    private fun Cookie.sameScopedIdentity(other: Cookie): Boolean =
+        name == other.name && path == other.path
+
+    private fun Cookie.forScopedOrigin(origin: HttpUrl, scopeExpiry: Long): Cookie = Cookie.Builder()
+        .name(name)
+        .value(value)
+        .hostOnlyDomain(origin.host)
+        .path(path)
+        .expiresAt(minOf(expiresAt, scopeExpiry))
+        .apply {
+            if (secure) secure()
+            if (httpOnly) httpOnly()
+        }
+        .build()
 }
 
 class HlsHttpClient(
@@ -83,6 +135,12 @@ class HlsHttpClient(
     fun cookiesFor(url: HttpUrl): List<Cookie> = cookieJar.loadForRequest(url)
 
     fun storeCookies(cookies: List<Cookie>) = cookieJar.import(cookies)
+
+    fun clearCookies() = cookieJar.clear()
+
+    fun replaceScopedCookies(cookies: List<OriginBoundCookie>) = cookieJar.replaceScoped(cookies)
+
+    fun clearScopedCookies() = cookieJar.clearScoped()
 
     suspend fun fetch(
         candidates: UrlCandidates,

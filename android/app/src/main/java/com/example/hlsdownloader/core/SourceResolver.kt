@@ -32,6 +32,9 @@ class SourceResolver(
         val inheritedThumbnailUrl: HttpUrl?,
     )
 
+    private val cookieGrantLock = Any()
+    private val capturedCookieGrants = LinkedHashMap<String, List<OriginBoundCookie>>()
+
     suspend fun discover(input: String): HlsDiscoveryResult {
         val inputUrl = UriResolver.normalizeInput(input)
         log("discovery", "start ${DiagnosticPrivacy.urlSummary(inputUrl)}")
@@ -90,6 +93,7 @@ class SourceResolver(
 
     suspend fun resolve(input: String): PlaylistDocument {
         val candidate = discover(input).candidates.firstOrNull() ?: throw HlsException.NoPlaylistFound()
+        activateCapturedCookieScope(candidate)
         return candidate.document ?: load(candidate.request, candidate.requestReferer)
     }
 
@@ -97,7 +101,6 @@ class SourceResolver(
         inspection: DynamicPageInspection,
         rootUrl: HttpUrl,
     ): List<HlsCandidate> {
-        client.storeCookies(inspection.cookies)
         val discovered = mutableSetOf<String>()
         val results = mutableListOf<HlsCandidate>()
         appendDynamicCandidates(inspection, rootUrl, discovered, results)
@@ -107,6 +110,26 @@ class SourceResolver(
                 "candidates=${results.size} cookies=${inspection.cookies.size}",
         )
         return results
+    }
+
+    /** Activates a one-attempt WebView cookie grant for the selected candidate. */
+    fun activateCapturedCookieScope(candidate: HlsCandidate) {
+        val captured = synchronized(cookieGrantLock) {
+            capturedCookieGrants.remove(cookieGrantKey(candidate)).orEmpty()
+        }
+        val allowedOrigins = candidateCookieOrigins(candidate)
+        client.replaceScopedCookies(
+            captured.filter { item -> allowedOrigins.any { item.origin.sameOrigin(it) } },
+        )
+    }
+
+    fun clearCapturedCookieScope() {
+        client.clearScopedCookies()
+    }
+
+    fun clearCapturedCookieGrants() {
+        synchronized(cookieGrantLock) { capturedCookieGrants.clear() }
+        clearCapturedCookieScope()
     }
 
     suspend fun load(candidates: UrlCandidates, referer: HttpUrl?): PlaylistDocument {
@@ -274,7 +297,6 @@ class SourceResolver(
         }
 
         val dynamic = dynamicDeferred.await()
-        client.storeCookies(dynamic.cookies)
         appendDynamicCandidates(dynamic, rootUrl, discovered, results)
         results
     }
@@ -315,24 +337,59 @@ class SourceResolver(
                 isSafeAutomaticUrl(it) && AutomaticNavigationPolicy.isAllowedFrameNavigation(rootUrl, it)
             } ?: pageUrl
             discovered += candidateKey(reference.url, requestReferer)
-            addOrMergeCandidate(
-                HlsCandidate(
-                    request = UrlCandidates(reference.url),
-                    requestReferer = requestReferer,
-                    document = null,
-                    pageUrl = pageUrl,
-                    title = limitedTitle(reference.title),
-                    thumbnailUrl = reference.thumbnailUrl?.takeIf {
-                        isSafeAutomaticUrl(it) &&
-                            AutomaticNavigationPolicy.isAllowedFrameNavigation(rootUrl, it)
-                    },
-                    iframeDepth = reference.iframeDepth.coerceAtLeast(0),
-                    origin = reference.origin,
-                ),
-                results,
+            val candidate = HlsCandidate(
+                request = UrlCandidates(reference.url),
+                requestReferer = requestReferer,
+                document = null,
+                pageUrl = pageUrl,
+                title = limitedTitle(reference.title),
+                thumbnailUrl = reference.thumbnailUrl?.takeIf {
+                    isSafeAutomaticUrl(it) &&
+                        AutomaticNavigationPolicy.isAllowedFrameNavigation(rootUrl, it)
+                },
+                iframeDepth = reference.iframeDepth.coerceAtLeast(0),
+                origin = reference.origin,
             )
+            addOrMergeCandidate(candidate, results)
+            registerCapturedCookieGrant(candidate, inspection.cookies)
         }
     }
+
+    private fun registerCapturedCookieGrant(
+        candidate: HlsCandidate,
+        capturedCookies: List<OriginBoundCookie>,
+    ) {
+        val allowedOrigins = candidateCookieOrigins(candidate)
+        val matching = capturedCookies.filter { item ->
+            allowedOrigins.any { item.origin.sameOrigin(it) }
+        }
+        if (matching.isEmpty()) return
+        synchronized(cookieGrantLock) {
+            val key = cookieGrantKey(candidate)
+            val merged = LinkedHashMap<String, OriginBoundCookie>()
+            capturedCookieGrants[key].orEmpty().forEach { merged[it.identityKey()] = it }
+            matching.forEach { merged[it.identityKey()] = it }
+            capturedCookieGrants[key] = merged.values.take(MAXIMUM_CAPTURED_COOKIES_PER_GRANT)
+            while (capturedCookieGrants.size > MAXIMUM_CAPTURED_COOKIE_GRANTS) {
+                capturedCookieGrants.remove(capturedCookieGrants.keys.first())
+            }
+        }
+    }
+
+    private fun candidateCookieOrigins(candidate: HlsCandidate): List<HttpUrl> = buildList {
+        add(candidate.request.primary)
+        add(candidate.pageUrl)
+        candidate.requestReferer?.let(::add)
+    }.distinctBy { "${it.scheme}\n${it.host}\n${it.port}" }
+
+    private fun HttpUrl.sameOrigin(other: HttpUrl): Boolean =
+        scheme == other.scheme && host == other.host && port == other.port
+
+    private fun OriginBoundCookie.identityKey(): String =
+        "${origin.scheme}\n${origin.host}\n${origin.port}\n${cookie.path}\n${cookie.name}"
+
+    private fun cookieGrantKey(candidate: HlsCandidate): String =
+        candidateKey(candidate.request.primary, candidate.requestReferer ?: candidate.pageUrl)
 
     private fun addOrMergeCandidate(candidate: HlsCandidate, results: MutableList<HlsCandidate>) {
         val key = candidateKey(
@@ -378,6 +435,11 @@ class SourceResolver(
 
     private fun candidateKey(url: HttpUrl, referer: HttpUrl?): String =
         canonicalUrlKey(url) + "\n" + (referer?.let(::canonicalUrlKey) ?: "")
+
+    private companion object {
+        const val MAXIMUM_CAPTURED_COOKIE_GRANTS = 128
+        const val MAXIMUM_CAPTURED_COOKIES_PER_GRANT = 128
+    }
 
     private fun limitedTitle(title: String?): String? = title?.trim()?.takeIf(String::isNotEmpty)?.take(160)
 

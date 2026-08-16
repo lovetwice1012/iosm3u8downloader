@@ -10,6 +10,7 @@ import com.example.hlsdownloader.background.BackgroundExecutionController
 import com.example.hlsdownloader.background.BackgroundOperationSnapshot
 import com.example.hlsdownloader.background.BackgroundOperationRegistry
 import com.example.hlsdownloader.capture.PlaybackCaptureSession
+import com.example.hlsdownloader.capture.PersistentWebProfile
 import com.example.hlsdownloader.capture.toDynamicPageInspection
 import com.example.hlsdownloader.core.DownloadPhase
 import com.example.hlsdownloader.core.DownloadProgress
@@ -45,11 +46,13 @@ data class HlsDownloaderUiState(
     val isCancelling: Boolean = false,
     val isPreparingPlaybackCapture: Boolean = false,
     val isFinalizingPlaybackCapture: Boolean = false,
+    val isClearingBrowserData: Boolean = false,
+    val browserDataMessage: String? = null,
     val playbackCaptureSession: PlaybackCaptureSession? = null,
 ) {
     val isBusy: Boolean
         get() = isOperationActive || isCancelling || isPreparingPlaybackCapture ||
-            isFinalizingPlaybackCapture || playbackCaptureSession != null
+            isFinalizingPlaybackCapture || isClearingBrowserData || playbackCaptureSession != null
 
     val canStart: Boolean
         get() = !isBusy && inputUrl.isNotBlank()
@@ -292,6 +295,37 @@ class HlsDownloaderViewModel(
         val id = BackgroundOperationRegistry.snapshot.value.operationId
         if (id == null || !BackgroundOperationRegistry.update(id) { it.copy(diagnosticLog = log) }) {
             _state.update { it.copy(diagnosticLog = log) }
+        }
+    }
+
+    fun clearBrowserData() {
+        if (_state.value.isBusy) return
+        _state.update { it.copy(isClearingBrowserData = true, browserDataMessage = null) }
+        viewModelScope.launch {
+            try {
+                val removedCookies = try {
+                    PersistentWebProfile.clearAllData(getApplication())
+                } finally {
+                    service.clearCookies()
+                }
+                service.recordDiagnostic(
+                    "webview-profile",
+                    "persistent browser data cleared cookiesPresent=$removedCookies",
+                )
+                _state.update {
+                    it.copy(browserDataMessage = "Cookie、ログイン状態、サイト保存領域、キャッシュを消去しました。")
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                service.recordDiagnostic(
+                    "webview-profile",
+                    "persistent browser data clear failed error=${error::class.simpleName ?: "error"}",
+                )
+                _state.update { it.copy(browserDataMessage = "ブラウザデータを消去できませんでした。") }
+            } finally {
+                _state.update { it.copy(isClearingBrowserData = false) }
+            }
         }
     }
 
