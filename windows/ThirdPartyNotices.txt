@@ -4,12 +4,15 @@ HLSDownloader for Windows - Third-party notices
 FFmpeg
 ------
 The portable GitHub Actions artifact includes ffmpeg.exe and ffprobe.exe from
-the Chocolatey Community FFmpeg package. FFmpeg is a separate executable and
-is not linked into this application's assemblies.
+the pinned Gyan.dev FFmpeg 8.1.2 essentials build published on GitHub. The
+downloaded archive is verified against its release SHA-256 before extraction.
+FFmpeg is a separate executable and is not linked into this application's
+assemblies.
 
 Project: https://ffmpeg.org/
 Source:  https://ffmpeg.org/download.html#get-sources
 License: https://ffmpeg.org/legal.html
+Windows build: https://github.com/GyanD/codexffmpeg/releases/tag/8.1.2
 
 The exact FFmpeg build configuration and applicable license text are captured
 at packaging time in tools/ffmpeg/FFmpeg-LICENSE.txt by running `ffmpeg -L`.

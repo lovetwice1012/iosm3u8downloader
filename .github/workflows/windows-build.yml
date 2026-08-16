@@ -28,9 +28,9 @@ jobs:
         with:
           dotnet-version: 8.0.301
 
-      - name: Install pinned FFmpeg
+      - name: Install verified FFmpeg 8.1.2
         shell: powershell
-        run: choco install ffmpeg --yes --no-progress --version=8.1.2
+        run: ./scripts/install-pinned-ffmpeg.ps1 -DestinationDirectory artifacts/ffmpeg/bin
 
       - name: Verify pinned SDK
         shell: powershell
@@ -65,7 +65,8 @@ jobs:
         run: |
           ./scripts/package-windows.ps1 `
             -PublishDirectory artifacts/publish `
-            -ArtifactDirectory artifacts/package
+            -ArtifactDirectory artifacts/package `
+            -FFmpegDirectory artifacts/ffmpeg/bin
           ./scripts/verify-portable.ps1 `
             -PublishDirectory artifacts/publish
 
