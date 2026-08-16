@@ -186,10 +186,11 @@ final class TransportStreamRemuxerTests: XCTestCase {
             initializationDataLength: 0
         )
 
-        XCTAssertEqual(
-            try await MP4Composer().outputFormat(main: [decrypted], externalAudio: nil),
-            .wav
+        let outputFormat = try await MP4Composer().outputFormat(
+            main: [decrypted],
+            externalAudio: nil
         )
+        XCTAssertEqual(outputFormat, .wav)
     }
 
     private struct MP4Box {
