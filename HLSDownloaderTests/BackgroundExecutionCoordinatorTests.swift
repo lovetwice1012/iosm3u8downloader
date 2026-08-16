@@ -74,7 +74,7 @@ final class BackgroundExecutionCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(value, 42)
-        XCTAssertEqual(manager.begunNames, ["HLS download and MP4 composition"])
+        XCTAssertEqual(manager.begunNames, ["HLS download and media composition"])
         XCTAssertEqual(manager.endedTokens.count, 1)
         let log = diagnostics.renderedText()
         XCTAssertTrue(log.contains("short background allowance selected"))
