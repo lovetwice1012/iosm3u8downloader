@@ -396,11 +396,7 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            _workflow.ImportBrowserCookies(signal.Url, detected.Cookies);
-            if (signal.PageUrl is { } pageScope)
-            {
-                _workflow.ImportBrowserCookies(pageScope, detected.Cookies);
-            }
+            _workflow.RememberBrowserCookies(signal.Url, detected.CookieSnapshot);
 
             var pageUri = signal.PageUrl ?? TryGetInputUriSilently() ?? signal.Url;
             var candidate = new MediaCandidate(

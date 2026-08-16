@@ -2,11 +2,17 @@ namespace HLSDownloader.Core;
 
 public static class WidevineDownloadPolicy
 {
+    private static readonly IReadOnlyList<string> DownloadableHostValues =
+        Array.AsReadOnly(["widevine.sprink.cloud"]);
+
     private static readonly HashSet<string> DownloadableHosts =
-        new(StringComparer.OrdinalIgnoreCase)
-        {
-            "widevine.sprink.cloud"
-        };
+        new(DownloadableHostValues, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The exact hosts used by non-.NET enforcement layers. The allowlist is
+    /// defined here once; callers must not duplicate host literals.
+    /// </summary>
+    public static IReadOnlyList<string> DownloadableWidevineHosts => DownloadableHostValues;
 
     /// <summary>
     /// The only Widevine admission check. Callers must check both the requested

@@ -13,6 +13,13 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
     private readonly BoundedHttpClient _discoveryClient;
     private readonly BoundedHttpClient _segmentClient;
     private readonly CookieContainer _cookies;
+    private readonly BrowserCookieSnapshotSynchronizer _browserCookieSynchronizer = new();
+    private readonly object _browserCookieSnapshotLock = new();
+    private readonly Dictionary<Uri, RememberedBrowserCookies> _browserCookieSnapshots = [];
+    private readonly Timer _browserCookieExpiryTimer;
+    private readonly SemaphoreSlim _downloadGate = new(1, 1);
+    private static readonly TimeSpan BrowserCookieSnapshotLifetime = TimeSpan.FromMinutes(5);
+    private bool _disposed;
     private HlsDownloadCoordinator? _coordinator;
     private readonly object _workerStartLock = new();
     private readonly object _activeWorkerJobLock = new();
@@ -20,7 +27,12 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     public CoreMediaWorkflow()
     {
-        _cookies = new CookieContainer();
+        _browserCookieExpiryTimer = new Timer(
+            static state => ((CoreMediaWorkflow)state!).PurgeExpiredBrowserCookieSnapshots(),
+            this,
+            Timeout.InfiniteTimeSpan,
+            Timeout.InfiniteTimeSpan);
+        _cookies = new CookieContainer(capacity: 512, perDomainCapacity: 128, maxCookieSize: 8 * 1024);
         _discoveryClient = new BoundedHttpClient(
             new BoundedHttpOptions(MaximumResponseBytes: 8 * 1024 * 1024),
             cookies: _cookies);
@@ -45,46 +57,27 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         return false;
     }
 
-    public void ImportBrowserCookies(Uri scope, IReadOnlyList<BrowserSessionCookie> cookies)
+    public void RememberBrowserCookies(Uri candidateUri, BrowserCookieSnapshot snapshot)
     {
-        if (!(scope.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
-              || scope.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-            || !string.IsNullOrEmpty(scope.UserInfo)
-            || cookies.Count > 128)
+        ArgumentNullException.ThrowIfNull(candidateUri);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_browserCookieSnapshotLock)
         {
-            return;
-        }
-
-        foreach (var source in cookies)
-        {
-            if (!IsSafeCookie(source, scope))
+            if (_disposed)
             {
-                continue;
+                return;
             }
 
-            var rawDomain = source.Domain.Trim();
-            var domain = rawDomain.TrimStart('.').ToLowerInvariant();
-            var cookieDomain = rawDomain.StartsWith(".", StringComparison.Ordinal)
-                ? "." + domain
-                : scope.IdnHost;
-            try
-            {
-                var cookie = new Cookie(source.Name, source.Value, source.Path, cookieDomain)
-                {
-                    Secure = source.IsSecure,
-                    HttpOnly = source.IsHttpOnly
-                };
-                if (source.Expires is { } expires)
-                {
-                    cookie.Expires = expires.UtcDateTime;
-                }
+            var now = DateTimeOffset.UtcNow;
+            PurgeExpiredBrowserCookieSnapshotsLocked(now);
 
-                _cookies.Add(cookie);
-            }
-            catch (CookieException)
+            if (!_browserCookieSnapshots.ContainsKey(candidateUri) && _browserCookieSnapshots.Count >= 128)
             {
-                // Ignore malformed browser-profile data without exposing its value.
+                _browserCookieSnapshots.Remove(_browserCookieSnapshots.Keys.First());
             }
+
+            _browserCookieSnapshots[candidateUri] = new RememberedBrowserCookies(snapshot, now);
+            ScheduleBrowserCookieExpiryLocked(now);
         }
     }
 
@@ -185,7 +178,7 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         return resolution.Candidates;
     }
 
-    public Task<CompletedMedia> DownloadAsync(
+    public async Task<CompletedMedia> DownloadAsync(
         MediaCandidate candidate,
         IProgress<DownloadProgress> progress,
         CancellationToken cancellationToken)
@@ -195,7 +188,41 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             throw new InvalidOperationException(reason);
         }
 
-        return DownloadWithCoordinatorAsync(candidate, progress, cancellationToken);
+        await _downloadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            BrowserCookieSnapshot? snapshot = null;
+            lock (_browserCookieSnapshotLock)
+            {
+                PurgeExpiredBrowserCookieSnapshotsLocked(DateTimeOffset.UtcNow);
+                if (_browserCookieSnapshots.Remove(candidate.Uri, out var remembered)
+                    && DateTimeOffset.UtcNow - remembered.CapturedAt <= BrowserCookieSnapshotLifetime)
+                {
+                    // A browser credential snapshot is a short-lived, single-use capability.
+                    // Removing it before network I/O prevents replay after this attempt.
+                    snapshot = remembered.Snapshot;
+                }
+
+                ScheduleBrowserCookieExpiryLocked(DateTimeOffset.UtcNow);
+            }
+
+            _browserCookieSynchronizer.Replace(_cookies, snapshot);
+            try
+            {
+                return await DownloadWithCoordinatorAsync(candidate, progress, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                // Browser credentials are candidate-scoped and memory-only. Do not leave
+                // them active for later analysis or for a different candidate.
+                _browserCookieSynchronizer.Replace(_cookies, null);
+            }
+        }
+        finally
+        {
+            _downloadGate.Release();
+        }
     }
 
     private async Task<CompletedMedia> DownloadWithCoordinatorAsync(
@@ -391,31 +418,6 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
            && string.IsNullOrEmpty(candidate.PageUri.Query)
            && File.Exists(GetWorkerExecutablePath());
 
-    private static bool IsSafeCookie(BrowserSessionCookie cookie, Uri scope)
-    {
-        if (string.IsNullOrWhiteSpace(cookie.Name)
-            || cookie.Name.Length > 256
-            || cookie.Value.Length > 4096
-            || cookie.Domain.Length > 255
-            || cookie.Path.Length is < 1 or > 2048
-            || !cookie.Path.StartsWith("/", StringComparison.Ordinal)
-            || cookie.Name.Any(IsUnsafeCookieCharacter)
-            || cookie.Value.Any(character => character is '\r' or '\n' or '\0')
-            || cookie.IsSecure && scope.Scheme != Uri.UriSchemeHttps)
-        {
-            return false;
-        }
-
-        var domain = cookie.Domain.Trim().TrimStart('.');
-        return domain.Length > 0
-               && (scope.IdnHost.Equals(domain, StringComparison.OrdinalIgnoreCase)
-                   || scope.IdnHost.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool IsUnsafeCookieCharacter(char character)
-        => char.IsControl(character) || character is '(' or ')' or '<' or '>' or '@' or ',' or ';' or ':'
-            or '\\' or '"' or '/' or '[' or ']' or '?' or '=' or '{' or '}' or ' ' or '\t';
-
     private HlsDownloadCoordinator CreateCoordinator()
     {
         var runner = new ExternalToolRunner(message => DiagnosticGenerated?.Invoke(message));
@@ -455,8 +457,65 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     public void Dispose()
     {
+        _browserCookieSynchronizer.Replace(_cookies, null);
+        lock (_browserCookieSnapshotLock)
+        {
+            _disposed = true;
+            _browserCookieSnapshots.Clear();
+        }
+
+        _browserCookieExpiryTimer.Dispose();
         _discoveryClient.Dispose();
         _segmentClient.Dispose();
     }
+
+    private void PurgeExpiredBrowserCookieSnapshots()
+    {
+        lock (_browserCookieSnapshotLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            PurgeExpiredBrowserCookieSnapshotsLocked(now);
+            ScheduleBrowserCookieExpiryLocked(now);
+        }
+    }
+
+    private void PurgeExpiredBrowserCookieSnapshotsLocked(DateTimeOffset now)
+    {
+        foreach (var expired in _browserCookieSnapshots
+                     .Where(pair => now - pair.Value.CapturedAt >= BrowserCookieSnapshotLifetime)
+                     .Select(pair => pair.Key)
+                     .ToArray())
+        {
+            _browserCookieSnapshots.Remove(expired);
+        }
+    }
+
+    private void ScheduleBrowserCookieExpiryLocked(DateTimeOffset now)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_browserCookieSnapshots.Count == 0)
+        {
+            _browserCookieExpiryTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            return;
+        }
+
+        var earliest = _browserCookieSnapshots.Values.Min(entry => entry.CapturedAt)
+                       + BrowserCookieSnapshotLifetime;
+        var dueTime = earliest > now ? earliest - now : TimeSpan.Zero;
+        _browserCookieExpiryTimer.Change(dueTime, Timeout.InfiniteTimeSpan);
+    }
+
+    private sealed record RememberedBrowserCookies(
+        BrowserCookieSnapshot Snapshot,
+        DateTimeOffset CapturedAt);
 
 }

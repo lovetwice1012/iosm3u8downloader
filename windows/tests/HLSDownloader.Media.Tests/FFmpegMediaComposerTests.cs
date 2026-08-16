@@ -35,10 +35,44 @@ public sealed class FFmpegMediaComposerTests
         Assert.Contains("0:a?", runner.LastInvocation!.Arguments);
     }
 
+    [Fact]
+    public async Task AudioOnlyPrimaryWithExternalAudioUsesTheSelectedExternalRendition()
+    {
+        using var scope = new TestFileScope();
+        string primary = scope.PathFor("primary.ts");
+        string secondary = scope.PathFor("selected-audio.ts");
+        await File.WriteAllTextAsync(primary, "primary fixture");
+        await File.WriteAllTextAsync(secondary, "secondary fixture");
+        var runner = new OutputCreatingRunner(MediaOutputFormat.Wav);
+        var probe = new PathProbe(new Dictionary<string, MediaTrackInfo>(StringComparer.OrdinalIgnoreCase)
+        {
+            [primary] = new(false, true, 44_100, 2),
+            [secondary] = new(false, true, 48_000, 1)
+        });
+        var composer = new FFmpegMediaComposer("ffmpeg", probe, runner);
+
+        MediaComposeResult result = await composer.ComposeAsync(new MediaComposeRequest(
+            primary,
+            scope.PathFor("output"),
+            SecondaryAudioInputPath: secondary));
+
+        Assert.Equal(MediaOutputFormat.Wav, result.OutputFormat);
+        Assert.Equal(48_000, result.Tracks.AudioSampleRate);
+        Assert.Equal(1, result.Tracks.AudioChannels);
+        int mapIndex = runner.LastInvocation!.Arguments.ToList().IndexOf("-map");
+        Assert.Equal("1:a:0", runner.LastInvocation.Arguments[mapIndex + 1]);
+    }
+
     private sealed class StubProbe(MediaTrackInfo result) : IMediaTrackProbe
     {
         public Task<MediaTrackInfo> ProbeAsync(string inputPath, TimeSpan timeout, CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
+    }
+
+    private sealed class PathProbe(IReadOnlyDictionary<string, MediaTrackInfo> results) : IMediaTrackProbe
+    {
+        public Task<MediaTrackInfo> ProbeAsync(string inputPath, TimeSpan timeout, CancellationToken cancellationToken = default) =>
+            Task.FromResult(results[inputPath]);
     }
 
     private sealed class OutputCreatingRunner(MediaOutputFormat format) : IExternalToolRunner

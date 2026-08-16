@@ -58,7 +58,7 @@ public sealed class FFmpegMediaComposer : IMediaComposer
         }
         else
         {
-            string audioMap = primaryTracks.HasAudio ? "0:a:0" : "1:a:0";
+            string audioMap = secondaryTracks?.HasAudio == true ? "1:a:0" : "0:a:0";
             arguments.AddRange(["-map", audioMap, "-vn", "-c:a", "pcm_s16le", "-rf64", "auto", "-f", "wav", partialPath]);
         }
 

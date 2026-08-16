@@ -39,7 +39,7 @@ public sealed class HlsDownloadPlanBuilder(
         if (!string.IsNullOrEmpty(variant.AudioGroupId))
         {
             var rendition = master.Renditions
-                .Where(x => x.Type == "AUDIO" && x.GroupId == variant.AudioGroupId && x.Uri is not null)
+                .Where(x => x.Type == "AUDIO" && x.GroupId == variant.AudioGroupId)
                 .OrderByDescending(x => x.IsDefault).ThenByDescending(x => x.IsAutoSelect).FirstOrDefault();
             if (rendition?.Uri is { } audioUri)
             {

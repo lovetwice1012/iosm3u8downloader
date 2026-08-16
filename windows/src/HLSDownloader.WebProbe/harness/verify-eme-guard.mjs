@@ -9,9 +9,12 @@ const sourcePath = path.resolve(directory, '..', 'WebProbeScript.cs');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const match = source.match(/private const string ScriptTemplate = """\r?\n([\s\S]*?)\r?\n""";/);
 assert.ok(match, 'WebProbeScript raw template was not found.');
-const script = match[1].replace('__NONCE_JSON__', JSON.stringify('harness-nonce'));
+const script = match[1]
+  .replace('__NONCE_JSON__', JSON.stringify('harness-nonce'))
+  .replace(
+    '__ALLOWED_WIDEVINE_HOSTS_JSON__',
+    JSON.stringify(['widevine.sprink.cloud']));
 
-let widevineAllowed = false;
 let originalCalls = 0;
 class Navigator {
   requestMediaKeySystemAccess(keySystem) {
@@ -28,23 +31,48 @@ const document = {
   readyState: 'loading',
   addEventListener() { }
 };
+class HarnessHeaders {
+  constructor(mime) { this.mime = mime; }
+  get(name) {
+    return String(name).toLowerCase() === 'content-type' ? this.mime : null;
+  }
+}
+class HarnessResponse {
+  constructor(url, status, mime) {
+    this.responseUrl = String(url);
+    this.status = status;
+    this.responseHeaders = new HarnessHeaders(mime);
+  }
+  get ok() { return this.status >= 200 && this.status < 300; }
+  get url() { return this.responseUrl; }
+  get headers() { return this.responseHeaders; }
+}
+class HarnessLocation {
+  constructor(href) {
+    this.locationHref = String(href);
+    Object.defineProperty(this, 'href', {
+      configurable: false,
+      enumerable: true,
+      get: () => this.locationHref
+    });
+  }
+}
+const nativeFetch = input => Promise.resolve(
+  new HarnessResponse(input, 200, 'application/dash+xml'));
+const location = new HarnessLocation('https://example.com/player');
 const context = vm.createContext({
   Navigator,
   navigator,
   document,
-  location: { href: 'https://example.com/player' },
+  location,
   chrome: {
     webview: {
-      postMessage(message) { messages.push(message); },
-      hostObjects: {
-        sync: {
-          widevinePolicy: {
-            IsWidevinePlaybackAllowed() { return widevineAllowed; }
-          }
-        }
-      }
+      postMessage(message) { messages.push(message); }
     }
   },
+  fetch: nativeFetch,
+  Headers: HarnessHeaders,
+  Response: HarnessResponse,
   XMLHttpRequest: class XMLHttpRequest { open() { } },
   performance: { getEntriesByType() { return []; } },
   URL,
@@ -94,16 +122,37 @@ vm.runInContext(`
   String = () => 'com.apple.fps';
   Reflect.apply = () => Promise.resolve('bypassed');
   Promise.reject = () => Promise.resolve('bypassed');
-  chrome.webview.hostObjects.sync.widevinePolicy.IsWidevinePlaybackAllowed = () => true;
+  Headers.prototype.get = () => 'text/html';
+  Object.defineProperty(Response.prototype, 'ok', { get: () => false });
+  Object.defineProperty(Response.prototype, 'url', {
+    get: () => 'https://example.com/bypassed.mpd'
+  });
+  Object.defineProperty(Response.prototype, 'headers', {
+    get: () => new Headers('text/html')
+  });
+  URL = class URL {};
 `, context);
 await assert.rejects(
   navigator.requestMediaKeySystemAccess('com.widevine.alpha'),
   error => error?.name === 'NotAllowedError');
 assert.equal(originalCalls, 1);
-widevineAllowed = true;
+
+await context.fetch('https://widevine.sprink.cloud/video/manifest.mpd');
+await assert.rejects(
+  Navigator.prototype.requestMediaKeySystemAccess.call(navigator, 'com.widevine.alpha'),
+  error => error?.name === 'NotAllowedError');
+assert.equal(originalCalls, 1);
+
+location.locationHref = 'https://widevine.sprink.cloud/player';
 assert.equal(
   await Navigator.prototype.requestMediaKeySystemAccess.call(navigator, 'com.widevine.alpha'),
   'original:com.widevine.alpha');
+assert.equal(originalCalls, 2);
+
+await context.fetch('https://example.com/video/manifest.mpd');
+await assert.rejects(
+  navigator.requestMediaKeySystemAccess('com.widevine.alpha'),
+  error => error?.name === 'NotAllowedError');
 assert.equal(originalCalls, 2);
 assert.ok(messages.some(message => message.source === 'requestMediaKeySystemAccess'));
 

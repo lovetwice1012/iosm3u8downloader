@@ -19,6 +19,39 @@ public sealed class HlsDownloadPlanBuilderTests
     }
 
     [Fact]
+    public async Task UriLessDefaultAudioKeepsTheVariantsInBandAudio()
+    {
+        var root = new Uri("https://example.com/master.m3u8");
+        var fetcher = new MapFetcher(new Dictionary<Uri, string>
+        {
+            [root] = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,AUTOSELECT=YES\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"alternate\",DEFAULT=NO,AUTOSELECT=YES,URI=\"alternate.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=20,AUDIO=\"a\"\nmain.m3u8",
+            [new("https://example.com/main.m3u8")] = Media("main.ts")
+        });
+
+        var plan = await new HlsDownloadPlanBuilder(fetcher)
+            .BuildAsync(new(root, MediaCandidateKind.Hls, MediaCandidateOrigin.Direct, root));
+
+        Assert.Null(plan.AudioPlaylist);
+    }
+
+    [Fact]
+    public async Task AudioRenditionSelectionUsesDefaultThenAutoselectThenDeclarationOrder()
+    {
+        var root = new Uri("https://example.com/master.m3u8");
+        var fetcher = new MapFetcher(new Dictionary<Uri, string>
+        {
+            [root] = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"first\",DEFAULT=NO,AUTOSELECT=YES,URI=\"first.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"second\",DEFAULT=NO,AUTOSELECT=YES,URI=\"second.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"manual\",DEFAULT=NO,AUTOSELECT=NO,URI=\"manual.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=20,AUDIO=\"a\"\nmain.m3u8",
+            [new("https://example.com/main.m3u8")] = Media("main.ts"),
+            [new("https://example.com/first.m3u8")] = Media("first.aac")
+        });
+
+        var plan = await new HlsDownloadPlanBuilder(fetcher)
+            .BuildAsync(new(root, MediaCandidateKind.Hls, MediaCandidateOrigin.Direct, root));
+
+        Assert.EndsWith("first.aac", plan.AudioPlaylist!.Segments.Single().Uri.AbsoluteUri, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ClearHlsIsNotRestrictedByWidevineDomain()
     {
         var uri = new Uri("https://example.com/media.m3u8");

@@ -13,12 +13,11 @@ namespace HLSDownloader.Windows;
 
 public sealed record PlaybackProbeCandidate(
     ProbeSignal Signal,
-    IReadOnlyList<BrowserSessionCookie> Cookies);
+    BrowserCookieSnapshot CookieSnapshot);
 
 public sealed partial class PlaybackProbeWindow : Window
 {
     private readonly ProbeSession _session = new();
-    private readonly WidevineHostPolicy _widevineHostPolicy = new();
     private readonly Uri _initialUri;
     private int _manifestCount;
 
@@ -52,12 +51,10 @@ public sealed partial class PlaybackProbeWindow : Window
         core.Settings.AreDevToolsEnabled = false;
         core.Settings.AreDefaultContextMenusEnabled = true;
         core.Settings.IsStatusBarEnabled = true;
-        core.AddHostObjectToScript("widevinePolicy", _widevineHostPolicy);
         core.WebMessageReceived += Core_OnWebMessageReceived;
         core.WebResourceRequested += Core_OnWebResourceRequested;
         core.WebResourceResponseReceived += Core_OnWebResourceResponseReceived;
         core.NewWindowRequested += Core_OnNewWindowRequested;
-        core.NavigationStarting += Core_OnNavigationStarting;
 
         foreach (var context in new[]
                  {
@@ -74,7 +71,9 @@ public sealed partial class PlaybackProbeWindow : Window
         try
         {
             await core.AddScriptToExecuteOnDocumentCreatedAsync(
-                WebProbeScript.CreateDocumentStartScript(_session.Nonce));
+                WebProbeScript.CreateDocumentStartScript(
+                    _session.Nonce,
+                    WidevineDownloadPolicy.DownloadableWidevineHosts));
             sender.Source = _initialUri;
         }
         catch (Exception exception)
@@ -99,11 +98,7 @@ public sealed partial class PlaybackProbeWindow : Window
         if (Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var requestedUri)
             && requestedUri.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase))
         {
-            if (WidevineDownloadPolicy.IsDownloadableWidevineDomain(requestedUri))
-            {
-                _widevineHostPolicy.ObserveManifest(requestedUri);
-            }
-            else
+            if (!WidevineDownloadPolicy.IsDownloadableWidevineDomain(requestedUri))
             {
                 args.Response = Browser.CoreWebView2.Environment.CreateWebResourceResponse(
                     null,
@@ -167,9 +162,6 @@ public sealed partial class PlaybackProbeWindow : Window
         Browser.Source = uri;
     }
 
-    private void Core_OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs args)
-        => _widevineHostPolicy.Reset();
-
     private void Browser_OnNavigationCompleted(WebView2 sender, CoreWebView2NavigationCompletedEventArgs args)
     {
         BrowserProgress.IsActive = false;
@@ -195,8 +187,6 @@ public sealed partial class PlaybackProbeWindow : Window
                 ShowError("許可されていないhostのWidevineコンテンツをブロックしました。");
                 return;
             }
-
-            _widevineHostPolicy.ObserveManifest(signal.Url);
         }
 
         if (signal.Kind == ProbeSignalKind.EncryptedMedia)
@@ -215,31 +205,40 @@ public sealed partial class PlaybackProbeWindow : Window
         ProbeInfoBar.Severity = InfoBarSeverity.Success;
         ProbeInfoBar.Message = $"ページ内の再生を解析中です。候補 {_manifestCount} 件";
         DiagnosticGenerated?.Invoke(this, $"{signal.Source} で候補を検出: {RedactForLog(signal.Url)}");
-        var cookies = await CaptureCookiesAsync(signal);
-        CandidateDetected?.Invoke(this, new PlaybackProbeCandidate(signal, cookies));
+        var cookieSnapshot = await CaptureCookiesAsync(signal);
+        CandidateDetected?.Invoke(this, new PlaybackProbeCandidate(signal, cookieSnapshot));
     }
 
-    private async Task<IReadOnlyList<BrowserSessionCookie>> CaptureCookiesAsync(ProbeSignal signal)
+    private async Task<BrowserCookieSnapshot> CaptureCookiesAsync(ProbeSignal signal)
     {
+        var requestedScopes = new[] { signal.Url, signal.PageUrl }
+            .Where(uri => uri is not null)
+            .Cast<Uri>()
+            .DistinctBy(uri => uri.AbsoluteUri)
+            .Take(8)
+            .ToArray();
         if (Browser.CoreWebView2 is null)
         {
-            return [];
+            return new BrowserCookieSnapshot([], []);
         }
 
-        var result = new List<BrowserSessionCookie>();
-        var keys = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var scope in new[] { signal.Url, signal.PageUrl }
-                     .Where(uri => uri is not null)
-                     .Cast<Uri>()
-                     .DistinctBy(uri => uri.AbsoluteUri))
+        var siteContext = Browser.Source is { IsAbsoluteUri: true } current
+                          && (current.Scheme == Uri.UriSchemeHttp || current.Scheme == Uri.UriSchemeHttps)
+            ? current
+            : signal.PageUrl ?? _initialUri;
+        var result = new Dictionary<string, BrowserSessionCookie>(StringComparer.Ordinal);
+        var capturedScopes = new List<Uri>(requestedScopes.Length);
+        foreach (var scope in requestedScopes)
         {
             try
             {
                 var browserCookies = await Browser.CoreWebView2.CookieManager.GetCookiesAsync(scope.AbsoluteUri);
-                foreach (var cookie in browserCookies.Take(128 - result.Count))
+                capturedScopes.Add(scope);
+                foreach (var cookie in browserCookies.Take(128))
                 {
-                    var key = $"{cookie.Name}\n{cookie.Domain}\n{cookie.Path}";
-                    if (!keys.Add(key))
+                    var isDomainCookie = cookie.Domain.StartsWith(".", StringComparison.Ordinal);
+                    var key = $"{cookie.Name}\n{cookie.Domain}\n{cookie.Path}\n{isDomainCookie}";
+                    if (result.Count >= 128 && !result.ContainsKey(key))
                     {
                         continue;
                     }
@@ -256,14 +255,27 @@ public sealed partial class PlaybackProbeWindow : Window
                         }
                     }
 
-                    result.Add(new BrowserSessionCookie(
+                    var capturedForUris = result.TryGetValue(key, out var existing)
+                        ? existing.CapturedForUris.Append(scope).DistinctBy(uri => uri.AbsoluteUri).ToArray()
+                        : [scope];
+                    result[key] = new BrowserSessionCookie(
+                        capturedForUris,
+                        siteContext,
                         cookie.Name,
                         cookie.Value,
                         cookie.Domain,
+                        isDomainCookie,
                         string.IsNullOrEmpty(cookie.Path) ? "/" : cookie.Path,
                         cookie.IsSecure,
                         cookie.IsHttpOnly,
-                        expires));
+                        cookie.SameSite switch
+                        {
+                            CoreWebView2CookieSameSiteKind.None => BrowserCookieSameSite.None,
+                            CoreWebView2CookieSameSiteKind.Lax => BrowserCookieSameSite.Lax,
+                            CoreWebView2CookieSameSiteKind.Strict => BrowserCookieSameSite.Strict,
+                            _ => BrowserCookieSameSite.Unknown
+                        },
+                        expires);
                 }
             }
             catch (Exception)
@@ -272,7 +284,7 @@ public sealed partial class PlaybackProbeWindow : Window
             }
         }
 
-        return result;
+        return new BrowserCookieSnapshot(capturedScopes, result.Values.ToArray());
     }
 
     private void NavigateFromAddressBar()
@@ -334,7 +346,6 @@ public sealed partial class PlaybackProbeWindow : Window
             core.WebResourceRequested -= Core_OnWebResourceRequested;
             core.WebResourceResponseReceived -= Core_OnWebResourceResponseReceived;
             core.NewWindowRequested -= Core_OnNewWindowRequested;
-            core.NavigationStarting -= Core_OnNavigationStarting;
         }
 
         Browser.Close();
