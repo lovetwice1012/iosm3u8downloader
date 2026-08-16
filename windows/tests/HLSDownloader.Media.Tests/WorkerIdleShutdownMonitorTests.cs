@@ -95,6 +95,31 @@ public sealed class WorkerIdleShutdownMonitorTests
     }
 
     [Fact]
+    public async Task AlreadyCancelledTokenIsPropagated()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var scope = new TestFileScope();
+        var ledger = new JobLedger(scope.PathFor("jobs.dat"));
+        var coordinator = new WorkerCoordinator(ledger, new NeverCalledComposer());
+        using var shutdown = new CancellationTokenSource();
+        using var stopTest = new CancellationTokenSource();
+        stopTest.Cancel();
+        var monitor = new WorkerIdleShutdownMonitor(
+            coordinator,
+            shutdown,
+            TimeSpan.FromMilliseconds(50),
+            TimeSpan.FromMilliseconds(10));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => monitor.RunAsync(stopTest.Token));
+
+        Assert.False(shutdown.IsCancellationRequested);
+    }
+
+    [Fact]
     public async Task RetriedEnqueueWithSameJobIdIsIdempotent()
     {
         if (!OperatingSystem.IsWindows())

@@ -31,8 +31,9 @@ public sealed class WorkerIdleShutdownMonitor
         _coordinator.ActivityOccurred += OnActivityOccurred;
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (true)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 await Task.Delay(_pollInterval, cancellationToken).ConfigureAwait(false);
                 DateTimeOffset lastActivity = new(Interlocked.Read(ref _lastActivityUtcTicks), TimeSpan.Zero);
                 if (DateTimeOffset.UtcNow - lastActivity < _idleTimeout)
