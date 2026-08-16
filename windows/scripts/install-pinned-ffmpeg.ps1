@@ -56,8 +56,17 @@ try {
     Copy-Item -LiteralPath $ffmpeg.FullName -Destination (Join-Path $destination 'ffmpeg.exe') -Force
     Copy-Item -LiteralPath $ffprobe.FullName -Destination (Join-Path $destination 'ffprobe.exe') -Force
 
-    $ffmpegVersion = & (Join-Path $destination 'ffmpeg.exe') -version | Select-Object -First 1
-    $ffprobeVersion = & (Join-Path $destination 'ffprobe.exe') -version | Select-Object -First 1
+    $ffmpegOutput = @(& (Join-Path $destination 'ffmpeg.exe') -version 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $ffmpegOutput.Count -eq 0) {
+        throw 'The extracted ffmpeg executable could not be started.'
+    }
+    $ffmpegVersion = [string]$ffmpegOutput[0]
+
+    $ffprobeOutput = @(& (Join-Path $destination 'ffprobe.exe') -version 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $ffprobeOutput.Count -eq 0) {
+        throw 'The extracted ffprobe executable could not be started.'
+    }
+    $ffprobeVersion = [string]$ffprobeOutput[0]
     if ($ffmpegVersion -notmatch '^ffmpeg version 8\.1\.2-essentials_build-www\.gyan\.dev(?:\s|$)' -or
         $ffprobeVersion -notmatch '^ffprobe version 8\.1\.2-essentials_build-www\.gyan\.dev(?:\s|$)') {
         throw "The extracted tools do not report FFmpeg $version."
