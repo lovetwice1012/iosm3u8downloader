@@ -9,7 +9,12 @@ private struct RemuxExecutionResult: Sendable {
 private final class RemuxSessionBox: @unchecked Sendable {
     let handle: UnsafeMutableRawPointer
 
-    init?(inputURL: URL, audioInputURL: URL?, outputURL: URL) {
+    init?(
+        inputURL: URL,
+        audioInputURL: URL?,
+        outputURL: URL,
+        maximumOutputBytes: Int64
+    ) {
         let created: UnsafeMutableRawPointer?
         if let audioInputURL {
             created = inputURL.path.withCString { inputPath in
@@ -18,7 +23,8 @@ private final class RemuxSessionBox: @unchecked Sendable {
                         hls_ffmpeg_remux_session_create(
                             inputPath,
                             audioInputPath,
-                            outputPath
+                            outputPath,
+                            maximumOutputBytes
                         )
                     }
                 }
@@ -26,7 +32,12 @@ private final class RemuxSessionBox: @unchecked Sendable {
         } else {
             created = inputURL.path.withCString { inputPath in
                 outputURL.path.withCString { outputPath in
-                    hls_ffmpeg_remux_session_create(inputPath, nil, outputPath)
+                    hls_ffmpeg_remux_session_create(
+                        inputPath,
+                        nil,
+                        outputPath,
+                        maximumOutputBytes
+                    )
                 }
             }
         }
@@ -75,11 +86,17 @@ final class TransportStreamRemuxer: @unchecked Sendable {
             throw HLSError.remuxFailed("MPEG-TS音声入力ファイルがありません")
         }
 
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: outputURL)
+        try LocalFFmpegOutputLimit.validateInputFiles(
+            [inputURL] + (audioInputURL.map { [$0] } ?? []),
+            maximumBytes: maximumOutputBytes
+        )
         try? FileManager.default.removeItem(at: outputURL)
         guard let session = RemuxSessionBox(
             inputURL: inputURL,
             audioInputURL: audioInputURL,
-            outputURL: outputURL
+            outputURL: outputURL,
+            maximumOutputBytes: maximumOutputBytes
         ) else {
             throw HLSError.remuxFailed("変換処理を開始できません")
         }
@@ -107,6 +124,10 @@ final class TransportStreamRemuxer: @unchecked Sendable {
         }
 
         do {
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: outputURL,
+                maximumBytes: maximumOutputBytes
+            )
             let values = try outputURL.resourceValues(forKeys: [.fileSizeKey])
             guard (values.fileSize ?? 0) > 0 else {
                 throw HLSError.remuxFailed("出力が空です")

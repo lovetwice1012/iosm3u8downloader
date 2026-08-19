@@ -37,9 +37,77 @@ final class SourceResolver: Sendable {
     func discover(input: String) async throws -> HLSDiscoveryResult {
         let inputURL = try URIResolver.normalizeInput(input)
         log("discovery", "start \(DiagnosticPrivacy.urlSummary(inputURL))")
+
+        var initialProbe: HTTPResourceProbe?
+        do {
+            let probe = try await client.probeMediaPrefix(inputURL)
+            initialProbe = probe
+            guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                from: inputURL,
+                to: probe.effectiveURL
+            ) else {
+                throw HLSError.network("progressive media redirect was blocked")
+            }
+            if let container = ProgressiveMediaDetector.detect(
+                prefix: probe.prefix,
+                url: probe.effectiveURL,
+                mimeType: probe.mimeType
+            ) {
+                guard ProgressiveMediaDetector.supportsStandaloneDownload(container) else {
+                    log("progressive", "standalone framed HLS media rejected because encryption cannot be authenticated without a manifest")
+                    throw HLSError.drmUnsupported("standalone TS/AAC/AC-3 requires an HLS manifest")
+                }
+                log(
+                    "progressive",
+                    "direct media accepted container=\(container.rawValue) bytesProbed=\(probe.prefix.count) \(DiagnosticPrivacy.urlSummary(probe.effectiveURL))"
+                )
+                return HLSDiscoveryResult(
+                    candidates: [
+                        HLSCandidate(
+                            id: UUID(),
+                            kind: .progressive,
+                            request: URLCandidates(
+                                primary: probe.effectiveURL,
+                                sameOriginQueryFallback: nil
+                            ),
+                            requestReferer: inputURL,
+                            document: nil,
+                            progressiveMedia: ProgressiveMediaReference(
+                                storage: .remote,
+                                hintedMIMEType: probe.mimeType
+                            ),
+                            pageURL: probe.effectiveURL,
+                            title: nil,
+                            thumbnailURL: nil,
+                            iframeDepth: 0,
+                            origin: .direct
+                        )
+                    ],
+                    isDirectPlaylist: false
+                )
+            }
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            if case .cancelled = error { throw error }
+            if case .drmUnsupported = error { throw error }
+            log("progressive", "direct media probe skipped error=\(DiagnosticPrivacy.errorCode(error))")
+        } catch {
+            log("progressive", "direct media probe skipped error=\(DiagnosticPrivacy.errorCode(error))")
+        }
+
         let payload: HTTPPayload
         do {
-            payload = try await client.fetch(inputURL)
+            if let initialProbe, initialProbe.isCompleteResponse {
+                payload = HTTPPayload(
+                    data: initialProbe.prefix,
+                    effectiveURL: initialProbe.effectiveURL,
+                    statusCode: initialProbe.statusCode,
+                    mimeType: initialProbe.mimeType
+                )
+            } else {
+                payload = try await client.fetch(inputURL)
+            }
             log(
                 "network",
                 "root response status=\(payload.statusCode) mime=\(DiagnosticPrivacy.mimeClass(payload.mimeType)) bytes=\(payload.data.count) redirected=\(payload.effectiveURL != inputURL) \(DiagnosticPrivacy.urlSummary(payload.effectiveURL))"
@@ -180,6 +248,12 @@ final class SourceResolver: Sendable {
         _ inspection: DynamicPageInspection,
         rootURL: URL
     ) async -> [HLSCandidate] {
+        guard !Task.isCancelled else {
+            inspection.blobs.forEach {
+                WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+            }
+            return []
+        }
         client.storeCookies(inspection.cookies)
         var discovered = Set<String>()
         var accepted = Set<String>()
@@ -456,6 +530,38 @@ final class SourceResolver: Sendable {
                     } catch {
                         log("widevine", "HTML MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
                     }
+                case .progressive:
+                    do {
+                        let validated = try await probeProgressiveMedia(
+                            request,
+                            referer: documentURL,
+                            rootURL: rootURL
+                        )
+                        appendCandidate(
+                            kind: .progressive,
+                            request: validated.request,
+                            requestReferer: documentURL,
+                            document: nil,
+                            progressiveMedia: ProgressiveMediaReference(
+                                storage: .remote,
+                                hintedMIMEType: validated.mimeType
+                            ),
+                            pageURL: documentURL,
+                            title: limitedTitle(reference.title ?? pageTitle),
+                            thumbnailURL: thumbnailURL,
+                            iframeDepth: work.iframeDepth,
+                            origin: reference.origin,
+                            accepted: &acceptedCandidates,
+                            results: &results
+                        )
+                    } catch is CancellationError {
+                        throw HLSError.cancelled
+                    } catch let error as HLSError {
+                        if case .cancelled = error { throw error }
+                        log("progressive", "HTML media candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                    } catch {
+                        log("progressive", "HTML media candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                    }
                 }
             }
 
@@ -510,10 +616,15 @@ final class SourceResolver: Sendable {
         }
 
         let dynamic = await dynamicInspection
-        try Task.checkCancellation()
+        guard !Task.isCancelled else {
+            dynamic.blobs.forEach {
+                WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+            }
+            throw HLSError.cancelled
+        }
         log(
             "webkit",
-            "inspection returned references=\(dynamic.media.count) licenseMetadata=\(dynamic.licenseRequests.count) eme=\(dynamic.detectedWidevineKeySystem) cookies=\(dynamic.cookies.count)"
+            "inspection returned references=\(dynamic.media.count) blobs=\(dynamic.blobs.count) mse=\(dynamic.detectedMediaSource) licenseMetadata=\(dynamic.licenseRequests.count) eme=\(dynamic.detectedWidevineKeySystem) cookies=\(dynamic.cookies.count)"
         )
         client.storeCookies(dynamic.cookies)
 
@@ -542,14 +653,19 @@ final class SourceResolver: Sendable {
         let result = await dynamicInspector.inspect(url: url, seedCookies: seedCookies)
         log(
             "webkit",
-            "inspection finish references=\(result.media.count) licenseMetadata=\(result.licenseRequests.count) eme=\(result.detectedWidevineKeySystem) cookies=\(result.cookies.count)"
+            "inspection finish references=\(result.media.count) blobs=\(result.blobs.count) mse=\(result.detectedMediaSource) licenseMetadata=\(result.licenseRequests.count) eme=\(result.detectedWidevineKeySystem) cookies=\(result.cookies.count)"
         )
         return result
     }
 
     private func dynamicallyDiscoveredCandidates(rootURL: URL) async throws -> [HLSCandidate] {
         let dynamic = await inspectDynamically(rootURL)
-        try Task.checkCancellation()
+        guard !Task.isCancelled else {
+            dynamic.blobs.forEach {
+                WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+            }
+            throw HLSError.cancelled
+        }
         client.storeCookies(dynamic.cookies)
         var discovered = Set<String>()
         var accepted = Set<String>()
@@ -571,8 +687,34 @@ final class SourceResolver: Sendable {
         accepted: inout Set<String>,
         results: inout [HLSCandidate]
     ) async {
+        var blobContextIndices: [Int: Int] = [:]
+        var mediaForContext = inspection.media
+        for (blobIndex, blob) in inspection.blobs.enumerated() where blob.kind == .widevineDASH {
+            blobContextIndices[blobIndex] = mediaForContext.count
+            mediaForContext.append(
+                DynamicMediaReference(
+                    url: blob.pageURL,
+                    kind: .widevineDASH,
+                    pageURL: blob.pageURL,
+                    title: blob.title,
+                    thumbnailURL: nil,
+                    iframeDepth: blob.iframeDepth,
+                    origin: .runtime,
+                    frameToken: blob.frameToken,
+                    sequence: blob.sequence
+                )
+            )
+        }
+        let contextInspection = DynamicPageInspection(
+            media: mediaForContext,
+            blobs: inspection.blobs,
+            cookies: inspection.cookies,
+            licenseRequests: inspection.licenseRequests,
+            detectedWidevineKeySystem: inspection.detectedWidevineKeySystem,
+            detectedMediaSource: inspection.detectedMediaSource
+        )
         let playbackContexts = widevinePlaybackContexts(
-            in: inspection,
+            in: contextInspection,
             rootURL: rootURL
         )
         for (referenceIndex, reference) in inspection.media.enumerated()
@@ -636,12 +778,197 @@ final class SourceResolver: Sendable {
                         results: &results
                     )
                 } catch is CancellationError {
+                    inspection.blobs.forEach {
+                        WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+                    }
                     return
+                } catch let error as HLSError {
+                    if case .cancelled = error {
+                        inspection.blobs.forEach {
+                            WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+                        }
+                        return
+                    }
+                    log("widevine", "dynamic MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
                 } catch {
                     log("widevine", "dynamic MPD candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
                 }
+            case .progressive:
+                do {
+                    let validated = try await probeProgressiveMedia(
+                        URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                        referer: pageURL,
+                        rootURL: rootURL
+                    )
+                    appendCandidate(
+                        kind: .progressive,
+                        request: validated.request,
+                        requestReferer: pageURL,
+                        document: nil,
+                        progressiveMedia: ProgressiveMediaReference(
+                            storage: .remote,
+                            hintedMIMEType: validated.mimeType
+                        ),
+                        pageURL: pageURL,
+                        title: limitedTitle(reference.title),
+                        thumbnailURL: thumbnailURL,
+                        iframeDepth: reference.iframeDepth,
+                        origin: reference.origin,
+                        accepted: &accepted,
+                        results: &results
+                    )
+                } catch is CancellationError {
+                    inspection.blobs.forEach {
+                        WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+                    }
+                    return
+                } catch let error as HLSError {
+                    if case .cancelled = error {
+                        inspection.blobs.forEach {
+                            WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+                        }
+                        return
+                    }
+                    log("progressive", "dynamic media candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                } catch {
+                    log("progressive", "dynamic media candidate rejected error=\(DiagnosticPrivacy.errorCode(error))")
+                }
             }
         }
+
+        guard !Task.isCancelled else {
+            inspection.blobs.forEach {
+                WebBlobCaptureStore.discardCaptureFile(at: $0.fileURL)
+            }
+            return
+        }
+        for (blobIndex, blob) in inspection.blobs.enumerated() {
+            guard results.count < maximumResults else {
+                WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+                continue
+            }
+            guard WebBlobCaptureStore.isManagedCaptureURL(blob.fileURL),
+                  isSafeAutomaticURL(blob.pageURL),
+                  AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: blob.pageURL
+              ) else {
+                log("security", "captured Blob candidate blocked by origin policy")
+                WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+                continue
+            }
+
+            switch blob.kind {
+            case .hls:
+                guard let text = capturedManifestText(blob),
+                      PlaylistParser.isPlaylist(text) else {
+                    log("webkit", "captured HLS Blob rejected because its body is invalid")
+                    WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+                    continue
+                }
+                let document = PlaylistDocument(
+                    text: text,
+                    effectiveURL: blob.pageURL,
+                    referer: blob.pageURL
+                )
+                appendCandidate(
+                    kind: .hls,
+                    request: URLCandidates(primary: blob.pageURL, sameOriginQueryFallback: nil),
+                    requestReferer: blob.pageURL,
+                    document: document,
+                    usesCapturedDocument: true,
+                    capturedContentID: blob.capturedContentID,
+                    pageURL: blob.pageURL,
+                    title: limitedTitle(blob.title),
+                    thumbnailURL: nil,
+                    iframeDepth: blob.iframeDepth,
+                    origin: .runtime,
+                    accepted: &accepted,
+                    results: &results
+                )
+                WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+
+            case .widevineDASH:
+                guard isDownloadableWidevineDomain(blob.pageURL),
+                      let data = capturedManifestData(blob),
+                      let text = decodeText(data),
+                      let manifest = try? DASHManifestParser.parse(
+                        data: data,
+                        effectiveURL: blob.pageURL
+                      ),
+                      manifest.isWidevine else {
+                    log("widevine", "captured MPD Blob rejected by validation/domain policy")
+                    WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+                    continue
+                }
+                let document = PlaylistDocument(
+                    text: text,
+                    effectiveURL: blob.pageURL,
+                    referer: blob.pageURL
+                )
+                appendCandidate(
+                    kind: .widevineDASH,
+                    request: URLCandidates(primary: blob.pageURL, sameOriginQueryFallback: nil),
+                    requestReferer: blob.pageURL,
+                    document: document,
+                    usesCapturedDocument: true,
+                    capturedContentID: blob.capturedContentID,
+                    widevinePlaybackContext: blobContextIndices[blobIndex]
+                        .flatMap { playbackContexts[$0] },
+                    pageURL: blob.pageURL,
+                    title: limitedTitle(blob.title),
+                    thumbnailURL: nil,
+                    iframeDepth: blob.iframeDepth,
+                    origin: .runtime,
+                    accepted: &accepted,
+                    results: &results
+                )
+                WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+
+            case .progressive:
+                appendCandidate(
+                    kind: .progressive,
+                    request: URLCandidates(primary: blob.blobURL, sameOriginQueryFallback: nil),
+                    requestReferer: blob.pageURL,
+                    document: nil,
+                    progressiveMedia: ProgressiveMediaReference(
+                        storage: .capturedBlob(
+                            fileURL: blob.fileURL,
+                            byteCount: blob.byteCount
+                        ),
+                        hintedMIMEType: blob.mimeType
+                    ),
+                    capturedContentID: blob.capturedContentID,
+                    pageURL: blob.pageURL,
+                    title: limitedTitle(blob.title),
+                    thumbnailURL: nil,
+                    iframeDepth: blob.iframeDepth,
+                    origin: .runtime,
+                    accepted: &accepted,
+                    results: &results
+                )
+            }
+        }
+    }
+
+    private func capturedManifestData(_ blob: DynamicBlobReference) -> Data? {
+        guard blob.byteCount > 0,
+              blob.byteCount <= 1_048_576,
+              WebBlobCaptureStore.isManagedCaptureURL(blob.fileURL),
+              let values = try? blob.fileURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              values.fileSize == blob.byteCount else {
+            return nil
+        }
+        return try? Data(contentsOf: blob.fileURL, options: .mappedIfSafe)
+    }
+
+    private func capturedManifestText(_ blob: DynamicBlobReference) -> String? {
+        guard let data = capturedManifestData(blob) else { return nil }
+        return decodeText(data)
     }
 
     /// Associates observed license traffic with a Widevine MPD conservatively.
@@ -799,6 +1126,73 @@ final class SourceResolver: Sendable {
         throw lastError
     }
 
+    /// A URL suffix or DOM MIME type is only a discovery hint. Every remote
+    /// progressive candidate must pass a fresh bounded byte probe before it is
+    /// shown, and is probed again after the complete job download.
+    private func probeProgressiveMedia(
+        _ candidates: URLCandidates,
+        referer: URL?,
+        rootURL: URL
+    ) async throws -> (
+        request: URLCandidates,
+        mimeType: String?,
+        container: MediaContainer
+    ) {
+        var lastError: Error = HLSError.invalidMediaPayload(
+            stream: "progressive",
+            number: 1,
+            mimeType: nil,
+            byteCount: 0,
+            signature: "unrecognized"
+        )
+        for candidate in candidates.all {
+            do {
+                let probe = try await client.probeMediaPrefix(
+                    candidate,
+                    referer: referer
+                )
+                guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: probe.effectiveURL
+                ),
+                let container = ProgressiveMediaDetector.detect(
+                    prefix: probe.prefix,
+                    url: probe.effectiveURL,
+                    mimeType: probe.mimeType
+                ),
+                ProgressiveMediaDetector.supportsStandaloneDownload(container) else {
+                    throw HLSError.invalidMediaPayload(
+                        stream: "progressive",
+                        number: 1,
+                        mimeType: probe.mimeType,
+                        byteCount: probe.prefix.count,
+                        signature: MediaPayloadInspector.signature(probe.prefix)
+                    )
+                }
+                log(
+                    "progressive",
+                    "media accepted container=\(container.rawValue) bytesProbed=\(probe.prefix.count) \(DiagnosticPrivacy.urlSummary(probe.effectiveURL))"
+                )
+                return (
+                    URLCandidates(
+                        primary: probe.effectiveURL,
+                        sameOriginQueryFallback: nil
+                    ),
+                    probe.mimeType,
+                    container
+                )
+            } catch is CancellationError {
+                throw HLSError.cancelled
+            } catch let error as HLSError {
+                if case .cancelled = error { throw error }
+                lastError = error
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
     private func validateWidevineDASHPayload(
         _ payload: HTTPPayload,
         requestedURL: URL,
@@ -845,6 +1239,9 @@ final class SourceResolver: Sendable {
         request: URLCandidates,
         requestReferer: URL?,
         document: PlaylistDocument?,
+        progressiveMedia: ProgressiveMediaReference? = nil,
+        usesCapturedDocument: Bool = false,
+        capturedContentID: UUID? = nil,
         widevinePlaybackContext: WidevinePlaybackContext? = nil,
         pageURL: URL,
         title: String?,
@@ -857,14 +1254,16 @@ final class SourceResolver: Sendable {
         let key = candidateKey(
             kind: kind,
             url: document?.effectiveURL ?? request.primary,
-            referer: document?.referer ?? requestReferer ?? pageURL
+            referer: document?.referer ?? requestReferer ?? pageURL,
+            capturedContentID: capturedContentID
         )
         guard accepted.insert(key).inserted else {
             guard let index = results.firstIndex(where: {
                 candidateKey(
                     kind: $0.kind,
                     url: $0.document?.effectiveURL ?? $0.request.primary,
-                    referer: $0.document?.referer ?? $0.requestReferer ?? $0.pageURL
+                    referer: $0.document?.referer ?? $0.requestReferer ?? $0.pageURL,
+                    capturedContentID: $0.capturedContentID
                 ) == key
             }) else { return }
             let existing = results[index]
@@ -874,6 +1273,9 @@ final class SourceResolver: Sendable {
                 request: existing.request.sameOriginQueryFallback != nil ? existing.request : request,
                 requestReferer: existing.requestReferer ?? requestReferer,
                 document: existing.document ?? document,
+                progressiveMedia: existing.progressiveMedia ?? progressiveMedia,
+                usesCapturedDocument: existing.usesCapturedDocument || usesCapturedDocument,
+                capturedContentID: existing.capturedContentID ?? capturedContentID,
                 widevinePlaybackContext: existing.widevinePlaybackContext ?? widevinePlaybackContext,
                 pageURL: existing.pageURL,
                 title: existing.title ?? title,
@@ -894,6 +1296,9 @@ final class SourceResolver: Sendable {
                 request: request,
                 requestReferer: requestReferer,
                 document: document,
+                progressiveMedia: progressiveMedia,
+                usesCapturedDocument: usesCapturedDocument,
+                capturedContentID: capturedContentID,
                 widevinePlaybackContext: widevinePlaybackContext,
                 pageURL: pageURL,
                 title: title,
@@ -949,8 +1354,16 @@ final class SourceResolver: Sendable {
         return components.string ?? url.absoluteString
     }
 
-    private func candidateKey(kind: MediaCandidateKind, url: URL, referer: URL?) -> String {
-        kind.rawValue + "\n" + canonicalURLKey(url) + "\n" + (referer.map(canonicalURLKey) ?? "")
+    private func candidateKey(
+        kind: MediaCandidateKind,
+        url: URL,
+        referer: URL?,
+        capturedContentID: UUID? = nil
+    ) -> String {
+        if let capturedContentID {
+            return kind.rawValue + "\ncapture:" + capturedContentID.uuidString.lowercased()
+        }
+        return kind.rawValue + "\n" + canonicalURLKey(url) + "\n" + (referer.map(canonicalURLKey) ?? "")
     }
 
     private func limitedTitle(_ title: String?) -> String? {

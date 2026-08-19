@@ -153,6 +153,54 @@ actor DASHDownloadPermitPool {
     }
 }
 
+private actor DASHStorageBudget {
+    struct Reservation: Sendable {
+        let id: UUID
+        let maximumBytes: Int64
+    }
+
+    private let maximumBytes: Int64
+    private var remainingBytes: Int64
+    private var reservations: [UUID: Int64] = [:]
+
+    init(maximumBytes: Int64) {
+        self.maximumBytes = maximumBytes
+        remainingBytes = maximumBytes
+    }
+
+    func reserve(maximumBytes requested: Int64) throws -> Reservation {
+        guard requested > 0, requested < remainingBytes else {
+            throw WidevineDASHProviderError.totalDownloadTooLarge
+        }
+        let reservation = Reservation(id: UUID(), maximumBytes: requested)
+        reservations[reservation.id] = requested
+        remainingBytes -= requested
+        return reservation
+    }
+
+    func commit(_ reservation: Reservation, actualBytes: Int64) throws {
+        guard let reserved = reservations.removeValue(forKey: reservation.id) else {
+            throw WidevineDASHProviderError.invalidMediaOutput
+        }
+        guard actualBytes > 0, actualBytes <= reserved else {
+            remainingBytes += reserved
+            throw WidevineDASHProviderError.segmentTooLarge
+        }
+        remainingBytes += reserved - actualBytes
+    }
+
+    func rollback(_ reservation: Reservation) {
+        guard let reserved = reservations.removeValue(forKey: reservation.id),
+              remainingBytes <= maximumBytes - reserved else { return }
+        remainingBytes += reserved
+    }
+
+    func releaseStoredBytes(_ byteCount: Int64) {
+        guard byteCount > 0 else { return }
+        remainingBytes = min(maximumBytes, remainingBytes + byteCount)
+    }
+}
+
 enum WidevineDASHProviderError: LocalizedError, Equatable, Sendable {
     case dynamicPresentationUnsupported
     case multiplePeriodsUnsupported
@@ -327,6 +375,11 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
         )
         try Self.prepareProtectedDirectory(jobDirectory, fileManager: fileManager)
         try Self.prepareProtectedDirectory(workDirectory, fileManager: fileManager)
+        let stagedMaximumBytes = try LocalFFmpegOutputLimit.maximumBytes(
+            for: workDirectory.appendingPathComponent(".dash-storage-budget"),
+            fileManager: fileManager
+        )
+        let storageBudget = DASHStorageBudget(maximumBytes: stagedMaximumBytes)
         var keepOutput = false
         defer {
             try? fileManager.removeItem(at: workDirectory)
@@ -337,12 +390,14 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
         async let videoFile = download(
             track: plan.video,
             in: workDirectory,
-            permitPool: downloadPool
+            permitPool: downloadPool,
+            storageBudget: storageBudget
         )
         async let audioFile = download(
             track: plan.audio,
             in: workDirectory,
-            permitPool: downloadPool
+            permitPool: downloadPool,
+            storageBudget: storageBudget
         )
         let (downloadedVideo, downloadedAudio) = try await (videoFile, audioFile)
 
@@ -450,7 +505,8 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
     private func download(
         track: WidevineDASHTrackPlan?,
         in workDirectory: URL,
-        permitPool: DASHDownloadPermitPool
+        permitPool: DASHDownloadPermitPool,
+        storageBudget: DASHStorageBudget
     ) async throws -> URL? {
         guard let track else { return nil }
         let trackDirectory = workDirectory.appendingPathComponent(
@@ -463,7 +519,8 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
         let parts = try await downloadParts(
             allReferences,
             to: trackDirectory,
-            permitPool: permitPool
+            permitPool: permitPool,
+            storageBudget: storageBudget
         )
         try WidevineFMP4EncryptionValidator.validate(
             initializationURL: parts[0],
@@ -475,14 +532,15 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
             "encrypted-\(track.mediaType.rawValue).mp4",
             isDirectory: false
         )
-        try concatenate(parts, to: combinedURL)
+        try await concatenate(parts, to: combinedURL, storageBudget: storageBudget)
         return combinedURL
     }
 
     private func downloadParts(
         _ references: [WidevineDASHSegmentReference],
         to directory: URL,
-        permitPool: DASHDownloadPermitPool
+        permitPool: DASHDownloadPermitPool,
+        storageBudget: DASHStorageBudget
     ) async throws -> [URL] {
         guard references.count <= WidevineDASHPlanner.maximumSegmentsPerTrack + 1 else {
             throw WidevineDASHProviderError.segmentLimitExceeded
@@ -500,12 +558,13 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
                     String(format: "%06lld.part", Int64(index)),
                     isDirectory: false
                 )
-                group.addTask { [segmentFetcher, permitPool] in
+                group.addTask { [segmentFetcher, permitPool, storageBudget] in
                     let byteCount = try await Self.fetchSegment(
                         reference,
                         to: destination,
                         segmentFetcher: segmentFetcher,
-                        permitPool: permitPool
+                        permitPool: permitPool,
+                        storageBudget: storageBudget
                     )
                     guard byteCount > 0,
                           byteCount <= Int64(Self.maximumSegmentBytes) else {
@@ -530,12 +589,13 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
                         String(format: "%06lld.part", Int64(pendingIndex)),
                         isDirectory: false
                     )
-                    group.addTask { [segmentFetcher, permitPool] in
+                    group.addTask { [segmentFetcher, permitPool, storageBudget] in
                         let byteCount = try await Self.fetchSegment(
                             reference,
                             to: destination,
                             segmentFetcher: segmentFetcher,
-                            permitPool: permitPool
+                            permitPool: permitPool,
+                            storageBudget: storageBudget
                         )
                         guard byteCount > 0,
                               byteCount <= Int64(Self.maximumSegmentBytes) else {
@@ -557,10 +617,16 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
         _ reference: WidevineDASHSegmentReference,
         to destination: URL,
         segmentFetcher: any DASHSegmentFetching,
-        permitPool: DASHDownloadPermitPool
+        permitPool: DASHDownloadPermitPool,
+        storageBudget: DASHStorageBudget
     ) async throws -> Int64 {
-        try await permitPool.acquire()
+        let reservation = try await storageBudget.reserve(
+            maximumBytes: Int64(maximumSegmentBytes)
+        )
+        var permitHeld = false
         do {
+            try await permitPool.acquire()
+            permitHeld = true
             try Task.checkCancellation()
             let byteCount = try await segmentFetcher.fetch(
                 to: destination,
@@ -570,30 +636,109 @@ struct WidevineDASHDownloadProvider: WidevineProcessingProviding, @unchecked Sen
                 maximumBytes: maximumSegmentBytes
             )
             await permitPool.release()
+            permitHeld = false
+            let values = try destination.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let fileSize = values.fileSize,
+                  fileSize > 0,
+                  Int64(fileSize) == byteCount else {
+                throw WidevineDASHProviderError.invalidMediaOutput
+            }
+            try await storageBudget.commit(reservation, actualBytes: byteCount)
             return byteCount
         } catch {
-            await permitPool.release()
+            if permitHeld { await permitPool.release() }
+            try? FileManager.default.removeItem(at: destination)
+            await storageBudget.rollback(reservation)
             throw error
         }
     }
 
-    private func concatenate(_ inputs: [URL], to outputURL: URL) throws {
-        guard fileManager.createFile(atPath: outputURL.path, contents: nil) else {
+    private func concatenate(
+        _ inputs: [URL],
+        to outputURL: URL,
+        storageBudget: DASHStorageBudget
+    ) async throws {
+        var inputSizes: [(URL, Int64)] = []
+        var totalBytes: Int64 = 0
+        for inputURL in inputs {
+            let values = try inputURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let fileSize = values.fileSize,
+                  fileSize > 0 else {
+                throw WidevineDASHProviderError.invalidMediaOutput
+            }
+            let size = Int64(fileSize)
+            let (updated, overflow) = totalBytes.addingReportingOverflow(size)
+            guard !overflow, updated <= Self.maximumTotalBytes else {
+                throw WidevineDASHProviderError.totalDownloadTooLarge
+            }
+            totalBytes = updated
+            inputSizes.append((inputURL, size))
+        }
+        let reservation = try await storageBudget.reserve(maximumBytes: totalBytes)
+        try? fileManager.removeItem(at: outputURL)
+        guard fileManager.createFile(
+            atPath: outputURL.path,
+            contents: nil,
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        ) else {
+            await storageBudget.rollback(reservation)
             throw WidevineDASHProviderError.invalidMediaOutput
         }
-        let output = try FileHandle(forWritingTo: outputURL)
-        defer { try? output.close() }
-        for inputURL in inputs {
-            try Task.checkCancellation()
-            let input = try FileHandle(forReadingFrom: inputURL)
-            do {
-                while let data = try input.read(upToCount: 1 * 1_024 * 1_024), !data.isEmpty {
-                    try output.write(contentsOf: data)
+
+        var writtenBytes: Int64 = 0
+        do {
+            let output = try FileHandle(forWritingTo: outputURL)
+            defer { try? output.close() }
+            for (inputURL, _) in inputSizes {
+                try Task.checkCancellation()
+                let input = try FileHandle(forReadingFrom: inputURL)
+                do {
+                    while let data = try input.read(upToCount: 1 * 1_024 * 1_024),
+                          !data.isEmpty {
+                        let chunkBytes = Int64(data.count)
+                        guard writtenBytes <= totalBytes,
+                              chunkBytes <= totalBytes - writtenBytes else {
+                            throw WidevineDASHProviderError.invalidMediaOutput
+                        }
+                        try output.write(contentsOf: data)
+                        writtenBytes += chunkBytes
+                    }
+                    try input.close()
+                } catch {
+                    try? input.close()
+                    throw error
                 }
-                try input.close()
+            }
+            guard writtenBytes == totalBytes else {
+                throw WidevineDASHProviderError.invalidMediaOutput
+            }
+            try output.synchronize()
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: outputURL.path
+            )
+            try await storageBudget.commit(reservation, actualBytes: writtenBytes)
+        } catch {
+            try? fileManager.removeItem(at: outputURL)
+            await storageBudget.rollback(reservation)
+            throw error
+        }
+
+        for (inputURL, size) in inputSizes {
+            do {
+                try fileManager.removeItem(at: inputURL)
+                await storageBudget.releaseStoredBytes(size)
             } catch {
-                try? input.close()
-                throw error
+                // A retained source remains charged to the job budget and is
+                // removed by the provider's work-directory cleanup.
             }
         }
     }

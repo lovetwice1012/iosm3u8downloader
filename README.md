@@ -1,6 +1,6 @@
 # HLS Downloader for iOS
 
-URLを1つ貼ると、公開VODのm3u8を解析し、選択した最高画質の全断片をダウンロードして、映像を含む配信はMP4、音声のみの配信はPCM WAVへまとめるSwiftUIアプリです。m3u8の直接URLに加え、HTMLや埋め込みプレイヤーから見つけた候補をサムネイル付きの一覧から選べます。
+URLを1つ貼ると、公開VODのHLS/DASHや通常の動画・音声ファイルを解析し、保存できる候補を一覧から選べるSwiftUIアプリです。HLS/DASHは映像を含む配信をMP4、音声のみの配信をPCM WAVへまとめます。通常のMP4/MOV/M4A/MP3/Ogg/Opus/WebMと、ページ内JavaScriptが生成した完全な`Blob`も、実際のコンテナとtrackを確認して保存します。
 
 Windows版はiOSコードを残したまま [`windows`](windows/README.md) 以下へ分離しています。WinUI 3で同じURL解析・再生解析・候補一覧・HLS保存・MP4/WAV出力・診断ログを提供し、Windows用のportable ZIPビルドとテストは別々のGitHub Actionsで実行します。Android版は `android` ブランチで管理しています。
 
@@ -9,10 +9,10 @@ iOS・Android・Windowsの再生解析ブラウザーは、それぞれアプリ
 ## 主な機能
 
 - master/media playlistの自動判別
-- `video` / `source`タグ、data属性、ページ内プレイヤー設定からm3u8候補を抽出
+- `video` / `audio` / `source`タグ、data属性、ページ内プレイヤー設定からHLS/DASHと通常メディア候補を抽出
 - `iframe` / `srcdoc`を最大3階層まで探索し、候補ごとの検出元Refererを維持
 - WebKitでJavaScript実行後のDOM変更、`fetch` / XHR、resource timingを全frameから監視
-- **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS/MPD候補を追加。Widevine EME試行とライセンス要求候補も同一frame内で関連付け
+- **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS/MPDと通常メディア候補を追加。`URL.createObjectURL(Blob)`とMedia Source Extensionsも検出し、Widevine EME試行とライセンス要求候補は同一frame内で関連付け
 - HTML入力では候補URL・検出元・サムネイルを一覧表示し、選択した候補だけを検証して保存
 - playlistごとの実URL（リダイレクト後）を基準にした相対URL補完
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
@@ -24,7 +24,7 @@ iOS・Android・Windowsの再生解析ブラウザーは、それぞれアプリ
 - identity `AES-128`（AES-CBC、鍵ローテーション、明示IV/sequence IV）
 - MPEG-TSはFFmpegKit/FFmpegで再圧縮せずMP4へremuxし、fMP4等はAVFoundationで結合
 - 断片単体を開けない場合のplaylist単位連結再試行
-- 完成MP4/WAVの共有・「ファイル」への保存
+- 完成MP4/WAV/WebMの共有・「ファイル」への保存
 - URLやCookieの秘密値を残さない、コピー・共有可能な診断ログ
 - MPEG-DASH/MPDの`ContentProtection`、Widevine system ID、PSSH、CENC/CBCSの検出（アルファ）
 - Widevine L3 WVD v2の構造検証と、端末限定Keychainへの保存
@@ -58,6 +58,15 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 - 選択した1つの映像variantと、それに対応する既定音声の全断片
 - 映像trackを含まないHLS/DASH音声の16-bit PCM WAV保存
 - identity `SAMPLE-AES`（許可host上のVOD。FairPlay key formatは対象外）
+- 通常のHTTP(S) MP4/MOV/M4V/M4A/MP3/Ogg/Opus/WebM（拡張子・MIMEは候補ヒントだけに使い、取得後のmagicと実trackで確定）
+- JavaScriptが生成した完全な`Blob`（HLS manifestまたは上記の通常メディア。ブラウザーsession内の一時実体を上限付きで取り出す）
+- WebM動画は再圧縮せず`.webm`のまま、音声だけの対応形式は16-bit PCM WAVとして保存
+
+### Blob / Media Source Extensions
+
+`blob:` URLはサーバー上のファイルURLではなく、そのブラウザー環境が保持する`Blob`や`MediaSource`への一時参照です。そのためURL文字列をHTTPで取得せず、完全な`Blob`だけを解析ブラウザーの生存中に上限付き・分割転送でアプリ専用一時領域へ取り出します。取得後もコンテナ、暗号化metadata、実track、完成ファイルを再検証し、ジョブ終了時に一時実体を削除します。
+
+典型的なhls.js/dash.jsは`video.currentSrc`が`blob:`でも、元のm3u8/MPD通信を検出できるため既存manifest経路で保存します。manifestを公開せず`SourceBuffer.appendBuffer()`だけで組み立てるMSEは、ABR切替・映像/音声分離・eviction・暗号化を安全に復元できないため検出表示だけです。元のHLS/MPD候補が見つかった場合は、そちらを保存してください。
 
 ### Widevineアルファ基盤
 
@@ -80,6 +89,8 @@ license要求はraw binaryを標準経路とし、応答はraw SignedMessage、�
 - main/audio rendition間で暗号方式が異なるSAMPLE-AES構成
 - Safari等、別アプリのログインCookieだけを必要とするページ（αブラウザは専用の永続WebKitプロファイルを使うため、ブラウザ内でログインしたサイトの標準Cookie・localStorage・IndexedDB等は次回起動後も利用できます。候補確定時には適合Cookieを選択後のダウンロードへ引き継ぎます）
 - Worker / Service Worker内だけでHLS URLを生成し、ページ側へURLを公開しないプレイヤー
+- 元manifestや完全な`Blob`を公開せず、`SourceBuffer.appendBuffer()`だけで構成するMSE再生
+- manifestがない単体MPEG-TS/ADTS AAC/AC3/EAC3（SAMPLE-AESとの安全な識別ができないため。HLS内では対応）
 - `#EXT-X-GAP` を含むplaylist
 - `#EXT-X-DISCONTINUITY` を含むplaylist
 - AVFoundationがMP4へ出力できないコーデック

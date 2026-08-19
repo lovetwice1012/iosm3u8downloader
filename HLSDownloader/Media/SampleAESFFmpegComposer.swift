@@ -29,6 +29,89 @@ private struct LocalFFmpegExecutionResult: Sendable {
     let diagnostic: String
 }
 
+enum LocalFFmpegOutputLimit {
+    static let absoluteMaximumBytes: Int64 = 8 * 1_024 * 1_024 * 1_024
+    static let reservedFreeBytes: Int64 = 512 * 1_024 * 1_024
+    static let minimumUsableBytes: Int64 = 1 * 1_024 * 1_024
+
+    static func maximumBytes(
+        for outputURL: URL,
+        fileManager: FileManager = .default
+    ) throws -> Int64 {
+        guard outputURL.isFileURL else { throw HLSError.remuxFailed("invalid output path") }
+        let parent = outputURL.deletingLastPathComponent()
+        let values = try parent.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw HLSError.remuxFailed("invalid output directory")
+        }
+        let attributes = try fileManager.attributesOfFileSystem(forPath: parent.path)
+        guard let free = (attributes[.systemFreeSize] as? NSNumber)?.int64Value,
+              let limit = maximumBytes(availableBytes: free) else {
+            throw HLSError.remuxFailed("insufficient output storage")
+        }
+        return limit
+    }
+
+    static func maximumBytes(availableBytes: Int64) -> Int64? {
+        guard availableBytes > reservedFreeBytes else { return nil }
+        let usable = availableBytes - reservedFreeBytes
+        guard usable >= minimumUsableBytes else { return nil }
+        return min(absoluteMaximumBytes, usable)
+    }
+
+    static func validateCompletedOutput(at url: URL, maximumBytes: Int64) throws {
+        guard maximumBytes > 0 else { throw HLSError.remuxFailed("invalid output limit") }
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size > 0,
+              Int64(size) < maximumBytes else {
+            throw HLSError.remuxFailed("FFmpeg output exceeded its storage limit")
+        }
+    }
+
+    @discardableResult
+    static func validateInputFiles(
+        _ urls: [URL],
+        maximumBytes: Int64
+    ) throws -> Int64 {
+        guard maximumBytes > 0, !urls.isEmpty else {
+            throw HLSError.remuxFailed("invalid media input budget")
+        }
+        var seenPaths = Set<String>()
+        var totalBytes: Int64 = 0
+        for rawURL in urls {
+            let url = rawURL.standardizedFileURL
+            guard url.isFileURL else {
+                throw HLSError.remuxFailed("invalid media input path")
+            }
+            guard seenPaths.insert(url.path).inserted else { continue }
+            let values = try url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let size = values.fileSize,
+                  size > 0 else {
+                throw HLSError.remuxFailed("invalid media input file")
+            }
+            let byteCount = Int64(size)
+            guard totalBytes < maximumBytes,
+                  byteCount < maximumBytes - totalBytes else {
+                throw HLSError.remuxFailed("media input exceeds output storage budget")
+            }
+            totalBytes += byteCount
+        }
+        guard totalBytes > 0 else {
+            throw HLSError.remuxFailed("empty media input")
+        }
+        return totalBytes
+    }
+}
+
 enum LocalFFmpegOutputValidation {
     static func validateMP4(at url: URL) throws {
         let values = try regularFileValues(at: url)
@@ -69,6 +152,11 @@ enum LocalFFmpegOutputValidation {
 
 }
 
+private struct SampleAESPlaylistInspection {
+    let keys: [Data]
+    let resourceURLs: [URL]
+}
+
 private enum LocalFFmpegFileSafety {
     static func validateRegularInput(_ url: URL) throws {
         guard url.isFileURL else {
@@ -102,7 +190,7 @@ private enum LocalFFmpegFileSafety {
         }
     }
 
-    static func validateSampleAESPlaylist(_ url: URL) throws -> [Data] {
+    static func validateSampleAESPlaylist(_ url: URL) throws -> SampleAESPlaylistInspection {
         try validateRegularInput(url)
         guard url.pathExtension.lowercased() == "m3u8" else {
             throw HLSError.remuxFailed("ローカルSAMPLE-AES入力がm3u8ではありません")
@@ -127,6 +215,7 @@ private enum LocalFFmpegFileSafety {
         }
 
         var keys: [Data] = []
+        var resourceURLs = [url]
         for rawLine in text.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
@@ -147,12 +236,15 @@ private enum LocalFFmpegFileSafety {
                 let key = try Data(contentsOf: keyURL, options: .mappedIfSafe)
                 guard key.count == 16 else { throw HLSError.invalidAESKey }
                 keys.append(key)
+                resourceURLs.append(keyURL)
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 let attributes = AttributeListParser.parse(valueAfterColon(line))
                 guard let name = attributes["URI"] else {
                     throw HLSError.invalidPlaylist("ローカルEXT-X-MAPにURIがありません")
                 }
-                _ = try validateLeafResource(name, in: directory, expectedByteCount: nil)
+                resourceURLs.append(
+                    try validateLeafResource(name, in: directory, expectedByteCount: nil)
+                )
             } else if line.hasPrefix("#EXT-X-STREAM-INF:")
                         || line.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:")
                         || line.hasPrefix("#EXT-X-MEDIA:")
@@ -170,12 +262,16 @@ private enum LocalFFmpegFileSafety {
                 guard resource.pathExtension.lowercased() != "m3u8" else {
                     throw HLSError.remuxFailed("ローカルmaster playlistは使用できません")
                 }
+                resourceURLs.append(resource)
             }
         }
         // A selected companion rendition may be clear while the other local
         // playlist is SAMPLE-AES. The composer requires at least one key over
         // the aggregate pair before it starts FFmpeg.
-        return Array(Set(keys))
+        return SampleAESPlaylistInspection(
+            keys: Array(Set(keys)),
+            resourceURLs: resourceURLs
+        )
     }
 
     static func prepareProtectedOutput(_ outputURL: URL) throws {
@@ -400,7 +496,8 @@ private final class SampleAESFFmpegSessionBox: @unchecked Sendable {
         externalAudioPlaylistURL: URL?,
         outputURL: URL,
         format: SampleAESComposedFormat,
-        diagnosticKeys: [Data]
+        diagnosticKeys: [Data],
+        maximumOutputBytes: Int64
     ) {
         let mode: Int32 = format == .mp4 ? 0 : 1
         let created: UnsafeMutableRawPointer?
@@ -412,7 +509,8 @@ private final class SampleAESFFmpegSessionBox: @unchecked Sendable {
                             primaryPath,
                             audioPath,
                             outputPath,
-                            mode
+                            mode,
+                            maximumOutputBytes
                         )
                     }
                 }
@@ -424,7 +522,8 @@ private final class SampleAESFFmpegSessionBox: @unchecked Sendable {
                         primaryPath,
                         nil,
                         outputPath,
-                        mode
+                        mode,
+                        maximumOutputBytes
                     )
                 }
             }
@@ -502,11 +601,15 @@ struct SampleAESFFmpegComposer: Sendable {
         diagnosticKeys: [Data],
         outputURL: URL
     ) async throws -> SampleAESComposedFormat {
-        let primaryKeys = try LocalFFmpegFileSafety.validateSampleAESPlaylist(primaryPlaylistURL)
-        let audioKeys = try externalAudioPlaylistURL.map {
+        let primaryInspection = try LocalFFmpegFileSafety.validateSampleAESPlaylist(
+            primaryPlaylistURL
+        )
+        let audioInspection = try externalAudioPlaylistURL.map {
             try LocalFFmpegFileSafety.validateSampleAESPlaylist($0)
-        } ?? []
-        let actualKeys = Array(Set(primaryKeys + audioKeys))
+        }
+        let actualKeys = Array(Set(
+            primaryInspection.keys + (audioInspection?.keys ?? [])
+        ))
         let suppliedKeys = Set(diagnosticKeys)
         guard !actualKeys.isEmpty,
               actualKeys.allSatisfy({ suppliedKeys.contains($0) }) else {
@@ -534,13 +637,19 @@ struct SampleAESFFmpegComposer: Sendable {
         )
 
         try Task.checkCancellation()
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: outputURL)
+        try LocalFFmpegOutputLimit.validateInputFiles(
+            primaryInspection.resourceURLs + (audioInspection?.resourceURLs ?? []),
+            maximumBytes: maximumOutputBytes
+        )
         try LocalFFmpegFileSafety.prepareProtectedOutput(outputURL)
         guard let session = SampleAESFFmpegSessionBox(
             primaryPlaylistURL: selection.primaryPlaylistURL,
             externalAudioPlaylistURL: selection.externalAudioPlaylistURL,
             outputURL: outputURL,
             format: selection.format,
-            diagnosticKeys: actualKeys
+            diagnosticKeys: actualKeys,
+            maximumOutputBytes: maximumOutputBytes
         ) else {
             try? FileManager.default.removeItem(at: outputURL)
             throw HLSError.remuxFailed("SAMPLE-AES FFmpeg処理を開始できません")
@@ -564,6 +673,10 @@ struct SampleAESFFmpegComposer: Sendable {
             throw HLSError.remuxFailed(detail)
         }
         do {
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: outputURL,
+                maximumBytes: maximumOutputBytes
+            )
             if selection.format == .mp4 {
                 try LocalFFmpegOutputValidation.validateMP4(at: outputURL)
             } else {
@@ -581,7 +694,12 @@ struct SampleAESFFmpegComposer: Sendable {
 private final class AudioWAVFFmpegSessionBox: @unchecked Sendable {
     let handle: UnsafeMutableRawPointer
 
-    init?(inputURL: URL, decryptionKey: Data?, outputURL: URL) {
+    init?(
+        inputURL: URL,
+        decryptionKey: Data?,
+        outputURL: URL,
+        maximumOutputBytes: Int64
+    ) {
         let created: UnsafeMutableRawPointer?
         if let decryptionKey {
             var key = LocalFFmpegSecret.cString(for: decryptionKey)
@@ -592,7 +710,8 @@ private final class AudioWAVFFmpegSessionBox: @unchecked Sendable {
                         hls_ffmpeg_audio_wav_session_create(
                             inputPath,
                             keyBuffer.baseAddress,
-                            outputPath
+                            outputPath,
+                            maximumOutputBytes
                         )
                     }
                 }
@@ -600,7 +719,12 @@ private final class AudioWAVFFmpegSessionBox: @unchecked Sendable {
         } else {
             created = inputURL.path.withCString { inputPath in
                 outputURL.path.withCString { outputPath in
-                    hls_ffmpeg_audio_wav_session_create(inputPath, nil, outputPath)
+                    hls_ffmpeg_audio_wav_session_create(
+                        inputPath,
+                        nil,
+                        outputPath,
+                        maximumOutputBytes
+                    )
                 }
             }
         }
@@ -647,11 +771,17 @@ struct FFmpegAudioWAVComposer: Sendable {
         guard tracks.contains(.audio), !tracks.contains(.video) else {
             throw HLSError.noPlayableTracks
         }
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: outputURL)
+        try LocalFFmpegOutputLimit.validateInputFiles(
+            [inputURL],
+            maximumBytes: maximumOutputBytes
+        )
         try LocalFFmpegFileSafety.prepareProtectedOutput(outputURL)
         guard let session = AudioWAVFFmpegSessionBox(
             inputURL: inputURL,
             decryptionKey: decryptionKey,
-            outputURL: outputURL
+            outputURL: outputURL,
+            maximumOutputBytes: maximumOutputBytes
         ) else {
             try? FileManager.default.removeItem(at: outputURL)
             throw HLSError.remuxFailed("音声WAV変換を開始できません")
@@ -675,6 +805,10 @@ struct FFmpegAudioWAVComposer: Sendable {
             throw HLSError.remuxFailed(detail)
         }
         do {
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: outputURL,
+                maximumBytes: maximumOutputBytes
+            )
             try LocalFFmpegOutputValidation.validatePCM16WAV(at: outputURL)
             try LocalFFmpegFileSafety.protectCompletedOutput(outputURL)
         } catch {

@@ -12,7 +12,8 @@ private final class WidevineFFmpegSessionBox: @unchecked Sendable {
     init?(
         video: WidevineEncryptedTrackInput,
         audio: WidevineEncryptedTrackInput?,
-        outputURL: URL
+        outputURL: URL,
+        maximumOutputBytes: Int64
     ) {
         var videoKey = Self.hexCString(video.keyData)
         defer { Self.zero(&videoKey) }
@@ -30,7 +31,8 @@ private final class WidevineFFmpegSessionBox: @unchecked Sendable {
                                     videoKeyBuffer.baseAddress,
                                     audioPath,
                                     audioKeyBuffer.baseAddress,
-                                    outputPath
+                                    outputPath,
+                                    maximumOutputBytes
                                 )
                             }
                         }
@@ -46,7 +48,8 @@ private final class WidevineFFmpegSessionBox: @unchecked Sendable {
                             videoKeyBuffer.baseAddress,
                             nil,
                             nil,
-                            outputPath
+                            outputPath,
+                            maximumOutputBytes
                         )
                     }
                 }
@@ -94,6 +97,99 @@ private final class WidevineFFmpegSessionBox: @unchecked Sendable {
     }
 }
 
+private final class WidevineFFmpegDecodeValidationSessionBox: @unchecked Sendable {
+    let handle: UnsafeMutableRawPointer
+
+    init?(inputURL: URL) {
+        let created = inputURL.path.withCString {
+            hls_ffmpeg_decode_validation_session_create($0)
+        }
+        guard let created else { return nil }
+        handle = created
+    }
+
+    func execute() -> WidevineFFmpegExecutionResult {
+        var diagnostic = [CChar](repeating: 0, count: 4_096)
+        let returnCode = diagnostic.withUnsafeMutableBufferPointer { buffer in
+            hls_ffmpeg_remux_session_execute(handle, buffer.baseAddress, buffer.count)
+        }
+        let bytes = diagnostic.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return WidevineFFmpegExecutionResult(
+            returnCode: returnCode,
+            diagnostic: String(decoding: bytes, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    func cancel() { hls_ffmpeg_remux_session_cancel(handle) }
+
+    deinit { hls_ffmpeg_remux_session_destroy(handle) }
+}
+
+/// Final fail-closed gate for already-clear Widevine output. FFprobe metadata
+/// must contain the expected stream type, then FFmpeg decodes every selected
+/// video/audio sample to the null muxer with fatal error handling. Diagnostics
+/// never leave this boundary, so a decoder failure cannot expose key material.
+struct LocalMediaDecodeValidator: Sendable {
+    func validate(
+        inputURL: URL,
+        expectedTracks: LocalMediaTrackSet
+    ) async throws {
+        let allowedTracks: LocalMediaTrackSet = [.audio, .video]
+        guard inputURL.isFileURL,
+              expectedTracks.rawValue != 0,
+              (expectedTracks.rawValue & ~allowedTracks.rawValue) == 0 else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let values = try inputURL.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              (values.fileSize ?? 0) > 0 else {
+            throw WidevineProcessingError.invalidOutput
+        }
+
+        let actualTracks: LocalMediaTrackSet
+        do {
+            actualTracks = try await LocalMediaTrackProbe().probe(
+                inputURL: inputURL,
+                input: .mediaFile()
+            )
+        } catch let error as HLSError {
+            if case .cancelled = error { throw error }
+            throw WidevineProcessingError.invalidOutput
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        } catch {
+            throw WidevineProcessingError.invalidOutput
+        }
+        guard actualTracks.intersection(expectedTracks) == expectedTracks else {
+            throw WidevineProcessingError.invalidOutput
+        }
+
+        try Task.checkCancellation()
+        guard let session = WidevineFFmpegDecodeValidationSessionBox(inputURL: inputURL) else {
+            throw WidevineProcessingError.invalidOutput
+        }
+        let worker = Task.detached(priority: .userInitiated) { session.execute() }
+        let result = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            session.cancel()
+            worker.cancel()
+        }
+        guard !Task.isCancelled else { throw HLSError.cancelled }
+        guard result.returnCode == 0 else {
+            // The bridge has already redacted registered secrets. Do not
+            // surface decoder logs or local paths from this final validator.
+            throw WidevineProcessingError.invalidOutput
+        }
+    }
+}
+
+typealias WidevineMediaDecodeValidator = LocalMediaDecodeValidator
+
 /// Uses the bundled FFmpeg 8 demuxer to decrypt one CENC/CBCS key per track
 /// and mux the selected video/audio streams into a normal MP4 file.
 ///
@@ -124,11 +220,17 @@ struct FFmpegWidevineMediaComposer: WidevineMediaComposing, Sendable {
         }
 
         try Task.checkCancellation()
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: outputURL)
+        try LocalFFmpegOutputLimit.validateInputFiles(
+            [video.encryptedFileURL] + (audio.map { [$0.encryptedFileURL] } ?? []),
+            maximumBytes: maximumOutputBytes
+        )
         try Self.prepareProtectedOutput(outputURL)
         guard let session = WidevineFFmpegSessionBox(
             video: video,
             audio: audio,
-            outputURL: outputURL
+            outputURL: outputURL,
+            maximumOutputBytes: maximumOutputBytes
         ) else {
             try? FileManager.default.removeItem(at: outputURL)
             throw WidevineDASHProviderError.invalidMediaOutput
@@ -157,6 +259,10 @@ struct FFmpegWidevineMediaComposer: WidevineMediaComposing, Sendable {
         }
 
         do {
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: outputURL,
+                maximumBytes: maximumOutputBytes
+            )
             let values = try outputURL.resourceValues(
                 forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
             )

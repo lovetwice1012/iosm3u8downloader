@@ -224,6 +224,14 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         let jobSegmentDownloader = SegmentDownloader(client: jobClient)
         let jobWidevineProcessor = widevineProcessorFactory?(jobClient) ?? widevineProcessor
 
+        if candidate.kind == .progressive {
+            return try await downloadProgressiveWithBackgroundExecution(
+                candidate: candidate,
+                client: jobClient,
+                progress: progress
+            )
+        }
+
         if candidate.kind == .widevineDASH {
             guard isDownloadableWidevineDomain(candidate.playlistURL) else {
                 diagnostics.record("widevine", "download start rejected by domain policy")
@@ -238,7 +246,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 throw HLSError.invalidPlaylist("Widevine MPDを再検証できません")
             }
             let document: PlaylistDocument
-            if widevineProcessorFactory == nil {
+            if candidate.usesCapturedDocument || widevineProcessorFactory == nil {
                 document = discoveredDocument
             } else {
                 document = try await reloadWidevineDocument(candidate, using: jobClient)
@@ -256,10 +264,14 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             // Refetch the selected playlist inside the job jar so Set-Cookie
             // issued by the playlist is available to variants, keys and
             // segments, but never returns to the resolver client.
-            document = try await jobResolver.load(
-                candidate.request,
-                referer: candidate.requestReferer
-            )
+            if candidate.usesCapturedDocument, let captured = candidate.document {
+                document = captured
+            } else {
+                document = try await jobResolver.load(
+                    candidate.request,
+                    referer: candidate.requestReferer
+                )
+            }
         } catch {
             let code = DiagnosticPrivacy.errorCode(error)
             diagnostics.record(
@@ -287,6 +299,276 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         }
         var seen = Set<String>()
         return urls.filter { seen.insert($0.absoluteString).inserted }
+    }
+
+    private func downloadProgressiveWithBackgroundExecution(
+        candidate: HLSCandidate,
+        client: HTTPClient,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        try await BackgroundExecutionCoordinator.shared.run(
+            title: "動画・音声ファイルを保存",
+            subtitle: "ダウンロードを準備中",
+            diagnosticSink: diagnostics.sink
+        ) { [self] backgroundProgress in
+            await backgroundProgress.report(
+                DownloadProgress(phase: .resolving, completedItems: 0, totalItems: 0)
+            )
+            return try await downloadProgressive(
+                candidate: candidate,
+                client: client
+            ) { update in
+                await backgroundProgress.report(update)
+                await progress(update)
+            }
+        }
+    }
+
+    private func downloadProgressive(
+        candidate: HLSCandidate,
+        client: HTTPClient,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        guard let reference = candidate.progressiveMedia else {
+            throw HLSError.invalidMediaPayload(
+                stream: "progressive",
+                number: 1,
+                mimeType: nil,
+                byteCount: 0,
+                signature: "missing-reference"
+            )
+        }
+
+        let jobDirectory = try fileStore.makeJobDirectory()
+        var temporaryOutput: URL?
+        defer { fileStore.removeJobDirectory(jobDirectory) }
+
+        do {
+            await progress(DownloadProgress(phase: .downloading, completedItems: 0, totalItems: 1))
+            var localInput: URL
+            var capturedInputToConsume: URL?
+            let effectiveURL: URL
+            let mimeType: String?
+            let byteCount: Int64
+
+            switch reference.storage {
+            case .remote:
+                let downloadedURL = jobDirectory.appendingPathComponent(
+                    "progressive-input.media",
+                    isDirectory: false
+                )
+                let response = try await client.downloadProgressiveMedia(
+                    candidate.request.primary,
+                    to: downloadedURL,
+                    referer: candidate.requestReferer
+                )
+                guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: candidate.request.primary,
+                    to: response.effectiveURL
+                ) else {
+                    throw HLSError.network("progressive media redirect was blocked")
+                }
+                localInput = downloadedURL
+                effectiveURL = response.effectiveURL
+                mimeType = response.mimeType ?? reference.hintedMIMEType
+                byteCount = response.byteCount
+
+            case .capturedBlob(let fileURL, let expectedByteCount):
+                let values = try fileURL.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+                )
+                guard fileURL.isFileURL,
+                      WebBlobCaptureStore.isManagedCaptureURL(fileURL),
+                      values.isRegularFile == true,
+                      values.isSymbolicLink != true,
+                      expectedByteCount > 0,
+                      expectedByteCount <= 512 * 1_024 * 1_024,
+                      values.fileSize == expectedByteCount else {
+                    throw HLSError.invalidMediaPayload(
+                        stream: "blob",
+                        number: 1,
+                        mimeType: reference.hintedMIMEType,
+                        byteCount: max(values.fileSize ?? 0, 0),
+                        signature: "invalid-capture"
+                    )
+                }
+                localInput = fileURL
+                capturedInputToConsume = fileURL
+                effectiveURL = candidate.pageURL
+                mimeType = reference.hintedMIMEType
+                byteCount = Int64(expectedByteCount)
+            }
+
+            try Task.checkCancellation()
+            let prefix = try Self.readPrefix(from: localInput, maximumBytes: 262_144)
+            guard let container = ProgressiveMediaDetector.detect(
+                prefix: prefix,
+                url: candidate.request.primary,
+                mimeType: mimeType
+            ) else {
+                throw HLSError.invalidMediaPayload(
+                    stream: "progressive",
+                    number: 1,
+                    mimeType: mimeType,
+                    byteCount: Int(clamping: byteCount),
+                    signature: MediaPayloadInspector.signature(prefix)
+                )
+            }
+
+            switch ProgressiveMediaProtectionInspector.inspect(
+                localInput,
+                container: container
+            ) {
+            case .clear:
+                break
+            case .encrypted:
+                diagnostics.record(
+                    "progressive",
+                    "encrypted input rejected container=\(container.rawValue)"
+                )
+                throw HLSError.drmUnsupported("encrypted progressive media")
+            case .invalid:
+                throw HLSError.invalidMediaPayload(
+                    stream: "progressive",
+                    number: 1,
+                    mimeType: mimeType,
+                    byteCount: Int(clamping: byteCount),
+                    signature: "invalid-container-structure"
+                )
+            }
+
+            localInput = try await stageProgressiveInput(
+                localInput,
+                container: container,
+                jobDirectory: jobDirectory,
+                canMove: capturedInputToConsume == nil
+            )
+
+            let tracks = try await LocalMediaTrackProbe().probe(
+                inputURL: localInput,
+                input: .mediaFile()
+            )
+            guard tracks.contains(.video) || tracks.contains(.audio) else {
+                throw HLSError.noPlayableTracks
+            }
+
+            await progress(DownloadProgress(phase: .composing, completedItems: 0, totalItems: 0))
+            let outputFormat: MediaOutputFormat
+            if tracks.contains(.video) {
+                outputFormat = container == .webM ? .webm : .mp4
+            } else {
+                outputFormat = .wav
+            }
+            let locations = try fileStore.outputLocations(for: effectiveURL, format: outputFormat)
+            temporaryOutput = locations.temporary
+
+            if outputFormat == .webm {
+                try await fileStore.copyProtectedFile(from: localInput, to: locations.temporary)
+            } else {
+                let source = MediaSegment(
+                    ordinal: 0,
+                    mediaSequence: 0,
+                    duration: 0,
+                    url: URLCandidates(primary: effectiveURL, sameOriginQueryFallback: nil),
+                    byteRange: nil,
+                    encryption: nil,
+                    initializationMap: nil,
+                    hasDiscontinuity: false
+                )
+                let media = DownloadedSegment(
+                    source: source,
+                    fileURL: localInput,
+                    container: container,
+                    byteCount: Int(clamping: byteCount),
+                    initializationDataLength: 0
+                )
+                try await composer.compose(
+                    main: [media],
+                    externalAudio: nil,
+                    format: outputFormat,
+                    outputURL: locations.temporary
+                )
+            }
+
+            try Task.checkCancellation()
+            guard WidevineMediaOutputValidator.isValid(
+                locations.temporary,
+                format: outputFormat
+            ) else {
+                throw HLSError.exportFailed("progressive output validation failed")
+            }
+            if outputFormat == .mp4,
+               ProgressiveMediaProtectionInspector.inspect(
+                locations.temporary,
+                container: .isoBaseMedia
+               ) != .clear {
+                throw HLSError.drmUnsupported("encrypted progressive output")
+            }
+            let expectedOutputTracks = tracks.intersection([.audio, .video])
+            try await LocalMediaDecodeValidator().validate(
+                inputURL: locations.temporary,
+                expectedTracks: expectedOutputTracks
+            )
+            try Task.checkCancellation()
+            try FileManager.default.moveItem(at: locations.temporary, to: locations.final)
+            temporaryOutput = nil
+            if let capturedInputToConsume {
+                WebBlobCaptureStore.discardCaptureFile(at: capturedInputToConsume)
+            }
+            await progress(DownloadProgress(phase: .completed, completedItems: 1, totalItems: 1))
+            diagnostics.record(
+                "progressive",
+                "completed container=\(container.rawValue) format=\(outputFormat.rawValue) bytes=\(byteCount)"
+            )
+            return DownloadResult(
+                outputURL: locations.final,
+                sourceURL: effectiveURL,
+                segmentCount: 1
+            )
+        } catch is CancellationError {
+            if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            throw error
+        } catch {
+            if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            throw error
+        }
+    }
+
+    private func stageProgressiveInput(
+        _ sourceURL: URL,
+        container: MediaContainer,
+        jobDirectory: URL,
+        canMove: Bool
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        let stagedURL = jobDirectory.appendingPathComponent(
+            "progressive-input.\(container.fileExtension)",
+            isDirectory: false
+        )
+        try? FileManager.default.removeItem(at: stagedURL)
+        if canMove {
+            try FileManager.default.moveItem(at: sourceURL, to: stagedURL)
+            return stagedURL
+        }
+
+        // A hard link gives AVFoundation/FFmpeg a truthful container suffix
+        // without duplicating a captured Blob. Fall back to the existing
+        // protected chunk copier on filesystems that do not permit hard links.
+        do {
+            try FileManager.default.linkItem(at: sourceURL, to: stagedURL)
+        } catch {
+            try await fileStore.copyProtectedFile(from: sourceURL, to: stagedURL)
+        }
+        return stagedURL
+    }
+
+    private static func readPrefix(from url: URL, maximumBytes: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        return try handle.read(upToCount: maximumBytes) ?? Data()
     }
 
     private func reloadWidevineDocument(
@@ -459,6 +741,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         guard values.isRegularFile == true,
               values.isSymbolicLink != true,
               (values.fileSize ?? 0) > 0,
+              processed.outputFormat != .webm,
               WidevineMediaOutputValidator.isValid(
                 sourceURL,
                 format: processed.outputFormat
@@ -483,6 +766,13 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             ) else {
                 throw WidevineProcessingError.invalidOutput
             }
+            let expectedTracks: LocalMediaTrackSet = processed.outputFormat == .mp4
+                ? .video
+                : .audio
+            try await LocalMediaDecodeValidator().validate(
+                inputURL: locations.temporary,
+                expectedTracks: expectedTracks
+            )
             // 保存へ進む直前の最終チェック。許可host比較はこの共通関数だけが行う。
             guard isDownloadableWidevineDomain(document.effectiveURL) else {
                 throw WidevineProcessingError.domainNotAllowed
@@ -750,6 +1040,11 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             try await fileStore.copyProtectedFile(
                 from: decryptedOutput,
                 to: locations.temporary
+            )
+            try Task.checkCancellation()
+            try await LocalMediaDecodeValidator().validate(
+                inputURL: locations.temporary,
+                expectedTracks: outputFormat == .mp4 ? .video : .audio
             )
             try Task.checkCancellation()
             // The common playlist permit is the final gate before a decrypted

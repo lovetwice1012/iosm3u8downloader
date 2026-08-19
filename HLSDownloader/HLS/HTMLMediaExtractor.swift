@@ -240,7 +240,14 @@ enum HTMLMediaExtractor {
         from text: String
     ) -> [(rawURL: String, kind: MediaCandidateKind)] {
         let decoded = URIResolver.decodeEscapes(decodeHTMLEntities(text))
-        let pattern = #"(?i)((?:https?:)?//[^\s\"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?|(?:\.\.?/|/)[^\s\"'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?|[A-Za-z0-9_%@+.-]+(?:/[A-Za-z0-9_%@+.,~!$&()*;=:-]+)*\.(?:m3u8|mpd)(?:\?[^\s\"'<>\\]*)?)"#
+        let supportedSuffixes = "m3u8|mpd|mp4|mov|m4v|m4a|mp3|aac|ac3|eac3|ec3|ogg|oga|opus|wav|flac|ts|m2t|m2ts|mts|webm"
+        let pattern = #"(?i)((?:https?:)?//[^\s\"'<>\\]+?\.(?:"#
+            + supportedSuffixes
+            + #")(?:\?[^\s\"'<>\\]*)?|(?:\.\.?/|/)[^\s\"'<>\\]+?\.(?:"#
+            + supportedSuffixes
+            + #")(?:\?[^\s\"'<>\\]*)?|[A-Za-z0-9_%@+.-]+(?:/[A-Za-z0-9_%@+.,~!$&()*;=:-]+)*\.(?:"#
+            + supportedSuffixes
+            + #")(?:\?[^\s\"'<>\\]*)?)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(decoded.startIndex..<decoded.endIndex, in: decoded)
         var seen = Set<String>()
@@ -367,6 +374,12 @@ enum HTMLMediaExtractor {
             || mimeType.contains("audio/x-mpegurl") {
                 return .hls
             }
+            if mimeType.hasPrefix("video/")
+                || mimeType.hasPrefix("audio/")
+                || mimeType.contains("application/ogg")
+                || mimeType.contains("application/mp4") {
+                return .progressive
+            }
         }
         let decodedURL = URIResolver.decodeEscapes(rawURL)
         if decodedURL.range(
@@ -380,6 +393,12 @@ enum HTMLMediaExtractor {
             options: [.regularExpression, .caseInsensitive]
         ) != nil {
             return .widevineDASH
+        }
+        if decodedURL.range(
+            of: #"\.(?:mp4|mov|m4v|m4a|mp3|aac|ac3|eac3|ec3|ogg|oga|opus|wav|flac|ts|m2t|m2ts|mts|webm)(?:$|[?#])"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil {
+            return .progressive
         }
         return nil
     }

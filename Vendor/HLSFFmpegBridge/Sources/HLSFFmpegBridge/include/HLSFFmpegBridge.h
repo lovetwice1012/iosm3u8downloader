@@ -20,7 +20,8 @@ typedef void *HLSFFmpegRemuxSessionHandle;
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
     const char *input_path,
     const char *audio_input_path,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 );
 
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
@@ -28,7 +29,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
     const char *video_decryption_key_hex,
     const char *audio_input_path,
     const char *audio_decryption_key_hex,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 );
 
 // Decrypts identity SAMPLE-AES from an app-generated, local-only HLS
@@ -38,7 +40,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
     const char *primary_playlist_path,
     const char *audio_playlist_path,
     const char *output_path,
-    int32_t output_mode
+    int32_t output_mode,
+    int64_t maximum_output_bytes
 );
 
 // Converts a local audio input to signed 16-bit little-endian PCM WAV.  The
@@ -47,7 +50,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
     const char *input_path,
     const char *decryption_key_hex,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 );
 
 // Probes actual decrypted streams.  The result is a bitwise combination of
@@ -56,6 +60,13 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_media_probe_session_create(
     const char *input_path,
     const char *decryption_key_hex,
     int32_t input_kind
+);
+
+// Fully decodes the first video and audio streams from an already-clear local
+// media file into FFmpeg's null muxer.  Any demux/decode error is fatal; this
+// validates media samples rather than merely trusting container metadata.
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_decode_validation_session_create(
+    const char *input_path
 );
 
 int32_t hls_ffmpeg_media_probe_session_execute(

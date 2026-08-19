@@ -40,10 +40,158 @@ private actor DownloadPermitPool {
     }
 }
 
+actor SegmentMediaMemoryBudget {
+    struct Claim: Sendable {
+        fileprivate let identifier: UUID
+        fileprivate let byteCount: Int64
+    }
+
+    private struct Waiter {
+        let byteCount: Int64
+        let continuation: CheckedContinuation<Claim, Never>
+    }
+
+    static let maximumInFlightBytes: Int64 = 128 * 1_024 * 1_024
+    private(set) var availableBytes: Int64 = maximumInFlightBytes
+    private var activeClaims: [UUID: Int64] = [:]
+    private var waiters: [Waiter] = []
+
+    func tryClaim(byteCount: Int64) throws -> Claim? {
+        try validate(byteCount: byteCount)
+        guard byteCount <= availableBytes else { return nil }
+        return makeClaim(byteCount: byteCount)
+    }
+
+    func acquire(byteCount: Int64) async throws -> Claim {
+        try validate(byteCount: byteCount)
+        if byteCount <= availableBytes {
+            return makeClaim(byteCount: byteCount)
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(Waiter(byteCount: byteCount, continuation: continuation))
+        }
+    }
+
+    func release(_ claim: Claim) {
+        guard let releasedBytes = activeClaims.removeValue(forKey: claim.identifier),
+              releasedBytes == claim.byteCount,
+              availableBytes <= Self.maximumInFlightBytes - releasedBytes else {
+            return
+        }
+        availableBytes += releasedBytes
+
+        var index = 0
+        while index < waiters.count {
+            let waiter = waiters[index]
+            guard waiter.byteCount <= availableBytes else {
+                index += 1
+                continue
+            }
+            waiters.remove(at: index)
+            waiter.continuation.resume(returning: makeClaim(byteCount: waiter.byteCount))
+        }
+    }
+
+    private func validate(byteCount: Int64) throws {
+        guard byteCount > 0, byteCount <= Self.maximumInFlightBytes else {
+            throw HLSError.network("invalid segment memory reservation")
+        }
+    }
+
+    private func makeClaim(byteCount: Int64) -> Claim {
+        let claim = Claim(identifier: UUID(), byteCount: byteCount)
+        availableBytes -= byteCount
+        activeClaims[claim.identifier] = byteCount
+        return claim
+    }
+}
+
+private actor SegmentStorageBudget {
+    struct Claim: Sendable {
+        let directoryPath: String
+        let byteCount: Int64
+    }
+
+    private var remainingByDirectory: [String: Int64] = [:]
+
+    func claim(byteCount: Int, in directory: URL) throws -> Claim {
+        guard byteCount > 0, directory.isFileURL else {
+            throw HLSError.network("invalid segment storage request")
+        }
+        let normalized = directory.standardizedFileURL
+        let key = normalized.path
+        if remainingByDirectory[key] == nil {
+            if remainingByDirectory.count >= 64 {
+                remainingByDirectory = remainingByDirectory.filter {
+                    FileManager.default.fileExists(atPath: $0.key)
+                }
+            }
+            let probe = normalized.appendingPathComponent(".segment-storage-budget")
+            remainingByDirectory[key] = try LocalFFmpegOutputLimit.maximumBytes(for: probe)
+        }
+        guard let remaining = remainingByDirectory[key] else {
+            throw HLSError.network("segment storage budget is unavailable")
+        }
+        let requested = Int64(byteCount)
+        guard requested < remaining else {
+            throw HLSError.network("downloaded media exceeds the job storage budget")
+        }
+        remainingByDirectory[key] = remaining - requested
+        return Claim(directoryPath: key, byteCount: requested)
+    }
+
+    func release(_ claim: Claim) {
+        guard let remaining = remainingByDirectory[claim.directoryPath],
+              claim.byteCount > 0,
+              remaining <= Int64.max - claim.byteCount else { return }
+        remainingByDirectory[claim.directoryPath] = remaining + claim.byteCount
+    }
+}
+
+struct InitializationMapMemoryBudget {
+    static let maximumMapCount = 64
+    static let maximumSingleMapBytes: Int64 = 8 * 1_024 * 1_024
+    static let maximumAggregateBytes: Int64 = 64 * 1_024 * 1_024
+
+    private(set) var committedMapCount = 0
+    private(set) var committedBytes: Int64 = 0
+
+    func maximumBytesForNextMap() throws -> Int64 {
+        guard committedMapCount < Self.maximumMapCount,
+              committedBytes < Self.maximumAggregateBytes else {
+            throw HLSError.invalidPlaylist("initialization map budget exceeded")
+        }
+        return min(
+            Self.maximumSingleMapBytes,
+            Self.maximumAggregateBytes - committedBytes
+        )
+    }
+
+    mutating func commit(byteCount: Int, reservedMaximumBytes: Int64) throws {
+        let actual = Int64(byteCount)
+        guard actual > 0,
+              actual <= reservedMaximumBytes,
+              committedMapCount < Self.maximumMapCount,
+              committedBytes <= Self.maximumAggregateBytes - actual else {
+            throw HLSError.invalidPlaylist("initialization map budget exceeded")
+        }
+        committedBytes += actual
+        committedMapCount += 1
+    }
+}
+
 final class SegmentDownloader: Sendable {
+    private static let maximumMediaResponseBytes: Int64 = 32 * 1_024 * 1_024
+    // The encrypted path can briefly retain both the HTTP body and decrypted
+    // bytes. fMP4 initialization data is written separately and is never
+    // concatenated into another in-memory Data value.
+    private static let mediaTaskMemoryReservationBytes: Int64 = 64 * 1_024 * 1_024
+
     private let client: HTTPClient
     private let maximumConcurrentDownloads: Int
     private let permitPool: DownloadPermitPool
+    private let mediaMemoryBudget = SegmentMediaMemoryBudget()
+    private let storageBudget = SegmentStorageBudget()
 
     init(client: HTTPClient, maximumConcurrentDownloads: Int = 6) {
         self.client = client
@@ -245,7 +393,7 @@ final class SegmentDownloader: Sendable {
             maps: maps,
             segments: downloadedSegments
         )
-        try writeProtected(Data(localText.utf8), to: playlistURL)
+        try await writeProtected(Data(localText.utf8), to: playlistURL)
         return DownloadedSampleAESPlaylist(
             playlistURL: playlistURL,
             diagnosticKeys: keyMaterials.values
@@ -330,7 +478,7 @@ final class SegmentDownloader: Sendable {
             }
             guard let data = accepted else { throw lastError }
             let fileName = String(format: "%@-key-%03d.key", prefix, index)
-            try writeProtected(
+            try await writeProtected(
                 data,
                 to: directory.appendingPathComponent(fileName, isDirectory: false)
             )
@@ -347,6 +495,9 @@ final class SegmentDownloader: Sendable {
     ) async throws -> [InitializationMap: SampleAESLocalMap] {
         let uniqueMaps = Array(Set(playlist.segments.compactMap(\.initializationMap)))
             .sorted { $0.url.primary.absoluteString < $1.url.primary.absoluteString }
+        guard uniqueMaps.count <= InitializationMapMemoryBudget.maximumMapCount else {
+            throw HLSError.invalidPlaylist("too many SAMPLE-AES initialization maps")
+        }
         var result: [InitializationMap: SampleAESLocalMap] = [:]
         for (index, map) in uniqueMaps.enumerated() {
             guard map.url.all.allSatisfy({ isSafeSampleAESResourceURL($0, from: playlist.effectiveURL) }) else {
@@ -361,7 +512,8 @@ final class SegmentDownloader: Sendable {
                     let response = try await client.fetch(
                         candidate,
                         referer: referer,
-                        byteRange: map.byteRange
+                        byteRange: map.byteRange,
+                        maximumBytes: InitializationMapMemoryBudget.maximumSingleMapBytes
                     )
                     guard isSafeSampleAESResourceURL(response.effectiveURL, from: candidate),
                           let container = MediaPayloadInspector.detectInitialization(response.data) else {
@@ -385,7 +537,7 @@ final class SegmentDownloader: Sendable {
                 index,
                 container.fileExtension
             )
-            try writeProtected(
+            try await writeProtected(
                 data,
                 to: directory.appendingPathComponent(fileName, isDirectory: false)
             )
@@ -401,6 +553,9 @@ final class SegmentDownloader: Sendable {
         referer: URL,
         playlistURL: URL
     ) async throws -> SampleAESLocalSegment {
+        let memoryClaim = try await mediaMemoryBudget.acquire(
+            byteCount: Self.mediaTaskMemoryReservationBytes
+        )
         await permitPool.acquire()
         do {
             let result = try await downloadSampleAESMedia(
@@ -411,9 +566,11 @@ final class SegmentDownloader: Sendable {
                 playlistURL: playlistURL
             )
             await permitPool.release()
+            await mediaMemoryBudget.release(memoryClaim)
             return result
         } catch {
             await permitPool.release()
+            await mediaMemoryBudget.release(memoryClaim)
             throw error
         }
     }
@@ -434,7 +591,8 @@ final class SegmentDownloader: Sendable {
                 let response = try await client.fetch(
                     candidate,
                     referer: referer,
-                    byteRange: segment.byteRange
+                    byteRange: segment.byteRange,
+                    maximumBytes: Self.maximumMediaResponseBytes
                 )
                 guard isSafeSampleAESResourceURL(response.effectiveURL, from: candidate),
                       let container = MediaPayloadInspector.detect(
@@ -454,7 +612,7 @@ final class SegmentDownloader: Sendable {
                     segment.ordinal,
                     container.fileExtension
                 )
-                try writeProtected(
+                try await writeProtected(
                     response.data,
                     to: directory.appendingPathComponent(fileName, isDirectory: false)
                 )
@@ -558,8 +716,21 @@ final class SegmentDownloader: Sendable {
         return AutomaticNavigationPolicy.isAllowedFrameNavigation(from: sourceURL, to: url)
     }
 
-    private func writeProtected(_ data: Data, to destination: URL) throws {
+    private func writeProtected(
+        _ data: Data,
+        initializationData: Data? = nil,
+        to destination: URL
+    ) async throws {
         guard destination.isFileURL else { throw HLSError.network("invalid local output URL") }
+        let parts = initializationData.map { [$0, data] } ?? [data]
+        var totalByteCount = 0
+        for part in parts {
+            guard !part.isEmpty, part.count <= Int.max - totalByteCount else {
+                throw HLSError.network("invalid protected output size")
+            }
+            totalByteCount += part.count
+        }
+        guard totalByteCount > 0 else { throw HLSError.network("protected output is empty") }
         let fileManager = FileManager.default
         let parent = destination.deletingLastPathComponent()
         let values = try parent.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -568,24 +739,33 @@ final class SegmentDownloader: Sendable {
               !fileManager.fileExists(atPath: destination.path) else {
             throw HLSError.network("protected local output path is invalid")
         }
+        let claim = try await storageBudget.claim(byteCount: totalByteCount, in: parent)
         guard fileManager.createFile(
             atPath: destination.path,
             contents: Data(),
             attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
         ) else {
+            await storageBudget.release(claim)
             throw HLSError.network("protected local file could not be created")
         }
         do {
             let handle = try FileHandle(forWritingTo: destination)
             defer { try? handle.close() }
-            try handle.write(contentsOf: data)
+            for part in parts {
+                try handle.write(contentsOf: part)
+            }
             try handle.synchronize()
+            let actualOffset = try handle.offset()
+            guard actualOffset == UInt64(totalByteCount) else {
+                throw HLSError.network("protected output size mismatch")
+            }
             try fileManager.setAttributes(
                 [.protectionKey: FileProtectionType.completeUnlessOpen],
                 ofItemAtPath: destination.path
             )
         } catch {
             try? fileManager.removeItem(at: destination)
+            await storageBudget.release(claim)
             throw error
         }
     }
@@ -598,6 +778,9 @@ final class SegmentDownloader: Sendable {
         mapData: [InitializationMap: Data],
         referer: URL
     ) async throws -> DownloadedSegment {
+        let memoryClaim = try await mediaMemoryBudget.acquire(
+            byteCount: Self.mediaTaskMemoryReservationBytes
+        )
         await permitPool.acquire()
         do {
             let result = try await downloadSegment(
@@ -609,9 +792,11 @@ final class SegmentDownloader: Sendable {
                 referer: referer
             )
             await permitPool.release()
+            await mediaMemoryBudget.release(memoryClaim)
             return result
         } catch {
             await permitPool.release()
+            await mediaMemoryBudget.release(memoryClaim)
             throw error
         }
     }
@@ -665,14 +850,25 @@ final class SegmentDownloader: Sendable {
         keyData: [URL: Data]
     ) async throws -> [InitializationMap: Data] {
         let maps = Array(Set(playlist.segments.compactMap(\.initializationMap)))
+        guard maps.count <= InitializationMapMemoryBudget.maximumMapCount else {
+            throw HLSError.invalidPlaylist("too many initialization maps")
+        }
         var result: [InitializationMap: Data] = [:]
+        var memoryBudget = InitializationMapMemoryBudget()
 
         for map in maps {
-            result[map] = try await fetchMap(
+            let reservedMaximum = try memoryBudget.maximumBytesForNextMap()
+            let data = try await fetchMap(
                 map,
                 keyData: keyData,
-                referer: playlist.requestReferer ?? playlist.effectiveURL
+                referer: playlist.requestReferer ?? playlist.effectiveURL,
+                maximumBytes: reservedMaximum
             )
+            try memoryBudget.commit(
+                byteCount: data.count,
+                reservedMaximumBytes: reservedMaximum
+            )
+            result[map] = data
         }
         return result
     }
@@ -680,12 +876,18 @@ final class SegmentDownloader: Sendable {
     private func fetchMap(
         _ map: InitializationMap,
         keyData: [URL: Data],
-        referer: URL
+        referer: URL,
+        maximumBytes: Int64
     ) async throws -> Data {
         var lastError: Error = HLSError.invalidPlaylist("初期化データを取得できません")
         for candidate in map.url.all {
             do {
-                let response = try await client.fetch(candidate, referer: referer, byteRange: map.byteRange)
+                let response = try await client.fetch(
+                    candidate,
+                    referer: referer,
+                    byteRange: map.byteRange,
+                    maximumBytes: maximumBytes
+                )
                 var data = response.data
                 if let encryption = map.encryption {
                     switch encryption.method {
@@ -729,42 +931,36 @@ final class SegmentDownloader: Sendable {
         referer: URL
     ) async throws -> DownloadedSegment {
         try Task.checkCancellation()
-        let (mediaData, response, mediaContainer) = try await fetchMedia(
+        let (mediaData, mediaContainer) = try await fetchMedia(
             segment,
             keyData: keyData,
             referer: referer,
             stream: prefix == "audio" ? "音声" : "映像"
         )
         let initializationData = segment.initializationMap.flatMap { mapData[$0] }
-        let finalData: Data
-        if let initializationData {
-            var combined = Data(capacity: initializationData.count + mediaData.count)
-            combined.append(initializationData)
-            combined.append(mediaData)
-            finalData = combined
-        } else {
-            finalData = mediaData
+        if let initializationData,
+           MediaPayloadInspector.detectInitialization(initializationData) != mediaContainer {
+            throw HLSError.invalidPlaylist("initialization map container does not match its media segment")
         }
 
-        guard let finalContainer = MediaPayloadInspector.detect(finalData, mimeType: response.mimeType),
-              finalContainer == mediaContainer else {
-            throw invalidPayloadError(
-                stream: prefix == "audio" ? "音声" : "映像",
-                number: segment.ordinal + 1,
-                response: response,
-                data: finalData
-            )
-        }
-
-        let name = String(format: "%@-%06d.%@", prefix, segment.ordinal, finalContainer.fileExtension)
+        let name = String(format: "%@-%06d.%@", prefix, segment.ordinal, mediaContainer.fileExtension)
         let destination = directory.appendingPathComponent(name, isDirectory: false)
-        try finalData.write(to: destination, options: .atomic)
+        try await writeProtected(
+            mediaData,
+            initializationData: initializationData,
+            to: destination
+        )
+        let initializationByteCount = initializationData?.count ?? 0
+        guard mediaData.count <= Int.max - initializationByteCount else {
+            throw HLSError.network("segment output size overflow")
+        }
+        let outputByteCount = initializationByteCount + mediaData.count
         return DownloadedSegment(
             source: segment,
             fileURL: destination,
-            container: finalContainer,
-            byteCount: finalData.count,
-            initializationDataLength: initializationData?.count ?? 0
+            container: mediaContainer,
+            byteCount: outputByteCount,
+            initializationDataLength: initializationByteCount
         )
     }
 
@@ -773,11 +969,16 @@ final class SegmentDownloader: Sendable {
         keyData: [URL: Data],
         referer: URL,
         stream: String
-    ) async throws -> (Data, HTTPPayload, MediaContainer) {
+    ) async throws -> (Data, MediaContainer) {
         var lastError: Error = HLSError.invalidPlaylist("断片を取得できません")
         for candidate in segment.url.all {
             do {
-                let response = try await client.fetch(candidate, referer: referer, byteRange: segment.byteRange)
+                let response = try await client.fetch(
+                    candidate,
+                    referer: referer,
+                    byteRange: segment.byteRange,
+                    maximumBytes: Self.maximumMediaResponseBytes
+                )
                 var data = response.data
                 if let encryption = segment.encryption {
                     switch encryption.method {
@@ -805,7 +1006,7 @@ final class SegmentDownloader: Sendable {
                    !MediaPayloadInspector.isInitializationData(data, container: container) {
                     throw HLSError.invalidPlaylist("fMP4断片に必要なEXT-X-MAPがありません")
                 }
-                return (data, response, container)
+                return (data, container)
             } catch is CancellationError {
                 throw HLSError.cancelled
             } catch let error as HLSError {
@@ -842,6 +1043,10 @@ enum MediaPayloadInspector {
 
         if isTransportStream(bytes) { return .transportStream }
         if isISOBaseMedia(bytes) { return .isoBaseMedia }
+        if isWebM(bytes) { return .webM }
+        if isOgg(bytes) { return .ogg }
+        if isWave(bytes) { return .wave }
+        if isFLAC(bytes) { return .flac }
 
         if let audio = detectAudio(bytes, at: 0, mimeType: mimeType) { return audio }
         if let offset = leadingID3Length(bytes),
@@ -933,6 +1138,33 @@ enum MediaPayloadInspector {
             }
         }
         return nil
+    }
+
+    private static func isWebM(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 4
+            && bytes[0] == 0x1a
+            && bytes[1] == 0x45
+            && bytes[2] == 0xdf
+            && bytes[3] == 0xa3
+    }
+
+    private static func isOgg(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 4
+            && bytes[0] == 0x4f
+            && bytes[1] == 0x67
+            && bytes[2] == 0x67
+            && bytes[3] == 0x53
+    }
+
+    private static func isWave(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 12
+            && bytes[0...3].elementsEqual([0x52, 0x49, 0x46, 0x46])
+            && bytes[8...11].elementsEqual([0x57, 0x41, 0x56, 0x45])
+    }
+
+    private static func isFLAC(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 4
+            && bytes[0...3].elementsEqual([0x66, 0x4c, 0x61, 0x43])
     }
 
     private static func isTransportStream(_ bytes: [UInt8]) -> Bool {
@@ -1032,5 +1264,68 @@ enum MediaPayloadInspector {
             visited += 1
         }
         return types
+    }
+}
+
+/// Treats URL extensions and Content-Type as discovery hints only. A candidate
+/// is not accepted until its bounded response prefix has a supported media
+/// signature; the complete file is probed again with FFprobe before export.
+enum ProgressiveMediaDetector {
+    private static let supportedExtensions: Set<String> = [
+        "mp4", "mov", "m4v", "m4a", "mp3", "aac", "ac3", "eac3", "ec3",
+        "ogg", "oga", "opus", "wav", "flac", "ts", "m2t", "m2ts", "mts", "webm"
+    ]
+
+    static func hasHint(url: URL, mimeType: String?) -> Bool {
+        if supportedExtensions.contains(url.pathExtension.lowercased()) { return true }
+        guard let mime = mimeType?
+            .split(separator: ";", maxSplits: 1)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return false
+        }
+        if mime.hasPrefix("video/") || mime.hasPrefix("audio/") { return true }
+        return mime == "application/ogg"
+            || mime == "application/mp4"
+            || mime == "application/octet-stream"
+    }
+
+    static func detect(prefix: Data, url: URL, mimeType: String?) -> MediaContainer? {
+        guard !prefix.isEmpty,
+              let detected = MediaPayloadInspector.detect(prefix, mimeType: mimeType) else {
+            return nil
+        }
+
+        // Strong bounded magic is authoritative. Hints decide which requests
+        // are worth probing, but a missing/incorrect suffix never overrides the
+        // bytes returned by the server.
+        guard hasHint(url: url, mimeType: mimeType)
+                || isStrongContainerSignature(detected) else {
+            return nil
+        }
+        return detected
+    }
+
+    /// Standalone TS/AAC/AC-3 have no manifest key metadata. SAMPLE-AES can
+    /// leave enough framing and metadata clear for FFprobe while media samples
+    /// remain encrypted, so accepting them from magic + FFprobe is fail-open.
+    /// Manifest-backed HLS continues through the existing SAMPLE-AES pipeline;
+    /// only raw progressive forms are excluded here.
+    static func supportsStandaloneDownload(_ container: MediaContainer) -> Bool {
+        switch container {
+        case .transportStream, .aac, .ac3, .eac3:
+            return false
+        case .isoBaseMedia, .mp3, .ogg, .wave, .flac, .webM:
+            return true
+        }
+    }
+
+    private static func isStrongContainerSignature(_ container: MediaContainer) -> Bool {
+        switch container {
+        case .transportStream, .isoBaseMedia, .aac, .mp3, .ac3, .eac3,
+             .ogg, .wave, .flac, .webM:
+            return true
+        }
     }
 }

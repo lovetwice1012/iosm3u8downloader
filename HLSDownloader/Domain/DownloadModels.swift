@@ -44,6 +44,23 @@ struct PlaylistDocument: Sendable {
 enum MediaCandidateKind: String, Hashable, Sendable {
     case hls
     case widevineDASH
+    case progressive
+}
+
+/// Describes where a non-manifest media candidate can be read from.
+///
+/// Remote resources are fetched again inside the isolated download job. A
+/// captured Blob is already a protected local file because `blob:` URLs only
+/// exist inside their originating WebKit content process and cannot be opened
+/// by URLSession after the capture browser closes.
+enum ProgressiveMediaStorage: Equatable, Sendable {
+    case remote
+    case capturedBlob(fileURL: URL, byteCount: Int)
+}
+
+struct ProgressiveMediaReference: Equatable, Sendable {
+    let storage: ProgressiveMediaStorage
+    let hintedMIMEType: String?
 }
 
 /// Non-secret facts observed for a possible Widevine license request.
@@ -235,7 +252,7 @@ enum HLSCandidateOrigin: String, Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .direct: return "m3u8直接リンク"
+        case .direct: return "直接リンク"
         case .video: return "videoタグ"
         case .source: return "sourceタグ"
         case .inlineScript: return "ページ内データ"
@@ -251,6 +268,12 @@ struct HLSCandidate: Identifiable, Sendable {
     let request: URLCandidates
     let requestReferer: URL?
     let document: PlaylistDocument?
+    let progressiveMedia: ProgressiveMediaReference?
+    let usesCapturedDocument: Bool
+    /// Native-only identity for one captured Blob. It prevents two manifest
+    /// Blobs created by the same page URL from collapsing into one candidate
+    /// without using or logging the opaque `blob:` URL itself.
+    let capturedContentID: UUID?
     let widevinePlaybackContext: WidevinePlaybackContext?
     let pageURL: URL
     let title: String?
@@ -264,6 +287,9 @@ struct HLSCandidate: Identifiable, Sendable {
         request: URLCandidates,
         requestReferer: URL?,
         document: PlaylistDocument?,
+        progressiveMedia: ProgressiveMediaReference? = nil,
+        usesCapturedDocument: Bool = false,
+        capturedContentID: UUID? = nil,
         widevinePlaybackContext: WidevinePlaybackContext? = nil,
         pageURL: URL,
         title: String?,
@@ -276,6 +302,9 @@ struct HLSCandidate: Identifiable, Sendable {
         self.request = request
         self.requestReferer = requestReferer
         self.document = document
+        self.progressiveMedia = kind == .progressive ? progressiveMedia : nil
+        self.usesCapturedDocument = usesCapturedDocument && document != nil
+        self.capturedContentID = capturedContentID
         self.widevinePlaybackContext = kind == .widevineDASH ? widevinePlaybackContext : nil
         self.pageURL = pageURL
         self.title = title
@@ -597,6 +626,10 @@ enum MediaContainer: String, Sendable {
     case mp3 = "MP3"
     case ac3 = "AC-3"
     case eac3 = "E-AC-3"
+    case ogg = "Ogg"
+    case wave = "WAVE"
+    case flac = "FLAC"
+    case webM = "WebM"
 
     var fileExtension: String {
         switch self {
@@ -606,6 +639,10 @@ enum MediaContainer: String, Sendable {
         case .mp3: return "mp3"
         case .ac3: return "ac3"
         case .eac3: return "ec3"
+        case .ogg: return "ogg"
+        case .wave: return "wav"
+        case .flac: return "flac"
+        case .webM: return "webm"
         }
     }
 }

@@ -91,6 +91,378 @@ private final class HTTPRejectRedirectDelegate: NSObject, URLSessionTaskDelegate
     }
 }
 
+private struct ProgressiveDownloadResult: Sendable {
+    let response: HTTPURLResponse
+    let byteCount: Int64
+}
+
+/// A one-shot download-task delegate. URLSession writes the network body to
+/// its own temporary file without crossing Swift one byte at a time. The
+/// delegate enforces the hard limit while bytes arrive, then copies the
+/// completed file into the already-protected job inode in bounded chunks.
+private final class HTTPProgressiveDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let maximumBytes: Int64
+    private let destinationURL: URL
+    private let redirectPolicy: HTTPRedirectDelegate
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ProgressiveDownloadResult, Error>?
+    private var task: URLSessionDownloadTask?
+    private var pendingResult: Result<ProgressiveDownloadResult, Error>?
+    private var cancellationRequested = false
+    private var sizeLimitExceeded = false
+    private var completed = false
+
+    init(
+        maximumBytes: Int64,
+        destinationURL: URL,
+        redirectPolicy: HTTPRedirectDelegate
+    ) {
+        self.maximumBytes = maximumBytes
+        self.destinationURL = destinationURL
+        self.redirectPolicy = redirectPolicy
+    }
+
+    func start(session: URLSession, request: URLRequest) async throws -> ProgressiveDownloadResult {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.downloadTask(with: request)
+                lock.lock()
+                self.continuation = continuation
+                self.task = task
+                let shouldCancel = cancellationRequested
+                lock.unlock()
+                if shouldCancel {
+                    task.cancel()
+                } else {
+                    task.resume()
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        redirectPolicy.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request,
+            completionHandler: completionHandler
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard totalBytesWritten <= maximumBytes,
+              totalBytesExpectedToWrite <= 0 || totalBytesExpectedToWrite <= maximumBytes else {
+            lock.lock()
+            sizeLimitExceeded = true
+            lock.unlock()
+            downloadTask.cancel()
+            return
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        do {
+            guard let response = downloadTask.response as? HTTPURLResponse else {
+                throw HLSError.network("progressive media did not receive HTTP")
+            }
+            redirectPolicy.responseCookieObserver?(response)
+            let effectiveURL = response.url ?? downloadTask.originalRequest?.url
+            guard (200...299).contains(response.statusCode) else {
+                throw HLSError.httpStatus(
+                    response.statusCode,
+                    effectiveURL?.host ?? "media server"
+                )
+            }
+            guard let originalURL = downloadTask.originalRequest?.url,
+                  let effectiveURL,
+                  AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: originalURL,
+                    to: effectiveURL
+                  ) else {
+                throw HLSError.network("progressive media redirect was blocked")
+            }
+
+            let values = try location.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            let copyMaximumBytes = try LocalFFmpegOutputLimit.maximumBytes(for: destinationURL)
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let fileSize = values.fileSize,
+                  fileSize > 0,
+                  Int64(fileSize) <= maximumBytes,
+                  Int64(fileSize) < copyMaximumBytes else {
+                throw HLSError.network("progressive media exceeded the size limit")
+            }
+            try copyDownloadedFile(
+                from: location,
+                to: destinationURL,
+                expectedByteCount: Int64(fileSize),
+                maximumCopyBytes: copyMaximumBytes
+            )
+            pendingResult = .success(
+                ProgressiveDownloadResult(
+                    response: response,
+                    byteCount: Int64(fileSize)
+                )
+            )
+        } catch {
+            pendingResult = .failure(error)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        lock.lock()
+        let cancelled = cancellationRequested
+        let exceeded = sizeLimitExceeded
+        lock.unlock()
+
+        if cancelled {
+            finish(.failure(CancellationError()))
+        } else if exceeded {
+            finish(.failure(HLSError.network("progressive media exceeded the size limit")))
+        } else if let error {
+            finish(.failure(error))
+        } else if let pendingResult {
+            finish(pendingResult)
+        } else {
+            finish(.failure(HLSError.network("progressive media download did not complete")))
+        }
+    }
+
+    private func copyDownloadedFile(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        expectedByteCount: Int64,
+        maximumCopyBytes: Int64
+    ) throws {
+        let input = try FileHandle(forReadingFrom: sourceURL)
+        let output = try FileHandle(forWritingTo: destinationURL)
+        var copied: Int64 = 0
+        do {
+            try output.truncate(atOffset: 0)
+            while let chunk = try input.read(upToCount: 1_048_576), !chunk.isEmpty {
+                lock.lock()
+                let shouldCancel = cancellationRequested
+                lock.unlock()
+                if shouldCancel { throw CancellationError() }
+                let chunkBytes = Int64(chunk.count)
+                guard copied < maximumCopyBytes,
+                      chunkBytes < maximumCopyBytes - copied else {
+                    throw HLSError.network("progressive media exceeded the size limit")
+                }
+                try output.write(contentsOf: chunk)
+                copied += chunkBytes
+            }
+            try output.synchronize()
+            try input.close()
+            try output.close()
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUnlessOpen],
+                ofItemAtPath: destinationURL.path
+            )
+            guard copied == expectedByteCount else {
+                throw HLSError.network("progressive media file was truncated")
+            }
+        } catch {
+            try? input.close()
+            try? output.close()
+            throw error
+        }
+    }
+
+    private func finish(_ result: Result<ProgressiveDownloadResult, Error>) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        let continuation = continuation
+        self.continuation = nil
+        task = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
+private struct HTTPBoundedDataResult: Sendable {
+    let data: Data
+    let response: HTTPURLResponse
+}
+
+/// Receives URLSession data in Foundation-provided chunks and cancels the task
+/// before an untrusted response can grow an in-memory HLS object without bound.
+private final class HTTPBoundedDataDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let maximumBytes: Int64
+    private let redirectPolicy: HTTPRedirectDelegate
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<HTTPBoundedDataResult, Error>?
+    private var task: URLSessionDataTask?
+    private var response: HTTPURLResponse?
+    private var received = Data()
+    private var cancellationRequested = false
+    private var sizeLimitExceeded = false
+    private var completed = false
+
+    init(maximumBytes: Int64, redirectPolicy: HTTPRedirectDelegate) {
+        self.maximumBytes = maximumBytes
+        self.redirectPolicy = redirectPolicy
+    }
+
+    func start(session: URLSession, request: URLRequest) async throws -> HTTPBoundedDataResult {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.dataTask(with: request)
+                lock.lock()
+                self.continuation = continuation
+                self.task = task
+                let shouldCancel = cancellationRequested
+                lock.unlock()
+                if shouldCancel {
+                    task.cancel()
+                } else {
+                    task.resume()
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        redirectPolicy.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request,
+            completionHandler: completionHandler
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            finish(.failure(HLSError.network("HTTP response was not received")))
+            return
+        }
+        lock.lock()
+        self.response = http
+        let exceedsLimit = http.expectedContentLength > maximumBytes
+        if exceedsLimit { sizeLimitExceeded = true }
+        lock.unlock()
+        completionHandler(exceedsLimit ? .cancel : .allow)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        lock.lock()
+        let currentCount = Int64(received.count)
+        let chunkCount = Int64(data.count)
+        guard currentCount <= maximumBytes,
+              chunkCount <= maximumBytes - currentCount else {
+            sizeLimitExceeded = true
+            let task = task
+            lock.unlock()
+            task?.cancel()
+            return
+        }
+        received.append(data)
+        lock.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        lock.lock()
+        let cancelled = cancellationRequested
+        let exceeded = sizeLimitExceeded
+        let response = response
+        let data = received
+        lock.unlock()
+        if cancelled {
+            finish(.failure(CancellationError()))
+        } else if exceeded {
+            finish(.failure(HLSError.network("HTTP response exceeded the size limit")))
+        } else if let error {
+            finish(.failure(error))
+        } else if let response {
+            finish(.success(HTTPBoundedDataResult(data: data, response: response)))
+        } else {
+            finish(.failure(HLSError.network("HTTP response did not complete")))
+        }
+    }
+
+    private func finish(_ result: Result<HTTPBoundedDataResult, Error>) {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        let continuation = continuation
+        self.continuation = nil
+        task = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
 struct HTTPPayload: Sendable {
     let data: Data
     let effectiveURL: URL
@@ -98,9 +470,26 @@ struct HTTPPayload: Sendable {
     let mimeType: String?
 }
 
+struct HTTPResourceProbe: Sendable {
+    let prefix: Data
+    let effectiveURL: URL
+    let statusCode: Int
+    let mimeType: String?
+    let expectedContentLength: Int64
+    let isCompleteResponse: Bool
+}
+
+struct HTTPFileDownload: Sendable {
+    let effectiveURL: URL
+    let statusCode: Int
+    let mimeType: String?
+    let byteCount: Int64
+}
+
 final class HTTPClient: @unchecked Sendable {
     static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0"
     private static let maximumTransientResponseCookies = 512
+    static let maximumBufferedResponseBytes: Int64 = 64 * 1_024 * 1_024
 
     private let session: URLSession
     private let redirectDelegate: HTTPRedirectDelegate
@@ -232,13 +621,19 @@ final class HTTPClient: @unchecked Sendable {
     func fetch(
         _ candidates: URLCandidates,
         referer: URL? = nil,
-        byteRange: ByteRange? = nil
+        byteRange: ByteRange? = nil,
+        maximumBytes: Int64 = HTTPClient.maximumBufferedResponseBytes
     ) async throws -> HTTPPayload {
         var lastError: Error?
 
         for candidate in candidates.all {
             do {
-                return try await fetch(candidate, referer: referer, byteRange: byteRange)
+                return try await fetch(
+                    candidate,
+                    referer: referer,
+                    byteRange: byteRange,
+                    maximumBytes: maximumBytes
+                )
             } catch let error as HLSError {
                 if case .cancelled = error { throw error }
                 lastError = error
@@ -252,7 +647,16 @@ final class HTTPClient: @unchecked Sendable {
         throw HLSError.network(lastError?.localizedDescription ?? "不明なエラー")
     }
 
-    func fetch(_ url: URL, referer: URL? = nil, byteRange: ByteRange? = nil) async throws -> HTTPPayload {
+    func fetch(
+        _ url: URL,
+        referer: URL? = nil,
+        byteRange: ByteRange? = nil,
+        maximumBytes: Int64 = HTTPClient.maximumBufferedResponseBytes
+    ) async throws -> HTTPPayload {
+        guard maximumBytes > 0,
+              maximumBytes <= Self.maximumBufferedResponseBytes else {
+            throw HLSError.network("invalid buffered response limit")
+        }
         var lastError: Error?
 
         for attempt in 0..<3 {
@@ -272,8 +676,17 @@ final class HTTPClient: @unchecked Sendable {
                     request.setValue("bytes=\(byteRange.offset)-\(upperBound)", forHTTPHeaderField: "Range")
                 }
 
-                let (rawData, response) = try await session.data(for: request)
-                guard let http = response as? HTTPURLResponse else {
+                if let byteRange,
+                   byteRange.length > maximumBytes {
+                    throw HLSError.byteRangeInvalid
+                }
+                let bounded = try await boundedData(
+                    for: request,
+                    maximumBytes: maximumBytes
+                )
+                let rawData = bounded.data
+                let http = bounded.response
+                guard http.url != nil else {
                     throw HLSError.network("HTTPレスポンスを受信できませんでした")
                 }
                 storeResponseCookies(from: http)
@@ -332,6 +745,32 @@ final class HTTPClient: @unchecked Sendable {
 
         if let hlsError = lastError as? HLSError { throw hlsError }
         throw HLSError.network(lastError?.localizedDescription ?? "不明なエラー")
+    }
+
+    private func boundedData(
+        for request: URLRequest,
+        maximumBytes: Int64
+    ) async throws -> HTTPBoundedDataResult {
+        let delegate = HTTPBoundedDataDelegate(
+            maximumBytes: maximumBytes,
+            redirectPolicy: redirectDelegate
+        )
+        let configuration = session.configuration
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        let boundedSession = URLSession(
+            configuration: configuration,
+            delegate: delegate,
+            delegateQueue: delegateQueue
+        )
+        do {
+            let result = try await delegate.start(session: boundedSession, request: request)
+            boundedSession.finishTasksAndInvalidate()
+            return result
+        } catch {
+            boundedSession.invalidateAndCancel()
+            throw error
+        }
     }
 
     func fetchLimited(
@@ -404,6 +843,179 @@ final class HTTPClient: @unchecked Sendable {
         throw HLSError.network(lastError?.localizedDescription ?? "不明なエラー")
     }
 
+    /// Reads only a bounded prefix for media discovery. Servers that ignore the
+    /// Range header are still stopped once the prefix is complete, so probing a
+    /// progressive movie never materializes the complete response in memory.
+    func probeMediaPrefix(
+        _ url: URL,
+        referer: URL? = nil,
+        maximumBytes: Int = 262_144
+    ) async throws -> HTTPResourceProbe {
+        guard Self.isSafeHTTPURL(url),
+              maximumBytes > 0,
+              maximumBytes <= 1_048_576 else {
+            throw HLSError.network("invalid progressive media probe")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            "video/*,audio/*,application/ogg,application/octet-stream,application/vnd.apple.mpegurl,application/dash+xml,*/*;q=0.4",
+            forHTTPHeaderField: "Accept"
+        )
+        request.setValue("bytes=0-\(maximumBytes - 1)", forHTTPHeaderField: "Range")
+        if let referer = safeReferer(referer, target: url) {
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+        if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
+            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        }
+
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw HLSError.network("progressive media probe did not receive HTTP")
+            }
+            storeResponseCookies(from: http)
+            let effectiveURL = http.url ?? url
+            guard (200...299).contains(http.statusCode) else {
+                throw HLSError.httpStatus(http.statusCode, effectiveURL.host ?? "media server")
+            }
+            guard AutomaticNavigationPolicy.isAllowedFrameNavigation(from: url, to: effectiveURL) else {
+                throw HLSError.network("progressive media probe redirect was blocked")
+            }
+
+            var prefix = Data()
+            prefix.reserveCapacity(maximumBytes)
+            var reachedEnd = true
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                if prefix.count >= maximumBytes {
+                    reachedEnd = false
+                    break
+                }
+                prefix.append(byte)
+            }
+            guard !prefix.isEmpty else {
+                throw HLSError.network("progressive media response was empty")
+            }
+            return HTTPResourceProbe(
+                prefix: prefix,
+                effectiveURL: effectiveURL,
+                statusCode: http.statusCode,
+                mimeType: http.mimeType,
+                expectedContentLength: http.expectedContentLength,
+                isCompleteResponse: http.statusCode == 200 && reachedEnd
+            )
+        } catch is CancellationError {
+            throw HLSError.cancelled
+        } catch let error as HLSError {
+            throw error
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            throw HLSError.cancelled
+        } catch {
+            throw HLSError.network("progressive media probe failed")
+        }
+    }
+
+    /// Streams a complete progressive resource into a file that is protected
+    /// before its first byte is written. The caller supplies a job-scoped path;
+    /// redirects and cookies continue through the same HTTPClient gates as HLS.
+    func downloadProgressiveMedia(
+        _ url: URL,
+        to destinationURL: URL,
+        referer: URL?,
+        maximumBytes: Int64 = 8 * 1_024 * 1_024 * 1_024
+    ) async throws -> HTTPFileDownload {
+        guard Self.isSafeHTTPURL(url),
+              destinationURL.isFileURL,
+              maximumBytes > 0,
+              maximumBytes <= 16 * 1_024 * 1_024 * 1_024 else {
+            throw HLSError.network("invalid progressive media download")
+        }
+        let parent = destinationURL.deletingLastPathComponent()
+        let parentValues = try parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard parentValues.isDirectory == true,
+              parentValues.isSymbolicLink != true else {
+            throw HLSError.network("invalid progressive media destination")
+        }
+        let destinationMaximumBytes = try LocalFFmpegOutputLimit.maximumBytes(for: destinationURL)
+        let effectiveMaximumBytes = min(maximumBytes, destinationMaximumBytes)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(
+            "video/*,audio/*,application/ogg,application/octet-stream,*/*;q=0.4",
+            forHTTPHeaderField: "Accept"
+        )
+        if let referer = safeReferer(referer, target: url) {
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+        if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
+            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        }
+
+        try? FileManager.default.removeItem(at: destinationURL)
+        let created = FileManager.default.createFile(
+            atPath: destinationURL.path,
+            contents: Data(),
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        )
+        guard created else { throw HLSError.network("could not create progressive media file") }
+
+        do {
+            let delegate = HTTPProgressiveDownloadDelegate(
+                maximumBytes: effectiveMaximumBytes,
+                destinationURL: destinationURL,
+                redirectPolicy: redirectDelegate
+            )
+            let configuration = session.configuration
+            configuration.timeoutIntervalForRequest = max(
+                configuration.timeoutIntervalForRequest,
+                60
+            )
+            configuration.timeoutIntervalForResource = max(
+                configuration.timeoutIntervalForResource,
+                24 * 60 * 60
+            )
+            let delegateQueue = OperationQueue()
+            delegateQueue.maxConcurrentOperationCount = 1
+            let downloadSession = URLSession(
+                configuration: configuration,
+                delegate: delegate,
+                delegateQueue: delegateQueue
+            )
+            do {
+                let downloaded = try await delegate.start(
+                    session: downloadSession,
+                    request: request
+                )
+                downloadSession.finishTasksAndInvalidate()
+                let effectiveURL = downloaded.response.url ?? url
+                return HTTPFileDownload(
+                    effectiveURL: effectiveURL,
+                    statusCode: downloaded.response.statusCode,
+                    mimeType: downloaded.response.mimeType,
+                    byteCount: downloaded.byteCount
+                )
+            } catch {
+                downloadSession.invalidateAndCancel()
+                throw error
+            }
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: destinationURL)
+            throw HLSError.cancelled
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            try? FileManager.default.removeItem(at: destinationURL)
+            throw HLSError.cancelled
+        } catch {
+            try? FileManager.default.removeItem(at: destinationURL)
+            throw error
+        }
+    }
+
     /// Streams one bounded DASH object directly to a local file. Range
     /// requests must be honored with HTTP 206 so a large shared media object
     /// is never downloaded repeatedly just to extract a small subrange.
@@ -431,6 +1043,7 @@ final class HTTPClient: @unchecked Sendable {
                 throw HLSError.byteRangeInvalid
             }
         }
+        let destinationMaximumBytes = try LocalFFmpegOutputLimit.maximumBytes(for: destinationURL)
 
         var lastError: Error?
         for attempt in 0..<3 {
@@ -470,7 +1083,8 @@ final class HTTPClient: @unchecked Sendable {
                 if byteRange != nil, http.statusCode != 206 {
                     throw HLSError.byteRangeInvalid
                 }
-                if http.expectedContentLength > Int64(maximumBytes) {
+                if http.expectedContentLength > Int64(maximumBytes)
+                    || http.expectedContentLength >= destinationMaximumBytes {
                     throw HLSError.network("DASH断片が大きすぎます")
                 }
 
@@ -487,7 +1101,8 @@ final class HTTPClient: @unchecked Sendable {
                 do {
                     for try await byte in bytes {
                         try Task.checkCancellation()
-                        guard written < Int64(maximumBytes) else {
+                        guard written < Int64(maximumBytes),
+                              written < destinationMaximumBytes else {
                             throw HLSError.network("DASH断片が大きすぎます")
                         }
                         buffer.append(byte)
@@ -506,7 +1121,9 @@ final class HTTPClient: @unchecked Sendable {
                     throw error
                 }
 
-                guard written > 0, written <= Int64(maximumBytes) else {
+                guard written > 0,
+                      written <= Int64(maximumBytes),
+                      written < destinationMaximumBytes else {
                     throw HLSError.network("DASH断片が空か大きすぎます")
                 }
                 if let byteRange {

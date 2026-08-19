@@ -397,9 +397,7 @@ struct ContentView: View {
     private func completionCard(_ outputURL: URL) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Label(
-                outputURL.pathExtension.lowercased() == "wav"
-                    ? "WAVを作成しました"
-                    : "MP4を作成しました",
+                completionTitle(for: outputURL),
                 systemImage: "checkmark.circle.fill"
             )
                 .font(.headline)
@@ -417,6 +415,14 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
         }
         .cardStyle()
+    }
+
+    private func completionTitle(for outputURL: URL) -> String {
+        switch outputURL.pathExtension.lowercased() {
+        case "wav": return "WAVを作成しました"
+        case "webm": return "WebMを保存しました"
+        default: return "MP4を作成しました"
+        }
     }
 
     private var diagnosticLogCard: some View {
@@ -472,7 +478,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("対応範囲", systemImage: "info.circle")
                 .font(.headline)
-            Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。終了済みVOD、相対URL、master playlist、別音声、TS/fMP4、BYTERANGE、identity AES-128と許可host上のidentity SAMPLE-AESに対応します。音声trackだけの配信はPCM WAVで保存します。")
+            Text("video/sourceタグ、ページ内設定、iframe、プレイヤー初期化後のfetch/XHRを探索します。HLS/DASHに加えてMP4/MOV/M4A/MP3/Ogg/Opus/WebMと完了Blobを検証し、音声trackだけならPCM WAV、video WebMならWebM、それ以外の動画はMP4で保存します。単体TS/AAC/AC3/EAC3は安全にclear判定できないため保存非対応、MSE単体は検出表示のみで、元manifestを優先します。")
             Text("Widevine DASH/MPDは `isDownloadableWidevineDomain` の許可hostだけを候補化します。その他のWidevineは再生・保存とも拒否し、DRMなしHLSは従来どおり全ドメインで処理します。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -575,8 +581,10 @@ private struct PlaybackCaptureBrowser: View {
     private var captureSummary: String {
         let hlsCount = session.references.filter { $0.kind == .hls }.count
         let widevineCount = session.references.filter { $0.kind == .widevineDASH }.count
+        let progressiveCount = session.references.filter { $0.kind == .progressive }.count
         let eme = session.detectedWidevineKeySystem ? " / EME検出" : ""
-        return "HLS \(hlsCount) / Widevine \(widevineCount) / license要求 \(session.licenseRequests.count)\(eme)"
+        let mse = session.detectedMediaSource ? " / MSE検出" : ""
+        return "HLS \(hlsCount) / file \(progressiveCount) / Blob \(session.capturedBlobCount) / Widevine \(widevineCount) / license要求 \(session.licenseRequests.count)\(eme)\(mse)"
     }
 
     private var controls: some View {
@@ -663,6 +671,7 @@ private extension MediaCandidateKind {
         switch self {
         case .hls: return "HLS"
         case .widevineDASH: return "Widevine DASH"
+        case .progressive: return "動画・音声ファイル"
         }
     }
 
@@ -670,6 +679,7 @@ private extension MediaCandidateKind {
         switch self {
         case .hls: return "HLS動画"
         case .widevineDASH: return "Widevine動画"
+        case .progressive: return "動画・音声ファイル"
         }
     }
 }

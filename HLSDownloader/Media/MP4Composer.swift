@@ -3,9 +3,23 @@ import Foundation
 
 private final class ExportSessionBox: @unchecked Sendable {
     let session: AVAssetExportSession
+    private let stateLock = NSLock()
+    private var limitExceeded = false
 
     init(_ session: AVAssetExportSession) {
         self.session = session
+    }
+
+    func markOutputLimitExceeded() {
+        stateLock.lock()
+        limitExceeded = true
+        stateLock.unlock()
+    }
+
+    func didExceedOutputLimit() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return limitExceeded
     }
 }
 
@@ -446,7 +460,11 @@ final class MP4Composer: @unchecked Sendable {
                 )
             )
         }
-        try await export(composition, to: outputURL)
+        try await export(
+            composition,
+            inputURLs: main.map(\.fileURL) + (externalAudio?.map(\.fileURL) ?? []),
+            to: outputURL
+        )
     }
 
     private struct ConsolidatedInput {
@@ -487,6 +505,7 @@ final class MP4Composer: @unchecked Sendable {
             "\(label)-joined-\(UUID().uuidString).\(first.container.fileExtension)",
             isDirectory: false
         )
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: temporaryURL)
         guard FileManager.default.createFile(
             atPath: temporaryURL.path,
             contents: nil,
@@ -499,7 +518,7 @@ final class MP4Composer: @unchecked Sendable {
             let handle = try FileHandle(forWritingTo: temporaryURL)
             defer { try? handle.close() }
 
-            var totalBytes = 0
+            var totalBytes: Int64 = 0
             for (index, segment) in ordered.enumerated() {
                 try Task.checkCancellation()
                 let data = try Data(contentsOf: segment.fileURL, options: .mappedIfSafe)
@@ -518,9 +537,19 @@ final class MP4Composer: @unchecked Sendable {
                     throw HLSError.invalidPlaylist("断片の初期化データ長が不正です")
                 }
                 let chunk = skipCount == 0 ? data : Data(data.dropFirst(skipCount))
+                let chunkBytes = Int64(chunk.count)
+                guard totalBytes < maximumOutputBytes,
+                      chunkBytes < maximumOutputBytes - totalBytes else {
+                    throw HLSError.exportFailed("consolidated input exceeded storage limit")
+                }
                 try handle.write(contentsOf: chunk)
-                totalBytes += chunk.count
+                totalBytes += chunkBytes
             }
+            try handle.synchronize()
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: temporaryURL,
+                maximumBytes: maximumOutputBytes
+            )
 
             let duration = ordered.reduce(0.0) { $0 + $1.source.duration }
             let source = MediaSegment(
@@ -538,7 +567,7 @@ final class MP4Composer: @unchecked Sendable {
                     source: source,
                     fileURL: temporaryURL,
                     container: first.container,
-                    byteCount: totalBytes,
+                    byteCount: Int(clamping: totalBytes),
                     initializationDataLength: 0
                 ),
                 temporaryURL: temporaryURL
@@ -758,12 +787,21 @@ final class MP4Composer: @unchecked Sendable {
         time.isNumeric && CMTimeCompare(time, .zero) > 0
     }
 
-    private func export(_ composition: AVMutableComposition, to outputURL: URL) async throws {
+    private func export(
+        _ composition: AVMutableComposition,
+        inputURLs: [URL],
+        to outputURL: URL
+    ) async throws {
         let presets = [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality]
         var lastError: Error?
 
         for preset in presets {
             try Task.checkCancellation()
+            let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(for: outputURL)
+            try LocalFFmpegOutputLimit.validateInputFiles(
+                inputURLs,
+                maximumBytes: maximumOutputBytes
+            )
             try? FileManager.default.removeItem(at: outputURL)
             guard let exporter = AVAssetExportSession(asset: composition, presetName: preset),
                   exporter.supportedFileTypes.contains(.mp4) else { continue }
@@ -771,13 +809,25 @@ final class MP4Composer: @unchecked Sendable {
             exporter.outputURL = outputURL
             exporter.outputFileType = .mp4
             exporter.shouldOptimizeForNetworkUse = true
+            let estimatedBytes = exporter.estimatedOutputFileLength
 
             do {
-                try await run(exporter)
+                guard estimatedBytes <= 0 || estimatedBytes < maximumOutputBytes else {
+                    throw HLSError.exportFailed("estimated MP4 output exceeds storage limit")
+                }
+                try await run(
+                    exporter,
+                    outputURL: outputURL,
+                    maximumOutputBytes: maximumOutputBytes
+                )
                 let values = try outputURL.resourceValues(forKeys: [.fileSizeKey])
                 guard (values.fileSize ?? 0) > 0 else {
                     throw HLSError.exportFailed("出力が空です")
                 }
+                try LocalFFmpegOutputLimit.validateCompletedOutput(
+                    at: outputURL,
+                    maximumBytes: maximumOutputBytes
+                )
                 return
             } catch {
                 if error is CancellationError { throw HLSError.cancelled }
@@ -794,11 +844,35 @@ final class MP4Composer: @unchecked Sendable {
         throw HLSError.mp4ExportUnsupported
     }
 
-    private func run(_ exporter: AVAssetExportSession) async throws {
+    private func run(
+        _ exporter: AVAssetExportSession,
+        outputURL: URL,
+        maximumOutputBytes: Int64
+    ) async throws {
         let box = ExportSessionBox(exporter)
+        let monitor = Task.detached(priority: .utility) { () -> Void in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+                guard let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                      Int64(size) >= maximumOutputBytes else {
+                    continue
+                }
+                box.markOutputLimitExceeded()
+                box.session.cancelExport()
+                return
+            }
+        }
+        defer { monitor.cancel() }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 box.session.exportAsynchronously {
+                    if box.didExceedOutputLimit() {
+                        continuation.resume(
+                            throwing: HLSError.exportFailed("MP4 output exceeded storage limit")
+                        )
+                        return
+                    }
                     switch box.session.status {
                     case .completed:
                         continuation.resume()

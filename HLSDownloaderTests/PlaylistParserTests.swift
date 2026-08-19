@@ -283,6 +283,48 @@ final class MediaPayloadInspectorTests: XCTestCase {
         XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .isoBaseMedia)
     }
 
+    func testDetectsProgressiveContainerSignatures() {
+        XCTAssertEqual(
+            MediaPayloadInspector.detect(Data([0x1a, 0x45, 0xdf, 0xa3, 0x81, 0x00]), mimeType: nil),
+            .webM
+        )
+        XCTAssertEqual(
+            MediaPayloadInspector.detect(Data("OggS\0fixture".utf8), mimeType: nil),
+            .ogg
+        )
+        XCTAssertEqual(
+            MediaPayloadInspector.detect(Data("RIFF\0\0\0\0WAVEfmt ".utf8), mimeType: nil),
+            .wave
+        )
+        XCTAssertEqual(
+            MediaPayloadInspector.detect(Data("fLaCfixture".utf8), mimeType: nil),
+            .flac
+        )
+    }
+
+    func testProgressiveDetectionRequiresMediaMagicNotOnlyAnExtension() {
+        let disguisedHTML = Data("<!doctype html><title>sign in</title>".utf8)
+        let mp4URL = URL(string: "https://example.com/movie.mp4")!
+        XCTAssertTrue(ProgressiveMediaDetector.hasHint(url: mp4URL, mimeType: nil))
+        XCTAssertNil(
+            ProgressiveMediaDetector.detect(
+                prefix: disguisedHTML,
+                url: mp4URL,
+                mimeType: "video/mp4"
+            )
+        )
+
+        let webM = Data([0x1a, 0x45, 0xdf, 0xa3, 0x81, 0x00])
+        XCTAssertEqual(
+            ProgressiveMediaDetector.detect(
+                prefix: webM,
+                url: URL(string: "https://example.com/download?id=1")!,
+                mimeType: "application/octet-stream"
+            ),
+            .webM
+        )
+    }
+
     func testRejectsTruncatedFileTypeBox() {
         let data = Data([0, 0, 0, 8]) + Data("ftyp".utf8)
         XCTAssertNil(MediaPayloadInspector.detect(data, mimeType: "video/mp4"))
@@ -320,6 +362,107 @@ final class MediaPayloadInspectorTests: XCTestCase {
         XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .eac3)
         data[5] = 0x50
         XCTAssertEqual(MediaPayloadInspector.detect(data, mimeType: nil), .ac3)
+    }
+}
+
+final class InitializationMapMemoryBudgetTests: XCTestCase {
+    func testAggregateBudgetAcceptsBoundaryAndRejectsNextMap() throws {
+        var budget = InitializationMapMemoryBudget()
+        for _ in 0..<8 {
+            let reserved = try budget.maximumBytesForNextMap()
+            XCTAssertEqual(
+                reserved,
+                InitializationMapMemoryBudget.maximumSingleMapBytes
+            )
+            try budget.commit(
+                byteCount: Int(reserved),
+                reservedMaximumBytes: reserved
+            )
+        }
+        XCTAssertEqual(
+            budget.committedBytes,
+            InitializationMapMemoryBudget.maximumAggregateBytes
+        )
+        XCTAssertThrowsError(try budget.maximumBytesForNextMap())
+    }
+
+    func testFailedFetchDoesNotConsumeReservation() throws {
+        var budget = InitializationMapMemoryBudget()
+        let firstReservation = try budget.maximumBytesForNextMap()
+        let retriedReservation = try budget.maximumBytesForNextMap()
+
+        XCTAssertEqual(firstReservation, retriedReservation)
+        XCTAssertEqual(budget.committedBytes, 0)
+        XCTAssertEqual(budget.committedMapCount, 0)
+    }
+
+    func testMapCountAndSingleMapCapsAreFailClosed() throws {
+        var countBudget = InitializationMapMemoryBudget()
+        for _ in 0..<InitializationMapMemoryBudget.maximumMapCount {
+            let reserved = try countBudget.maximumBytesForNextMap()
+            try countBudget.commit(byteCount: 1, reservedMaximumBytes: reserved)
+        }
+        XCTAssertThrowsError(try countBudget.maximumBytesForNextMap())
+
+        var sizeBudget = InitializationMapMemoryBudget()
+        let reserved = try sizeBudget.maximumBytesForNextMap()
+        XCTAssertThrowsError(
+            try sizeBudget.commit(
+                byteCount: Int(reserved) + 1,
+                reservedMaximumBytes: reserved
+            )
+        )
+        XCTAssertEqual(sizeBudget.committedBytes, 0)
+        XCTAssertEqual(sizeBudget.committedMapCount, 0)
+    }
+}
+
+final class SegmentMediaMemoryBudgetTests: XCTestCase {
+    func testAggregateBoundaryAndReleaseAreFailClosed() async throws {
+        let budget = SegmentMediaMemoryBudget()
+        let half = SegmentMediaMemoryBudget.maximumInFlightBytes / 2
+
+        let firstOptional = try await budget.tryClaim(byteCount: half)
+        let first = try XCTUnwrap(firstOptional)
+        let secondOptional = try await budget.tryClaim(byteCount: half)
+        let second = try XCTUnwrap(secondOptional)
+        let exhaustedBytes = await budget.availableBytes
+        XCTAssertEqual(exhaustedBytes, 0)
+        let exhaustedClaim = try await budget.tryClaim(byteCount: 1)
+        XCTAssertNil(exhaustedClaim)
+
+        await budget.release(first)
+        let releasedBytes = await budget.availableBytes
+        XCTAssertEqual(releasedBytes, half)
+        let replacementOptional = try await budget.tryClaim(byteCount: half)
+        let replacement = try XCTUnwrap(replacementOptional)
+        let reclaimedBytes = await budget.availableBytes
+        XCTAssertEqual(reclaimedBytes, 0)
+
+        await budget.release(second)
+        await budget.release(replacement)
+        let restoredBytes = await budget.availableBytes
+        XCTAssertEqual(
+            restoredBytes,
+            SegmentMediaMemoryBudget.maximumInFlightBytes
+        )
+    }
+
+    func testInvalidClaimDoesNotConsumeCapacity() async throws {
+        let budget = SegmentMediaMemoryBudget()
+        do {
+            _ = try await budget.tryClaim(
+                byteCount: SegmentMediaMemoryBudget.maximumInFlightBytes + 1
+            )
+            XCTFail("oversized memory claim should fail")
+        } catch {
+            // Expected.
+        }
+        let remainingBytes = await budget.availableBytes
+        XCTAssertEqual(
+            remainingBytes,
+            SegmentMediaMemoryBudget.maximumInFlightBytes
+        )
     }
 }
 
@@ -368,6 +511,67 @@ private final class URLProtocolStub: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+final class ProgressiveHTTPDownloadTests: XCTestCase {
+    override func tearDown() {
+        URLProtocolStub.reset()
+        super.tearDown()
+    }
+
+    func testDownloadTaskWritesCompleteProgressiveFileAndEnforcesLimit() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let sourceURL = try XCTUnwrap(URL(string: "https://media.example/movie.mp4"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ProgressiveHTTPDownloadTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let body = Data(repeating: 0x5A, count: 384 * 1_024)
+        URLProtocolStub.handler = { request in
+            (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "Content-Type": "video/mp4",
+                        "Content-Length": String(body.count)
+                    ]
+                )!,
+                body
+            )
+        }
+
+        let successfulURL = directory.appendingPathComponent("success.media")
+        let result = try await client.downloadProgressiveMedia(
+            sourceURL,
+            to: successfulURL,
+            referer: nil,
+            maximumBytes: Int64(body.count + 1)
+        )
+        XCTAssertEqual(result.byteCount, Int64(body.count))
+        XCTAssertEqual(try Data(contentsOf: successfulURL), body)
+
+        let rejectedURL = directory.appendingPathComponent("rejected.media")
+        do {
+            _ = try await client.downloadProgressiveMedia(
+                sourceURL,
+                to: rejectedURL,
+                referer: nil,
+                maximumBytes: Int64(body.count - 1)
+            )
+            XCTFail("A response above the hard download limit must be cancelled")
+        } catch let error as HLSError {
+            guard case .network = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rejectedURL.path))
+    }
 }
 
 final class SourceResolverFallbackTests: XCTestCase {

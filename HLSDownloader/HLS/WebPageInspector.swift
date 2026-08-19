@@ -36,22 +36,42 @@ struct DynamicMediaReference: Sendable {
     }
 }
 
+struct DynamicBlobReference: Sendable {
+    let capturedContentID: UUID
+    let blobURL: URL
+    let fileURL: URL
+    let byteCount: Int
+    let mimeType: String?
+    let kind: MediaCandidateKind
+    let pageURL: URL
+    let title: String?
+    let iframeDepth: Int
+    let frameToken: String?
+    let sequence: Int
+}
+
 struct DynamicPageInspection: @unchecked Sendable {
     let media: [DynamicMediaReference]
+    let blobs: [DynamicBlobReference]
     let cookies: [HTTPCookie]
     let licenseRequests: [DynamicLicenseReference]
     let detectedWidevineKeySystem: Bool
+    let detectedMediaSource: Bool
 
     init(
         media: [DynamicMediaReference],
+        blobs: [DynamicBlobReference] = [],
         cookies: [HTTPCookie],
         licenseRequests: [DynamicLicenseReference] = [],
-        detectedWidevineKeySystem: Bool = false
+        detectedWidevineKeySystem: Bool = false,
+        detectedMediaSource: Bool = false
     ) {
         self.media = media
+        self.blobs = blobs
         self.cookies = cookies
         self.licenseRequests = licenseRequests
         self.detectedWidevineKeySystem = detectedWidevineKeySystem
+        self.detectedMediaSource = detectedMediaSource
     }
 
     static let empty = DynamicPageInspection(media: [], cookies: [])
@@ -60,6 +80,7 @@ struct DynamicPageInspection: @unchecked Sendable {
 private func observedCookieURLs(
     rootURL: URL,
     media: [DynamicMediaReference],
+    blobs: [DynamicBlobReference] = [],
     licenseRequests: [DynamicLicenseReference],
     additionalPageURLs: [URL]
 ) -> [URL] {
@@ -68,6 +89,7 @@ private func observedCookieURLs(
     let candidates = [rootURL]
         + additionalPageURLs
         + media.flatMap { [$0.pageURL, $0.url] }
+        + blobs.map(\.pageURL)
         + licenseRequests.flatMap { [$0.pageURL, $0.url] }
     for url in candidates {
         guard let scheme = url.scheme?.lowercased(),
@@ -159,6 +181,464 @@ enum PlaybackProbePayloadParser {
 }
 
 @MainActor
+final class WebBlobCaptureStore {
+    private struct ActiveCapture {
+        let capturedContentID: UUID
+        let blobURL: URL
+        let fileURL: URL
+        let expectedByteCount: Int
+        let mimeType: String?
+        let pageURL: URL
+        let title: String?
+        let iframeDepth: Int
+        let frameToken: String?
+        let sequence: Int
+        let handle: FileHandle
+        var writtenByteCount: Int
+        var prefix: Data
+    }
+
+    private static let maximumBlobBytes = 512 * 1_024 * 1_024
+    private static let maximumSessionBytes = 1_024 * 1_024 * 1_024
+    private static let maximumChunkBytes = 256 * 1_024
+    private static let maximumActiveCaptures = 4
+    private static let maximumCompletedCaptures = 32
+    private static let maximumManifestBytes = 1_048_576
+    private static let prefixBytes = 262_144
+    private static let cleanupOnce: Void = { WebBlobCaptureStore.cleanupStaleCaptures() }()
+
+    private let sessionDirectory: URL?
+    private let maximumCaptureStorageBytes: Int
+    private var active: [String: ActiveCapture] = [:]
+    private(set) var completed: [DynamicBlobReference] = []
+    private var reservedSessionBytes = 0
+
+    init(storageBudgetOverride: Int? = nil) {
+        _ = Self.cleanupOnce
+        let directory = try? Self.makeSessionDirectory()
+        sessionDirectory = directory
+        if let storageBudgetOverride {
+            maximumCaptureStorageBytes = min(
+                Self.maximumSessionBytes,
+                max(storageBudgetOverride, 0)
+            )
+        } else if let directory,
+                  let volumeMaximum = try? LocalFFmpegOutputLimit.maximumBytes(
+                    for: directory.appendingPathComponent(".blob-storage-budget")
+                  ) {
+            maximumCaptureStorageBytes = min(
+                Self.maximumSessionBytes,
+                Int(clamping: volumeMaximum)
+            )
+        } else {
+            maximumCaptureStorageBytes = 0
+        }
+    }
+
+    var hasActiveCaptures: Bool { !active.isEmpty }
+
+    func handle(
+        body: [String: Any],
+        pageURL: URL,
+        iframeDepth: Int,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) -> DynamicBlobReference? {
+        guard let eventKind = body["eventKind"] as? String,
+              let identifier = normalizedIdentifier(body["id"] as? String) else {
+            replyHandler(nil, "invalid blob message")
+            return nil
+        }
+
+        do {
+            switch eventKind {
+            case "blobStart":
+                try start(
+                    identifier: identifier,
+                    body: body,
+                    pageURL: pageURL,
+                    iframeDepth: iframeDepth
+                )
+                replyHandler(true, nil)
+                return nil
+
+            case "blobChunk":
+                try append(identifier: identifier, body: body)
+                replyHandler(true, nil)
+                return nil
+
+            case "blobFinish":
+                let reference = try finish(identifier: identifier)
+                replyHandler(reference != nil, nil)
+                return reference
+
+            case "blobAbort":
+                abort(identifier: identifier)
+                replyHandler(true, nil)
+                return nil
+
+            default:
+                replyHandler(nil, "unsupported blob message")
+                return nil
+            }
+        } catch {
+            abort(identifier: identifier)
+            replyHandler(nil, "blob capture rejected")
+            return nil
+        }
+    }
+
+    func waitForIdle(maximumNanoseconds: UInt64) async {
+        let started = DispatchTime.now().uptimeNanoseconds
+        while !active.isEmpty,
+              DispatchTime.now().uptimeNanoseconds - started < maximumNanoseconds {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if !active.isEmpty { cancelActiveCaptures() }
+    }
+
+    func cancelActiveCaptures() {
+        let captures = active.values
+        active.removeAll(keepingCapacity: false)
+        for capture in captures {
+            try? capture.handle.close()
+            try? FileManager.default.removeItem(at: capture.fileURL)
+            releaseReservation(for: capture)
+        }
+    }
+
+    nonisolated static func isManagedCaptureURL(_ url: URL) -> Bool {
+        guard url.isFileURL,
+              let rootURL = try? capturesRoot() else {
+            return false
+        }
+        let root = rootURL.resolvingSymlinksInPath()
+        let candidate = url.resolvingSymlinksInPath()
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return candidate.path.hasPrefix(rootPath)
+    }
+
+    /// Deletes one consumed or abandoned capture and then its empty session
+    /// directory. The exact two-level path is revalidated beneath the fixed
+    /// cache root; symlinks and broader directories are never removed.
+    nonisolated static func discardCaptureFile(at url: URL) {
+        guard url.isFileURL,
+              let rootURL = try? capturesRoot() else { return }
+        let root = rootURL.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = url.standardizedFileURL
+        let parent = candidate.deletingLastPathComponent().resolvingSymlinksInPath()
+        guard parent.deletingLastPathComponent() == root,
+              candidate.deletingLastPathComponent().standardizedFileURL == parent.standardizedFileURL,
+              let values = try? candidate.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            return
+        }
+        try? FileManager.default.removeItem(at: candidate)
+
+        guard let remaining = try? FileManager.default.contentsOfDirectory(
+            at: parent,
+            includingPropertiesForKeys: nil,
+            options: []
+        ),
+        remaining.isEmpty,
+        let parentValues = try? parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ),
+        parentValues.isDirectory == true,
+        parentValues.isSymbolicLink != true else {
+            return
+        }
+        try? FileManager.default.removeItem(at: parent)
+    }
+
+    private func start(
+        identifier: String,
+        body: [String: Any],
+        pageURL: URL,
+        iframeDepth: Int
+    ) throws {
+        guard active[identifier] == nil,
+              active.count < Self.maximumActiveCaptures,
+              completed.count < Self.maximumCompletedCaptures,
+              let sessionDirectory,
+              let rawBlobURL = body["url"] as? String,
+              rawBlobURL.utf8.count <= 8_192,
+              let blobURL = URL(string: rawBlobURL),
+              blobURL.scheme?.lowercased() == "blob",
+              let sizeValue = body["size"] as? NSNumber,
+              sizeValue.int64Value > 0,
+              sizeValue.int64Value <= Int64(Self.maximumBlobBytes),
+              sizeValue.int64Value <= Int64(Int.max) else {
+            throw HLSError.invalidMediaPayload(
+                stream: "blob",
+                number: 1,
+                mimeType: nil,
+                byteCount: 0,
+                signature: "invalid-start"
+            )
+        }
+        let expectedByteCount = Int(sizeValue.int64Value)
+        guard reservedSessionBytes < maximumCaptureStorageBytes,
+              expectedByteCount < maximumCaptureStorageBytes - reservedSessionBytes else {
+            throw HLSError.network("blob capture session limit exceeded")
+        }
+
+        let fileURL = sessionDirectory.appendingPathComponent(
+            "capture-\(UUID().uuidString).media",
+            isDirectory: false
+        )
+        let created = FileManager.default.createFile(
+            atPath: fileURL.path,
+            contents: Data(),
+            attributes: [.protectionKey: FileProtectionType.completeUnlessOpen]
+        )
+        guard created else { throw HLSError.network("blob capture file could not be created") }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forWritingTo: fileURL)
+        } catch {
+            try? FileManager.default.removeItem(at: fileURL)
+            throw error
+        }
+        let mimeType = normalizedMIMEType(body["mimeType"] as? String)
+        let title = normalizedText(body["title"] as? String, maximumLength: 256)
+        active[identifier] = ActiveCapture(
+            capturedContentID: UUID(),
+            blobURL: blobURL,
+            fileURL: fileURL,
+            expectedByteCount: expectedByteCount,
+            mimeType: mimeType,
+            pageURL: pageURL,
+            title: title,
+            iframeDepth: max(iframeDepth, 0),
+            frameToken: PlaybackProbePayloadParser.normalizedFrameToken(body["frameToken"] as? String),
+            sequence: max((body["sequence"] as? NSNumber)?.intValue ?? 0, 0),
+            handle: handle,
+            writtenByteCount: 0,
+            prefix: Data()
+        )
+        reservedSessionBytes += expectedByteCount
+    }
+
+    private func append(identifier: String, body: [String: Any]) throws {
+        guard var capture = active[identifier],
+              let offsetValue = body["offset"] as? NSNumber,
+              offsetValue.int64Value >= 0,
+              offsetValue.int64Value <= Int64(Int.max),
+              Int(offsetValue.int64Value) == capture.writtenByteCount,
+              let encoded = body["data"] as? String,
+              encoded.utf8.count <= ((Self.maximumChunkBytes + 2) / 3) * 4 + 8,
+              let data = Data(base64Encoded: encoded),
+              !data.isEmpty,
+              data.count <= Self.maximumChunkBytes,
+              capture.writtenByteCount <= capture.expectedByteCount - data.count else {
+            throw HLSError.network("invalid blob capture chunk")
+        }
+        try capture.handle.write(contentsOf: data)
+        let updatedByteCount = capture.writtenByteCount + data.count
+        let actualOffset = try capture.handle.offset()
+        guard actualOffset == UInt64(updatedByteCount),
+              updatedByteCount <= capture.expectedByteCount,
+              updatedByteCount < maximumCaptureStorageBytes else {
+            throw HLSError.network("blob capture exceeded its storage budget")
+        }
+        if capture.prefix.count < Self.prefixBytes {
+            capture.prefix.append(
+                contentsOf: data.prefix(Self.prefixBytes - capture.prefix.count)
+            )
+        }
+        capture.writtenByteCount = updatedByteCount
+        active[identifier] = capture
+    }
+
+    private func finish(identifier: String) throws -> DynamicBlobReference? {
+        guard let capture = active.removeValue(forKey: identifier) else {
+            throw HLSError.network("unknown blob capture")
+        }
+        do {
+            try capture.handle.close()
+            let values = try capture.fileURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            guard capture.writtenByteCount == capture.expectedByteCount,
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  values.fileSize == capture.expectedByteCount,
+                  capture.expectedByteCount < maximumCaptureStorageBytes else {
+                throw HLSError.network("incomplete blob capture")
+            }
+            let kind: MediaCandidateKind?
+            let signature = MediaPayloadInspector.signature(capture.prefix)
+            if signature == "m3u8", capture.expectedByteCount <= Self.maximumManifestBytes {
+                kind = .hls
+            } else if capture.expectedByteCount <= Self.maximumManifestBytes,
+                      let text = String(data: capture.prefix, encoding: .utf8),
+                      text.range(of: #"<MPD(?:\s|>)"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                kind = .widevineDASH
+            } else if let container = ProgressiveMediaDetector.detect(
+                prefix: capture.prefix,
+                url: capture.blobURL,
+                mimeType: capture.mimeType
+            ), ProgressiveMediaDetector.supportsStandaloneDownload(container) {
+                kind = .progressive
+            } else {
+                kind = nil
+            }
+
+            guard let kind else {
+                try? FileManager.default.removeItem(at: capture.fileURL)
+                releaseReservation(for: capture)
+                return nil
+            }
+            let reference = DynamicBlobReference(
+                capturedContentID: capture.capturedContentID,
+                blobURL: capture.blobURL,
+                fileURL: capture.fileURL,
+                byteCount: capture.expectedByteCount,
+                mimeType: capture.mimeType,
+                kind: kind,
+                pageURL: capture.pageURL,
+                title: capture.title,
+                iframeDepth: capture.iframeDepth,
+                frameToken: capture.frameToken,
+                sequence: capture.sequence
+            )
+            completed.append(reference)
+            return reference
+        } catch {
+            try? capture.handle.close()
+            try? FileManager.default.removeItem(at: capture.fileURL)
+            releaseReservation(for: capture)
+            throw error
+        }
+    }
+
+    private func abort(identifier: String) {
+        guard let capture = active.removeValue(forKey: identifier) else { return }
+        try? capture.handle.close()
+        try? FileManager.default.removeItem(at: capture.fileURL)
+        releaseReservation(for: capture)
+    }
+
+    private func releaseReservation(for capture: ActiveCapture) {
+        // Keep completed captures charged to the per-session limit while their
+        // files remain available, but immediately return failed/aborted active
+        // reservations. Clamp defensively so malformed duplicate teardown can
+        // never underflow the quota counter.
+        if capture.expectedByteCount >= reservedSessionBytes {
+            reservedSessionBytes = 0
+        } else {
+            reservedSessionBytes -= capture.expectedByteCount
+        }
+    }
+
+    private func normalizedIdentifier(_ value: String?) -> String? {
+        guard let value,
+              !value.isEmpty,
+              value.count <= 64,
+              value.unicodeScalars.allSatisfy({
+                CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+                    .contains($0)
+              }) else {
+            return nil
+        }
+        return value
+    }
+
+    private func normalizedMIMEType(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value
+            .split(separator: ";", maxSplits: 1)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        guard !normalized.isEmpty,
+              normalized.utf8.count <= 127,
+              normalized.unicodeScalars.allSatisfy({
+                CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789!#$&^_.+-/")
+                    .contains($0)
+              }) else {
+            return nil
+        }
+        return normalized
+    }
+
+    private func normalizedText(_ value: String?, maximumLength: Int) -> String? {
+        guard let value else { return nil }
+        let collapsed = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else { return nil }
+        return String(collapsed.prefix(maximumLength))
+    }
+
+    nonisolated private static func capturesRoot() throws -> URL {
+        guard let caches = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw HLSError.network("blob capture cache is unavailable")
+        }
+        return caches.appendingPathComponent("HLSBlobCaptures", isDirectory: true)
+    }
+
+    private static func makeSessionDirectory() throws -> URL {
+        let root = try capturesRoot()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutable = directory
+        try? mutable.setResourceValues(values)
+        return directory
+    }
+
+    private static func cleanupStaleCaptures() {
+        guard let root = try? capturesRoot(),
+              let children = try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return
+        }
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        for child in children {
+            guard let values = try? child.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
+            ),
+            values.isDirectory == true,
+            values.isSymbolicLink != true,
+            (values.contentModificationDate ?? .distantFuture) < cutoff else {
+                continue
+            }
+            try? FileManager.default.removeItem(at: child)
+        }
+    }
+}
+
+@MainActor
+private final class BlobCaptureScriptBridge: NSObject, WKScriptMessageHandlerWithReply {
+    var handler: ((WKScriptMessage, @escaping (Any?, String?) -> Void) -> Void)?
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        guard let handler else {
+            replyHandler(nil, "blob capture unavailable")
+            return
+        }
+        handler(message, replyHandler)
+    }
+}
+
+@MainActor
 protocol DynamicPageInspecting: AnyObject, Sendable {
     func inspect(url: URL, seedCookies: [HTTPCookie]) async -> DynamicPageInspection
 }
@@ -209,6 +689,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     }
 
     private static let messageName = "hlsDiscovery"
+    private static let blobMessageName = "hlsBlobExport"
     private static let maximumMessages = 512
     private static let maximumRawMessages = 4_096
     private static let maximumURLLength = 8_192
@@ -224,7 +705,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     // and app launches. Cookie expiry and SameSite/Secure semantics remain
     // controlled by WebKit and the origin server.
     private let websiteDataStore = WKWebsiteDataStore.default()
+    private let blobCaptureStore = WebBlobCaptureStore()
     private var webView: WKWebView?
+    private var blobScriptBridge: BlobCaptureScriptBridge?
     private var continuation: CheckedContinuation<DynamicPageInspection, Never>?
     private var hardTimeoutTask: Task<Void, Never>?
     private var settleTask: Task<Void, Never>?
@@ -245,6 +728,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
     private var licenseRequests: [DynamicLicenseReference] = []
     private var licenseRequestKeys = Set<String>()
     private var detectedWidevineKeySystem = false
+    private var detectedMediaSource = false
     private var navigationContexts: [String: (pageURL: URL, iframeDepth: Int)] = [:]
     private var pendingFinishReason: FinishReason = .settled
 
@@ -282,6 +766,20 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             self,
             contentWorld: .page,
             name: Self.messageName
+        )
+        let blobScriptBridge = BlobCaptureScriptBridge()
+        blobScriptBridge.handler = { [weak self] message, replyHandler in
+            guard let self else {
+                replyHandler(nil, "blob capture unavailable")
+                return
+            }
+            self.receiveBlobMessage(message, replyHandler: replyHandler)
+        }
+        self.blobScriptBridge = blobScriptBridge
+        contentController.addScriptMessageHandler(
+            blobScriptBridge,
+            contentWorld: .page,
+            name: Self.blobMessageName
         )
         contentController.addUserScript(
             WKUserScript(
@@ -357,6 +855,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             return
         }
         isFinishing = true
+        await blobCaptureStore.waitForIdle(maximumNanoseconds: 10_000_000_000)
         hardTimeoutTask?.cancel()
         settleTask?.cancel()
         hardTimeoutTask = nil
@@ -370,30 +869,48 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 forName: Self.messageName,
                 contentWorld: .page
             )
+            webView.configuration.userContentController.removeScriptMessageHandler(
+                forName: Self.blobMessageName,
+                contentWorld: .page
+            )
             webView.configuration.userContentController.removeAllUserScripts()
         }
+        blobScriptBridge?.handler = nil
+        blobScriptBridge = nil
         webView = nil
 
         let media = referenceOrder.compactMap { references[$0] }
+        let completedBlobs: [DynamicBlobReference]
+        if reason == .cancelled {
+            for blob in blobCaptureStore.completed {
+                WebBlobCaptureStore.discardCaptureFile(at: blob.fileURL)
+            }
+            completedBlobs = []
+        } else {
+            completedBlobs = blobCaptureStore.completed
+        }
         let cookies = await cookies(
             matching: observedCookieURLs(
                 rootURL: rootURL,
                 media: media,
+                blobs: completedBlobs,
                 licenseRequests: licenseRequests,
                 additionalPageURLs: navigationContexts.values.map { $0.pageURL }
                     + [currentPageURL].compactMap { $0 }
             )
         )
         log(
-            "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
+            "finish reason=\(reason.rawValue) rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(media.count) blobs=\(completedBlobs.count) mse=\(detectedMediaSource) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) rawLimit=\(rawMessageLimitReached) referenceLimit=\(referenceLimitReached) cookies=\(cookies.count)"
         )
         self.continuation = nil
         continuation.resume(
             returning: DynamicPageInspection(
                 media: media,
+                blobs: completedBlobs,
                 cookies: cookies,
                 licenseRequests: licenseRequests,
-                detectedWidevineKeySystem: detectedWidevineKeySystem
+                detectedWidevineKeySystem: detectedWidevineKeySystem,
+                detectedMediaSource: detectedMediaSource
             )
         )
     }
@@ -578,6 +1095,10 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         message: WKScriptMessage
     ) -> Bool {
         switch body["eventKind"] as? String {
+        case "mediaSource":
+            detectedMediaSource = true
+            scheduleSettle()
+            return true
         case "widevineEME":
             if !detectedWidevineKeySystem {
                 detectedWidevineKeySystem = true
@@ -625,6 +1146,27 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         default:
             return false
         }
+    }
+
+    private func receiveBlobMessage(
+        _ message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        guard message.name == Self.blobMessageName,
+              let body = message.body as? [String: Any],
+              PlaybackProbePayloadParser.hasValidNonce(body, expected: messageNonce),
+              let pageURL = trustedFrameURL(from: message.frameInfo),
+              AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: pageURL) else {
+            invalidMessageCount += 1
+            replyHandler(nil, "blob capture rejected")
+            return
+        }
+        _ = blobCaptureStore.handle(
+            body: body,
+            pageURL: pageURL,
+            iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
+            replyHandler: replyHandler
+        )
     }
 
     private func recordReference(
@@ -704,6 +1246,12 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             || mimeType.contains("audio/x-mpegurl") {
             return .hls
         }
+        if mimeType.hasPrefix("video/")
+            || mimeType.hasPrefix("audio/")
+            || mimeType.contains("application/ogg")
+            || mimeType.contains("application/mp4") {
+            return .progressive
+        }
         return nil
     }
 
@@ -711,6 +1259,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         switch url.pathExtension.lowercased() {
         case "m3u8": return .hls
         case "mpd": return .widevineDASH
+        case "mp4", "mov", "m4v", "m4a", "mp3", "aac", "ac3", "eac3", "ec3",
+             "ogg", "oga", "opus", "wav", "flac", "ts", "m2t", "m2ts", "mts", "webm":
+            return .progressive
         default: return nil
         }
     }
@@ -782,6 +1333,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       const interactive = __HLS_DOWNLOADER_INTERACTIVE__;
       const probeNonce = '__HLS_DOWNLOADER_MESSAGE_NONCE__';
       const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hlsDiscovery;
+      const blobHandler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hlsBlobExport;
       if (!handler) return;
       const frameToken = (() => {
         try {
@@ -813,9 +1365,18 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       let emeMessageSignalUntil = 0;
       let emeMessageBytes = null;
       let emeMessageBase64 = '';
+      let mediaSourcePosted = false;
+      let blobSequence = 0;
+      const maximumCapturedBlobBytes = 512 * 1024 * 1024;
+      const blobChunkBytes = 256 * 1024;
+      const blobPrefixBytes = 256 * 1024;
       const hlsType = value => /(?:application|audio)\/(?:vnd\.apple\.mpegurl|x-mpegurl|mpegurl)/i.test(value || '');
       const dashType = value => /application\/dash\+xml/i.test(value || '');
-      const typeKind = value => dashType(value) ? 'widevineDASH' : (hlsType(value) ? 'hls' : '');
+      const progressiveType = value => /^(?:video|audio)\//i.test(String(value || '').trim())
+        || /^(?:application\/(?:ogg|mp4))\b/i.test(String(value || '').trim());
+      const typeKind = value => dashType(value)
+        ? 'widevineDASH'
+        : (hlsType(value) ? 'hls' : (progressiveType(value) ? 'progressive' : ''));
       const decode = value => String(value == null ? '' : value)
         .replace(/\\\//g, '/')
         .replace(/\\u002f/gi, '/')
@@ -843,17 +1404,22 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       const post = (value, kind, poster, title, forcedManifestKind, baseURL) => {
         const url = absolute(value, baseURL);
         if (!url || !/^https?:/i.test(url)) return;
+        const normalizedKind = kind || 'runtime';
+        const progressiveSuffix = /\.(?:mp4|mov|m4v|m4a|mp3|aac|ac3|eac3|ec3|ogg|oga|opus|wav|flac|ts|m2t|m2ts|mts|webm)(?:$|[?#])/i.test(url);
         const inferredManifestKind = /\.mpd(?:$|[?#])/i.test(url)
           ? 'widevineDASH'
-          : (/\.m3u8(?:$|[?#])/i.test(url) ? 'hls' : '');
-        const hintedManifestKind = forcedManifestKind === 'widevineDASH' || forcedManifestKind === 'hls'
+          : (/\.m3u8(?:$|[?#])/i.test(url)
+            ? 'hls'
+            : (progressiveSuffix && normalizedKind !== 'network' ? 'progressive' : ''));
+        const hintedManifestKind = forcedManifestKind === 'widevineDASH'
+          || forcedManifestKind === 'hls'
+          || (forcedManifestKind === 'progressive' && normalizedKind !== 'network')
           ? forcedManifestKind
           : '';
         const fallbackManifestKind = forcedManifestKind === 'hlsFallback' ? 'hls' : '';
         const manifestKind = hintedManifestKind || inferredManifestKind || fallbackManifestKind;
         if (!manifestKind) return;
         if (manifestKind === 'widevineDASH') widevineManifestObserved = true;
-        const normalizedKind = kind || 'runtime';
         const normalizedPoster = absolute(poster || pagePoster() || '') || '';
         const normalizedTitle = String(title || document.title || '').slice(0, 256);
         const key = `${normalizedKind}\n${manifestKind}\n${url}`;
@@ -878,6 +1444,148 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
           });
         } catch (_) {}
       };
+      const postMediaSourceSignal = () => {
+        if (mediaSourcePosted) return;
+        mediaSourcePosted = true;
+        try {
+          handler.postMessage({
+            nonce: probeNonce,
+            eventKind: 'mediaSource',
+            frameToken,
+            sequence: nextSequence()
+          });
+        } catch (_) {}
+      };
+      const hasBytes = (bytes, offset, expected) => {
+        if (!bytes || offset < 0 || offset + expected.length > bytes.length) return false;
+        for (let index = 0; index < expected.length; index += 1) {
+          if (bytes[offset + index] !== expected[index]) return false;
+        }
+        return true;
+      };
+      const looksLikeTransportStream = bytes => {
+        for (const packetSize of [188, 192, 204]) {
+          const maximumOffset = Math.min(packetSize - 1, Math.max(bytes.length - 1, 0));
+          for (let offset = 0; offset <= maximumOffset; offset += 1) {
+            if (bytes[offset] === 0x47
+                && bytes[offset + packetSize] === 0x47
+                && bytes[offset + packetSize * 2] === 0x47) return true;
+          }
+        }
+        return false;
+      };
+      const classifyBlobPrefix = (bytes, mimeType) => {
+        const mime = String(mimeType || '').split(';', 1)[0].trim().toLowerCase();
+        let text = '';
+        try { text = new TextDecoder('utf-8').decode(bytes.subarray(0, Math.min(bytes.length, 64 * 1024))); }
+        catch (_) {}
+        if (/^\s*#EXTM3U/i.test(text)) return 'hls';
+        if (/<MPD(?:\s|>)/i.test(text)) return 'widevineDASH';
+        if (hasBytes(bytes, 0, [0x1a, 0x45, 0xdf, 0xa3])) return 'progressive';
+        if (hasBytes(bytes, 0, [0x4f, 0x67, 0x67, 0x53])) return 'progressive';
+        if (hasBytes(bytes, 0, [0x66, 0x4c, 0x61, 0x43])) return 'progressive';
+        if (hasBytes(bytes, 0, [0x52, 0x49, 0x46, 0x46])
+            && hasBytes(bytes, 8, [0x57, 0x41, 0x56, 0x45])) return 'progressive';
+        if (bytes.length >= 12) {
+          const box = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+          if (['ftyp', 'styp', 'moov', 'moof', 'sidx'].includes(box)) return 'progressive';
+        }
+        if (looksLikeTransportStream(bytes)) return 'progressive';
+        if (hasBytes(bytes, 0, [0x49, 0x44, 0x33])) return 'progressive';
+        if (bytes.length >= 2 && bytes[0] === 0xff
+            && ((bytes[1] & 0xf6) === 0xf0 || (bytes[1] & 0xe0) === 0xe0)) return 'progressive';
+        if (bytes.length >= 2 && bytes[0] === 0x0b && bytes[1] === 0x77) return 'progressive';
+        if (hlsType(mime)) return 'hls';
+        if (dashType(mime)) return 'widevineDASH';
+        if (progressiveType(mime)) return 'progressive';
+        return '';
+      };
+      const exportBlob = async (blob, blobURL) => {
+        if (!blobHandler || !blob || typeof blob.slice !== 'function') return;
+        const size = Number(blob.size) || 0;
+        if (size <= 0 || size > maximumCapturedBlobBytes) return;
+        let prefix;
+        try {
+          prefix = new Uint8Array(
+            await blob.slice(0, Math.min(size, blobPrefixBytes)).arrayBuffer()
+          );
+        } catch (_) { return; }
+        if (!classifyBlobPrefix(prefix, blob.type)) return;
+        blobSequence = blobSequence >= 2147483646 ? 1 : blobSequence + 1;
+        const identifier = `${frameToken}-${blobSequence}`.slice(0, 64);
+        const common = {
+          nonce: probeNonce,
+          id: identifier,
+          url: String(blobURL || '').slice(0, 8192),
+          mimeType: String(blob.type || '').slice(0, 127),
+          size,
+          title: String(document.title || '').slice(0, 256),
+          frameToken,
+          sequence: nextSequence()
+        };
+        try {
+          await blobHandler.postMessage({ ...common, eventKind: 'blobStart' });
+          for (let offset = 0; offset < size; offset += blobChunkBytes) {
+            const buffer = await blob.slice(offset, Math.min(size, offset + blobChunkBytes)).arrayBuffer();
+            const encoded = base64FromBytes(new Uint8Array(buffer));
+            if (!encoded) throw new Error('blob encoding failed');
+            await blobHandler.postMessage({
+              nonce: probeNonce,
+              eventKind: 'blobChunk',
+              id: identifier,
+              offset,
+              data: encoded
+            });
+          }
+          await blobHandler.postMessage({
+            nonce: probeNonce,
+            eventKind: 'blobFinish',
+            id: identifier
+          });
+        } catch (_) {
+          try {
+            await blobHandler.postMessage({
+              nonce: probeNonce,
+              eventKind: 'blobAbort',
+              id: identifier
+            });
+          } catch (_) {}
+        }
+      };
+      const isMediaSourceObject = value => {
+        if (!value) return false;
+        try {
+          if (typeof MediaSource !== 'undefined' && value instanceof MediaSource) return true;
+          if (typeof ManagedMediaSource !== 'undefined' && value instanceof ManagedMediaSource) return true;
+        } catch (_) {}
+        return /MediaSource(?:Handle)?/.test(String(value.constructor && value.constructor.name || ''));
+      };
+      try {
+        const originalCreateObjectURL = URL.createObjectURL;
+        if (typeof originalCreateObjectURL === 'function') {
+          URL.createObjectURL = function(value) {
+            const result = Reflect.apply(originalCreateObjectURL, this, [value]);
+            try {
+              if (typeof Blob !== 'undefined' && value instanceof Blob) {
+                void exportBlob(value, result);
+              } else if (isMediaSourceObject(value)) {
+                postMediaSourceSignal();
+              }
+            } catch (_) {}
+            return result;
+          };
+        }
+      } catch (_) {}
+      try {
+        const mediaSourcePrototype = self.MediaSource && self.MediaSource.prototype;
+        const originalAddSourceBuffer = mediaSourcePrototype && mediaSourcePrototype.addSourceBuffer;
+        if (typeof originalAddSourceBuffer === 'function') {
+          mediaSourcePrototype.addSourceBuffer = function(...args) {
+            postMediaSourceSignal();
+            return Reflect.apply(originalAddSourceBuffer, this, args);
+          };
+        }
+      } catch (_) {}
       const postWidevineEMESignal = () => {
         widevineKeySystemRequested = true;
         if (widevineEMEPosted) return;
@@ -1179,7 +1887,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             });
           document.querySelectorAll('script:not([src])').forEach(script => {
             const text = script.textContent || '';
-            const matches = text.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>`]*)?/gi) || [];
+            const matches = text.match(/(?:https?:)?(?:\\?\/\\?\/|\.{0,2}\/)?[^\s\"'<>`]+?\.(?:m3u8|mpd|mp4|mov|m4v|m4a|mp3|aac|ac3|eac3|ec3|ogg|oga|opus|wav|flac|ts|m2t|m2ts|mts|webm)(?:\?[^\s\"'<>`]*)?/gi) || [];
             matches.slice(0, 64).forEach(value => post(value, 'script', '', document.title, false));
           });
           if (window.performance && performance.getEntriesByType) {
@@ -1314,6 +2022,7 @@ private final class PlaybackCaptureScriptBridge: NSObject, WKScriptMessageHandle
 @MainActor
 final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDelegate {
     private static let messageName = "hlsDiscovery"
+    private static let blobMessageName = "hlsBlobExport"
     private static let maximumReferences = 512
     private static let maximumRawMessages = 4_096
     private static let maximumURLLength = 8_192
@@ -1324,6 +2033,8 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
     @Published private(set) var references: [DynamicMediaReference] = []
     @Published private(set) var licenseRequests: [DynamicLicenseReference] = []
     @Published private(set) var detectedWidevineKeySystem = false
+    @Published private(set) var detectedMediaSource = false
+    @Published private(set) var capturedBlobCount = 0
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
     @Published private(set) var currentURL: URL?
@@ -1336,7 +2047,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
     private let messageNonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     private let websiteDataStore: WKWebsiteDataStore
     private let contentController: WKUserContentController
+    private let blobCaptureStore = WebBlobCaptureStore()
     private var scriptBridge: PlaybackCaptureScriptBridge?
+    private var blobScriptBridge: BlobCaptureScriptBridge?
     private var startupTask: Task<Void, Never>?
     private var isStopping = false
     private var stoppedSnapshot: DynamicPageInspection?
@@ -1403,6 +2116,20 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             contentWorld: .page,
             name: Self.messageName
         )
+        let blobScriptBridge = BlobCaptureScriptBridge()
+        blobScriptBridge.handler = { [weak self] message, replyHandler in
+            guard let self else {
+                replyHandler(nil, "blob capture unavailable")
+                return
+            }
+            self.receiveBlobMessage(message, replyHandler: replyHandler)
+        }
+        self.blobScriptBridge = blobScriptBridge
+        contentController.addScriptMessageHandler(
+            blobScriptBridge,
+            contentWorld: .page,
+            name: Self.blobMessageName
+        )
         webView.customUserAgent = HTTPClient.userAgent
         webView.navigationDelegate = self
         currentURL = url
@@ -1465,6 +2192,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         }
 
         isStopping = true
+        await blobCaptureStore.waitForIdle(maximumNanoseconds: 30_000_000_000)
         startupTask?.cancel()
         startupTask = nil
         webView.stopLoading()
@@ -1472,6 +2200,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             matching: observedCookieURLs(
                 rootURL: rootURL,
                 media: references,
+                blobs: blobCaptureStore.completed,
                 licenseRequests: licenseRequests,
                 additionalPageURLs: navigationContexts.values.map { $0.pageURL }
                     + [currentURL, webView.url].compactMap { $0 }
@@ -1479,14 +2208,16 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         )
         let snapshot = DynamicPageInspection(
             media: references,
+            blobs: blobCaptureStore.completed,
             cookies: cookies,
             licenseRequests: licenseRequests,
-            detectedWidevineKeySystem: detectedWidevineKeySystem
+            detectedWidevineKeySystem: detectedWidevineKeySystem,
+            detectedMediaSource: detectedMediaSource
         )
         stoppedSnapshot = snapshot
         cleanup()
         log(
-            "capture finish rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(references.count) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) blockedReferences=\(blockedReferenceCount) cookies=\(cookies.count)"
+            "capture finish rawMessages=\(rawMessageCount) invalid=\(invalidMessageCount) duplicates=\(duplicateReferenceCount) accepted=\(references.count) blobs=\(blobCaptureStore.completed.count) mse=\(detectedMediaSource) licenseMetadata=\(licenseRequests.count) widevineEME=\(detectedWidevineKeySystem) blockedNavigations=\(blockedNavigationCount) blockedReferences=\(blockedReferenceCount) cookies=\(cookies.count)"
         )
 
         let waiters = stopWaiters
@@ -1716,6 +2447,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         message: WKScriptMessage
     ) -> Bool {
         switch body["eventKind"] as? String {
+        case "mediaSource":
+            detectedMediaSource = true
+            return true
         case "widevineEME":
             if !detectedWidevineKeySystem {
                 detectedWidevineKeySystem = true
@@ -1764,6 +2498,29 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             return true
         default:
             return false
+        }
+    }
+
+    private func receiveBlobMessage(
+        _ message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        guard message.name == Self.blobMessageName,
+              let body = message.body as? [String: Any],
+              PlaybackProbePayloadParser.hasValidNonce(body, expected: messageNonce),
+              let pageURL = trustedFrameURL(from: message.frameInfo),
+              AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: pageURL) else {
+            invalidMessageCount += 1
+            replyHandler(nil, "blob capture rejected")
+            return
+        }
+        if blobCaptureStore.handle(
+            body: body,
+            pageURL: pageURL,
+            iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
+            replyHandler: replyHandler
+        ) != nil {
+            capturedBlobCount = blobCaptureStore.completed.count
         }
     }
 
@@ -1869,9 +2626,16 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             forName: Self.messageName,
             contentWorld: .page
         )
+        contentController.removeScriptMessageHandler(
+            forName: Self.blobMessageName,
+            contentWorld: .page
+        )
         contentController.removeAllUserScripts()
         scriptBridge?.handler = nil
         scriptBridge = nil
+        blobScriptBridge?.handler = nil
+        blobScriptBridge = nil
+        blobCaptureStore.cancelActiveCaptures()
         updateNavigationState()
     }
 
@@ -1916,6 +2680,12 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             || mimeType.contains("audio/x-mpegurl") {
             return .hls
         }
+        if mimeType.hasPrefix("video/")
+            || mimeType.hasPrefix("audio/")
+            || mimeType.contains("application/ogg")
+            || mimeType.contains("application/mp4") {
+            return .progressive
+        }
         return nil
     }
 
@@ -1923,6 +2693,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         switch url.pathExtension.lowercased() {
         case "m3u8": return .hls
         case "mpd": return .widevineDASH
+        case "mp4", "mov", "m4v", "m4a", "mp3", "aac", "ac3", "eac3", "ec3",
+             "ogg", "oga", "opus", "wav", "flac", "ts", "m2t", "m2ts", "mts", "webm":
+            return .progressive
         default: return nil
         }
     }

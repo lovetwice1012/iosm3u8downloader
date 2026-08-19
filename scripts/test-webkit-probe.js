@@ -10,6 +10,7 @@ assert(template, 'WebKit probe template was not found');
 
 async function runProbe() {
   const messages = [];
+  const blobMessages = [];
   const nonce = '0123456789abcdef0123456789abcdef';
   const listeners = new Map();
 
@@ -29,6 +30,18 @@ async function runProbe() {
     setRequestHeader() {}
     send() {}
     getResponseHeader() { return ''; }
+  }
+
+  class MockMediaSource {
+    addSourceBuffer() { return {}; }
+  }
+
+  class MockURL extends URL {
+    static createObjectURL() {
+      return `blob:https://widevine.sprink.cloud/${Math.random().toString(36).slice(2)}`;
+    }
+
+    static revokeObjectURL() {}
   }
 
   const headers = new Headers();
@@ -52,12 +65,13 @@ async function runProbe() {
     FormData,
     Headers,
     MediaKeySession: MockMediaKeySession,
+    MediaSource: MockMediaSource,
     MutationObserver: class { observe() {} },
     PerformanceObserver: class { observe() {} },
     Request,
     TextDecoder,
     TextEncoder,
-    URL,
+    URL: MockURL,
     URLSearchParams,
     Uint8Array,
     XMLHttpRequest: MockXMLHttpRequest,
@@ -76,6 +90,12 @@ async function runProbe() {
       messageHandlers: {
         hlsDiscovery: {
           postMessage(message) { messages.push(message); }
+        },
+        hlsBlobExport: {
+          async postMessage(message) {
+            blobMessages.push(message);
+            return true;
+          }
         }
       }
     }
@@ -87,6 +107,41 @@ async function runProbe() {
     .replaceAll('__HLS_DOWNLOADER_INTERACTIVE__', 'true')
     .replaceAll('__HLS_DOWNLOADER_MESSAGE_NONCE__', nonce);
   vm.runInNewContext(script, context, { timeout: 2_000 });
+
+  const mp4Bytes = Uint8Array.from([
+    0x00, 0x00, 0x00, 0x10,
+    0x66, 0x74, 0x79, 0x70,
+    0x69, 0x73, 0x6f, 0x6d,
+    0x30, 0x30, 0x30, 0x30
+  ]);
+  const capturedURL = context.URL.createObjectURL(
+    new Blob([mp4Bytes], { type: 'video/mp4' })
+  );
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (blobMessages.some(message => message.eventKind === 'blobFinish')) break;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const blobStart = blobMessages.find(message => message.eventKind === 'blobStart');
+  const blobChunk = blobMessages.find(message => message.eventKind === 'blobChunk');
+  const blobFinish = blobMessages.find(message => message.eventKind === 'blobFinish');
+  assert(blobStart, 'complete Blob capture did not start');
+  assert(blobChunk, 'complete Blob capture did not stream a chunk');
+  assert(blobFinish, 'complete Blob capture did not finish');
+  assert.equal(blobStart.url, capturedURL);
+  assert.equal(blobStart.size, mp4Bytes.byteLength);
+  assert.equal(blobChunk.offset, 0);
+  assert.equal(Buffer.from(blobChunk.data, 'base64').byteLength, mp4Bytes.byteLength);
+  assert(blobMessages.every(message => message.nonce === nonce));
+  assert(!messages.some(message => Object.hasOwn(message, 'data')));
+
+  const mediaSource = new context.MediaSource();
+  context.URL.createObjectURL(mediaSource);
+  mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+  assert.equal(
+    messages.filter(message => message.eventKind === 'mediaSource').length,
+    1,
+    'MSE must be signaled once without exporting SourceBuffer bytes'
+  );
 
   await context.fetch('https://widevine.sprink.cloud/video/manifest.mpd');
   await context.navigator.requestMediaKeySystemAccess('com.widevine.alpha', []);

@@ -11,6 +11,7 @@ final class DownloadViewModel: ObservableObject {
             if normalized != discoveredInput {
                 diagnosticSessionID = nil
                 cancelActiveOperation()
+                discardCapturedFiles(in: candidates)
                 candidates = []
                 thumbnails = [:]
                 attemptedThumbnailIDs = []
@@ -74,7 +75,7 @@ final class DownloadViewModel: ObservableObject {
     func canDownload(_ candidate: HLSCandidate) -> Bool {
         guard !isBusy else { return false }
         switch candidate.kind {
-        case .hls:
+        case .hls, .progressive:
             return true
         case .widevineDASH:
             return isDownloadableWidevineDomain(candidate.playlistURL)
@@ -94,6 +95,7 @@ final class DownloadViewModel: ObservableObject {
         outputURL = nil
         downloadedSegmentCount = 0
         errorMessage = nil
+        discardCapturedFiles(in: candidates)
         candidates = []
         thumbnails = [:]
         attemptedThumbnailIDs = []
@@ -113,8 +115,14 @@ final class DownloadViewModel: ObservableObject {
             guard let self else { return }
             do {
                 let discovery = try await service.discover(input: input)
-                try Task.checkCancellation()
-                guard isCurrentOperation(operationID, input: input) else { return }
+                if Task.isCancelled {
+                    discardCapturedFiles(in: discovery.candidates)
+                    throw HLSError.cancelled
+                }
+                guard isCurrentOperation(operationID, input: input) else {
+                    discardCapturedFiles(in: discovery.candidates)
+                    return
+                }
 
                 if discovery.isDirectPlaylist,
                    let candidate = discovery.candidates.first,
@@ -127,6 +135,7 @@ final class DownloadViewModel: ObservableObject {
                     apply(result)
                 } else {
                     discoveredInput = input
+                    discardCapturedFiles(in: candidates)
                     candidates = discovery.candidates
                     progress = DownloadProgress(phase: .idle, completedItems: 0, totalItems: 0)
                 }
@@ -141,6 +150,8 @@ final class DownloadViewModel: ObservableObject {
     func startPlaybackCapture() {
         guard canStart else { return }
         task?.cancel()
+        discardCapturedFiles(in: candidates)
+        candidates.removeAll(where: { $0.capturedContentID != nil })
         outputURL = nil
         downloadedSegmentCount = 0
         errorMessage = nil
@@ -167,7 +178,8 @@ final class DownloadViewModel: ObservableObject {
                     isPlaybackCapturePresented = true
                     progress = DownloadProgress(phase: .idle, completedItems: 0, totalItems: 0)
                 } else {
-                    _ = await service.finishPlaybackCapture(session)
+                    let abandoned = await service.finishPlaybackCapture(session)
+                    discardCapturedFiles(in: abandoned)
                 }
             } catch {
                 if self.operationID == operationID { handle(error) }
@@ -215,6 +227,9 @@ final class DownloadViewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard isCurrentOperation(operationID, input: input) else { return }
                 apply(result)
+                if candidate.capturedContentID != nil {
+                    candidates.removeAll(where: { $0.id == candidate.id })
+                }
             } catch {
                 if self.operationID == operationID { handle(error) }
             }
@@ -346,8 +361,14 @@ final class DownloadViewModel: ObservableObject {
             if mergingResults, inputStillMatches {
                 mergeCandidates(capturedCandidates)
                 if capturedCandidates.isEmpty, candidates.isEmpty {
-                    errorMessage = "再生通信からHLS / Widevine候補を検出できませんでした。動画を再生してから、もう一度お試しください。"
+                    if session.detectedMediaSource {
+                        errorMessage = "MSEの利用を検出しましたが、元のHLS / DASH manifestまたは完了Blobを取得できませんでした。MSE SourceBuffer単体の保存には対応していません。"
+                    } else {
+                        errorMessage = "再生通信からHLS / Widevine候補を検出できませんでした。動画を再生してから、もう一度お試しください。"
+                    }
                 }
+            } else {
+                discardCapturedFiles(in: capturedCandidates)
             }
 
             if playbackCaptureSession === session {
@@ -367,21 +388,7 @@ final class DownloadViewModel: ObservableObject {
             let identity = candidateIdentity(candidate)
             if let index = candidates.firstIndex(where: { candidateIdentity($0) == identity }) {
                 let existing = candidates[index]
-                candidates[index] = HLSCandidate(
-                    id: existing.id,
-                    kind: existing.kind,
-                    request: existing.request.sameOriginQueryFallback != nil
-                        ? existing.request : candidate.request,
-                    requestReferer: existing.requestReferer ?? candidate.requestReferer,
-                    document: existing.document ?? candidate.document,
-                    widevinePlaybackContext: existing.widevinePlaybackContext
-                        ?? candidate.widevinePlaybackContext,
-                    pageURL: existing.pageURL,
-                    title: existing.title ?? candidate.title,
-                    thumbnailURL: existing.thumbnailURL ?? candidate.thumbnailURL,
-                    iframeDepth: min(existing.iframeDepth, candidate.iframeDepth),
-                    origin: existing.origin
-                )
+                candidates[index] = CandidateMergePolicy.merge(existing, candidate)
             } else {
                 candidates.append(candidate)
             }
@@ -389,7 +396,12 @@ final class DownloadViewModel: ObservableObject {
     }
 
     private func candidateIdentity(_ candidate: HLSCandidate) -> String {
-        candidate.kind.rawValue
+        if let capturedContentID = candidate.capturedContentID {
+            return candidate.kind.rawValue
+                + "\ncapture:"
+                + capturedContentID.uuidString.lowercased()
+        }
+        return candidate.kind.rawValue
             + "\n"
             + canonicalURL(candidate.playlistURL)
             + "\n"
@@ -431,6 +443,16 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
+    private func discardCapturedFiles(in candidates: [HLSCandidate]) {
+        for candidate in candidates {
+            guard let progressiveMedia = candidate.progressiveMedia,
+                  case .capturedBlob(let fileURL, _) = progressiveMedia.storage else {
+                continue
+            }
+            WebBlobCaptureStore.discardCaptureFile(at: fileURL)
+        }
+    }
+
     private func downsampledImage(from data: Data) -> UIImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -443,6 +465,29 @@ final class DownloadViewModel: ObservableObject {
             return nil
         }
         return UIImage(cgImage: image)
+    }
+}
+
+enum CandidateMergePolicy {
+    static func merge(_ existing: HLSCandidate, _ candidate: HLSCandidate) -> HLSCandidate {
+        HLSCandidate(
+            id: existing.id,
+            kind: existing.kind,
+            request: existing.request.sameOriginQueryFallback != nil
+                ? existing.request : candidate.request,
+            requestReferer: existing.requestReferer ?? candidate.requestReferer,
+            document: existing.document ?? candidate.document,
+            progressiveMedia: existing.progressiveMedia ?? candidate.progressiveMedia,
+            usesCapturedDocument: existing.usesCapturedDocument || candidate.usesCapturedDocument,
+            capturedContentID: existing.capturedContentID ?? candidate.capturedContentID,
+            widevinePlaybackContext: existing.widevinePlaybackContext
+                ?? candidate.widevinePlaybackContext,
+            pageURL: existing.pageURL,
+            title: existing.title ?? candidate.title,
+            thumbnailURL: existing.thumbnailURL ?? candidate.thumbnailURL,
+            iframeDepth: min(existing.iframeDepth, candidate.iframeDepth),
+            origin: existing.origin
+        )
     }
 }
 

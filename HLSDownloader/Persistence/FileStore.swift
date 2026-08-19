@@ -3,6 +3,7 @@ import Foundation
 enum MediaOutputFormat: String, Equatable, Sendable {
     case mp4
     case wav
+    case webm
 }
 
 struct FileStore {
@@ -74,17 +75,25 @@ struct FileStore {
     /// the protected inode.
     func copyProtectedFile(from sourceURL: URL, to destinationURL: URL) async throws {
         guard sourceURL.isFileURL,
-              destinationURL.isFileURL else {
+              destinationURL.isFileURL,
+              sourceURL.standardizedFileURL != destinationURL.standardizedFileURL else {
             throw WidevineProcessingError.invalidOutput
         }
         let sourceValues = try sourceURL.resourceValues(
-            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
         )
         let parentValues = try destinationURL.deletingLastPathComponent().resourceValues(
             forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
         )
+        let maximumOutputBytes = try LocalFFmpegOutputLimit.maximumBytes(
+            for: destinationURL,
+            fileManager: fileManager
+        )
         guard sourceValues.isRegularFile == true,
               sourceValues.isSymbolicLink != true,
+              let sourceSize = sourceValues.fileSize,
+              sourceSize > 0,
+              Int64(sourceSize) < maximumOutputBytes,
               parentValues.isDirectory == true,
               parentValues.isSymbolicLink != true else {
             throw WidevineProcessingError.invalidOutput
@@ -105,15 +114,29 @@ struct FileStore {
                 try? source.close()
                 try? destination.close()
             }
+            var writtenBytes: Int64 = 0
             while true {
                 try Task.checkCancellation()
                 guard let chunk = try source.read(upToCount: 1_024 * 1_024),
                       !chunk.isEmpty else {
                     break
                 }
+                let chunkBytes = Int64(chunk.count)
+                guard writtenBytes < maximumOutputBytes,
+                      chunkBytes < maximumOutputBytes - writtenBytes else {
+                    throw HLSError.exportFailed("copied output exceeded its storage limit")
+                }
                 try destination.write(contentsOf: chunk)
+                writtenBytes += chunkBytes
+            }
+            guard writtenBytes == Int64(sourceSize) else {
+                throw WidevineProcessingError.invalidOutput
             }
             try destination.synchronize()
+            try LocalFFmpegOutputLimit.validateCompletedOutput(
+                at: destinationURL,
+                maximumBytes: maximumOutputBytes
+            )
             try fileManager.setAttributes(
                 [.protectionKey: FileProtectionType.completeUnlessOpen],
                 ofItemAtPath: destinationURL.path
@@ -147,7 +170,9 @@ struct FileStore {
             let name = normalized.lastPathComponent
             guard normalized.deletingLastPathComponent() == normalizedRoot,
                   name.hasPrefix("."),
-                  (name.hasSuffix(".part.mp4") || name.hasSuffix(".part.wav")) else {
+                  (name.hasSuffix(".part.mp4")
+                    || name.hasSuffix(".part.wav")
+                    || name.hasSuffix(".part.webm")) else {
                 continue
             }
             let values = try normalized.resourceValues(

@@ -150,6 +150,30 @@ final class HTMLMediaExtractorTests: XCTestCase {
         )
     }
 
+    func testExtractsProgressiveVideoAndAudioSources() throws {
+        let html = #"""
+        <video src="/media/movie.mp4"></video>
+        <audio><source src="/api/audio?id=7" type="audio/mp4"></audio>
+        <script>
+          const clip = "https://cdn.example/media/clip.webm?token=abc";
+          const track = "/media/song.opus";
+        </script>
+        """#
+
+        let result = HTMLMediaExtractor.extract(from: html)
+
+        XCTAssertEqual(
+            result.media.map(\.rawURL),
+            [
+                "/media/movie.mp4",
+                "/api/audio?id=7",
+                "https://cdn.example/media/clip.webm?token=abc",
+                "/media/song.opus"
+            ]
+        )
+        XCTAssertEqual(result.media.map(\.kind), Array(repeating: .progressive, count: 4))
+    }
+
     func testDecodesSemicolonlessEntityAndDoubleEscapedURL() throws {
         let result = HTMLMediaExtractor.extract(
             from: #"<script>const source="https:\\/\\/cdn\\u002Eexample\\/v\\u002Em3u8?a=1&amp;b=2"</script>"#
@@ -374,6 +398,245 @@ final class PlaybackCapturePersistenceTests: XCTestCase {
     }
 }
 
+final class WebBlobCaptureQuotaTests: XCTestCase {
+    private let maximumBlobBytes = 512 * 1_024 * 1_024
+
+    @MainActor
+    func testAbortReturnsReservedSessionCapacity() throws {
+        let store = WebBlobCaptureStore(storageBudgetOverride: maximumBlobBytes * 2)
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+
+        for index in 0..<3 {
+            let identifier = "aborted-\(index)"
+            XCTAssertNil(startCapture(store, identifier: identifier, pageURL: pageURL))
+            XCTAssertNil(send(
+                store,
+                body: ["eventKind": "blobAbort", "id": identifier],
+                pageURL: pageURL
+            ))
+        }
+    }
+
+    @MainActor
+    func testInvalidFinishReturnsReservedSessionCapacity() throws {
+        let store = WebBlobCaptureStore(storageBudgetOverride: maximumBlobBytes * 2)
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+
+        for index in 0..<3 {
+            let identifier = "incomplete-\(index)"
+            XCTAssertNil(startCapture(store, identifier: identifier, pageURL: pageURL))
+            XCTAssertNotNil(send(
+                store,
+                body: ["eventKind": "blobFinish", "id": identifier],
+                pageURL: pageURL
+            ))
+        }
+    }
+
+    @MainActor
+    func testUnsupportedFinishedBlobReturnsReservedSessionCapacity() throws {
+        let store = WebBlobCaptureStore(storageBudgetOverride: maximumBlobBytes * 2)
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        XCTAssertNil(send(
+            store,
+            body: [
+                "eventKind": "blobStart",
+                "id": "unsupported",
+                "url": "blob:https://site.example/unsupported",
+                "mimeType": "application/octet-stream",
+                "size": NSNumber(value: 1)
+            ],
+            pageURL: pageURL
+        ))
+        XCTAssertNil(send(
+            store,
+            body: [
+                "eventKind": "blobChunk",
+                "id": "unsupported",
+                "offset": NSNumber(value: 0),
+                "data": Data([0]).base64EncodedString()
+            ],
+            pageURL: pageURL
+        ))
+        XCTAssertNil(send(
+            store,
+            body: ["eventKind": "blobFinish", "id": "unsupported"],
+            pageURL: pageURL
+        ))
+
+        // A strict-less-than storage claim permits 1 GiB minus one byte. Even
+        // one leaked byte from the unsupported Blob would reject the second.
+        XCTAssertNil(startCapture(store, identifier: "large-one", pageURL: pageURL))
+        XCTAssertNil(startCapture(
+            store,
+            identifier: "large-two",
+            pageURL: pageURL,
+            byteCount: maximumBlobBytes - 1
+        ))
+        store.cancelActiveCaptures()
+    }
+
+    @MainActor
+    func testCancelActiveCapturesReturnsReservedSessionCapacity() throws {
+        let store = WebBlobCaptureStore(storageBudgetOverride: maximumBlobBytes * 2)
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        XCTAssertNil(startCapture(store, identifier: "cancelled-one", pageURL: pageURL))
+        XCTAssertNil(startCapture(
+            store,
+            identifier: "cancelled-two",
+            pageURL: pageURL,
+            byteCount: maximumBlobBytes - 1
+        ))
+
+        store.cancelActiveCaptures()
+
+        XCTAssertNil(startCapture(store, identifier: "after-cancel", pageURL: pageURL))
+        XCTAssertNil(send(
+            store,
+            body: ["eventKind": "blobAbort", "id": "after-cancel"],
+            pageURL: pageURL
+        ))
+    }
+
+    @MainActor
+    func testFixedVolumeBudgetRejectsBoundaryAndAbortReturnsClaim() throws {
+        let store = WebBlobCaptureStore(storageBudgetOverride: maximumBlobBytes + 1)
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        XCTAssertNil(startCapture(store, identifier: "volume-one", pageURL: pageURL))
+        XCTAssertNotNil(startCapture(
+            store,
+            identifier: "volume-boundary",
+            pageURL: pageURL,
+            byteCount: 1
+        ))
+
+        XCTAssertNil(send(
+            store,
+            body: ["eventKind": "blobAbort", "id": "volume-one"],
+            pageURL: pageURL
+        ))
+        XCTAssertNil(startCapture(store, identifier: "volume-reused", pageURL: pageURL))
+        store.cancelActiveCaptures()
+    }
+
+    @MainActor
+    private func startCapture(
+        _ store: WebBlobCaptureStore,
+        identifier: String,
+        pageURL: URL,
+        byteCount: Int? = nil
+    ) -> String? {
+        send(
+            store,
+            body: [
+                "eventKind": "blobStart",
+                "id": identifier,
+                "url": "blob:https://site.example/\(identifier)",
+                "mimeType": "video/mp4",
+                "size": NSNumber(value: byteCount ?? maximumBlobBytes)
+            ],
+            pageURL: pageURL
+        )
+    }
+
+    @MainActor
+    private func send(
+        _ store: WebBlobCaptureStore,
+        body: [String: Any],
+        pageURL: URL
+    ) -> String? {
+        var replyError: String?
+        _ = store.handle(body: body, pageURL: pageURL, iframeDepth: 0) { _, error in
+            replyError = error
+        }
+        return replyError
+    }
+}
+
+final class CandidateMergePolicyTests: XCTestCase {
+    func testMergePreservesProgressiveStorageAndCapturedDocumentState() throws {
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let captureID = UUID()
+        let captureFile = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "merge-capture-\(UUID().uuidString).media"
+        )
+        let existingProgressive = HLSCandidate(
+            id: UUID(),
+            kind: .progressive,
+            request: URLCandidates(primary: pageURL, sameOriginQueryFallback: nil),
+            requestReferer: pageURL,
+            document: nil,
+            capturedContentID: captureID,
+            pageURL: pageURL,
+            title: nil,
+            thumbnailURL: nil,
+            iframeDepth: 1,
+            origin: .runtime
+        )
+        let capturedProgressive = HLSCandidate(
+            id: UUID(),
+            kind: .progressive,
+            request: URLCandidates(primary: pageURL, sameOriginQueryFallback: nil),
+            requestReferer: pageURL,
+            document: nil,
+            progressiveMedia: ProgressiveMediaReference(
+                storage: .capturedBlob(fileURL: captureFile, byteCount: 123),
+                hintedMIMEType: "video/mp4"
+            ),
+            capturedContentID: captureID,
+            pageURL: pageURL,
+            title: "Captured",
+            thumbnailURL: nil,
+            iframeDepth: 1,
+            origin: .runtime
+        )
+        let progressiveMerge = CandidateMergePolicy.merge(
+            existingProgressive,
+            capturedProgressive
+        )
+        XCTAssertEqual(progressiveMerge.progressiveMedia, capturedProgressive.progressiveMedia)
+        XCTAssertEqual(progressiveMerge.capturedContentID, captureID)
+
+        let document = PlaylistDocument(
+            text: "#EXTM3U\n#EXT-X-ENDLIST\n",
+            effectiveURL: pageURL,
+            referer: pageURL
+        )
+        let existingHLS = HLSCandidate(
+            id: UUID(),
+            kind: .hls,
+            request: URLCandidates(primary: pageURL, sameOriginQueryFallback: nil),
+            requestReferer: pageURL,
+            document: document,
+            usesCapturedDocument: false,
+            capturedContentID: captureID,
+            pageURL: pageURL,
+            title: nil,
+            thumbnailURL: nil,
+            iframeDepth: 1,
+            origin: .runtime
+        )
+        let capturedHLS = HLSCandidate(
+            id: UUID(),
+            kind: .hls,
+            request: URLCandidates(primary: pageURL, sameOriginQueryFallback: nil),
+            requestReferer: pageURL,
+            document: document,
+            usesCapturedDocument: true,
+            capturedContentID: captureID,
+            pageURL: pageURL,
+            title: nil,
+            thumbnailURL: nil,
+            iframeDepth: 1,
+            origin: .runtime
+        )
+        let hlsMerge = CandidateMergePolicy.merge(existingHLS, capturedHLS)
+        XCTAssertTrue(hlsMerge.usesCapturedDocument)
+        XCTAssertNotNil(hlsMerge.document)
+        XCTAssertEqual(hlsMerge.capturedContentID, captureID)
+    }
+}
+
 @MainActor
 private final class StubDynamicInspector: DynamicPageInspecting {
     let inspection: DynamicPageInspection
@@ -409,6 +672,106 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertNotNil(discovery.candidates[0].document)
         XCTAssertEqual(discovery.candidates[0].origin, .direct)
         XCTAssertEqual(discovery.candidates[0].kind, .hls)
+    }
+
+    func testAcceptsDirectProgressiveMediaOnlyAfterBoundedMagicProbe() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        let body = Data([
+            0x00, 0x00, 0x00, 0x10,
+            0x66, 0x74, 0x79, 0x70,
+            0x69, 0x73, 0x6F, 0x6D,
+            0x30, 0x30, 0x30, 0x30,
+            0x00, 0x00, 0x00, 0x08,
+            0x6D, 0x6F, 0x6F, 0x76
+        ])
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "video/mp4"]
+                )!,
+                body
+            )
+        }
+
+        let discovery = try await resolver.discover(
+            input: "https://media.example/movie.mp4"
+        )
+
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.kind, .progressive)
+        XCTAssertNotNil(discovery.candidates.first?.progressiveMedia)
+        XCTAssertEqual(
+            recorder.snapshot().first?.value(forHTTPHeaderField: "Range"),
+            "bytes=0-262143"
+        )
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testRejectsStandaloneTransportStreamFailClosed() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        var body = Data(repeating: 0, count: 188 * 3)
+        for offset in stride(from: 0, to: body.count, by: 188) {
+            body[offset] = 0x47
+            body[offset + 3] = 0x10
+        }
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "video/mp2t"]
+                )!,
+                body
+            )
+        }
+
+        do {
+            _ = try await resolver.discover(input: "https://media.example/movie.ts")
+            XCTFail("Standalone TS must not be accepted without manifest encryption metadata")
+        } catch let error as HLSError {
+            guard case .drmUnsupported = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testRejectsHTMLDisguisedAsProgressiveMedia() async throws {
+        let recorder = DiscoveryRequestRecorder()
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            if request.url?.path == "/watch" {
+                return Self.response(
+                    request,
+                    body: #"<video src="/movie.mp4"></video>"#,
+                    mimeType: "text/html"
+                )
+            }
+            return Self.response(
+                request,
+                body: "<!doctype html><title>sign in</title>",
+                mimeType: "video/mp4"
+            )
+        }
+
+        do {
+            _ = try await resolver.discover(input: "https://site.example/watch")
+            XCTFail("An extension/MIME hint without media magic must not become a candidate")
+        } catch let error as HLSError {
+            guard case .noPlaylistFound = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(recorder.snapshot().count, 2)
     }
 
     func testAcceptsDirectWidevineMPDOnlyOnDownloadableDomain() async throws {
@@ -1237,6 +1600,31 @@ final class SourceDiscoveryTests: XCTestCase {
         )
     }
 
+    func testBufferedFetchRejectsOversizedContentLengthBeforeBodyAccumulation() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DiscoveryURLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        DiscoveryURLProtocolStub.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": "video/mp2t",
+                    "Content-Length": String(HTTPClient.maximumBufferedResponseBytes + 1)
+                ]
+            )!
+            return (response, Data([0x47]))
+        }
+
+        do {
+            _ = try await client.fetch(URL(string: "https://example.com/oversized.ts")!)
+            XCTFail("Oversized buffered responses must be rejected")
+        } catch {
+            XCTAssertFalse(error is CancellationError)
+        }
+    }
+
     func testImportedCookieGateUsesSchemefulRefererContext() async throws {
         let recorder = DiscoveryRequestRecorder()
         let configuration = URLSessionConfiguration.ephemeral
@@ -1630,6 +2018,98 @@ final class SourceDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(providerContext, originalContext)
         XCTAssertNil(redirectedRequest?.value(forHTTPHeaderField: "Cookie"))
+    }
+
+    @MainActor
+    func testKeepsTwoCapturedManifestBlobsFromTheSamePageDistinct() async throws {
+        let store = WebBlobCaptureStore()
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let first = try captureBlobManifest(
+            store: store,
+            identifier: "manifest-one",
+            blobURL: "blob:https://site.example/one",
+            text: "#EXTM3U\n#EXTINF:1,\nfirst.ts\n#EXT-X-ENDLIST\n",
+            pageURL: pageURL,
+            sequence: 1
+        )
+        let second = try captureBlobManifest(
+            store: store,
+            identifier: "manifest-two",
+            blobURL: "blob:https://site.example/two",
+            text: "#EXTM3U\n#EXTINF:1,\nsecond.ts\n#EXT-X-ENDLIST\n",
+            pageURL: pageURL,
+            sequence: 2
+        )
+        XCTAssertNotEqual(first.capturedContentID, second.capturedContentID)
+        let parentDirectory = first.fileURL.deletingLastPathComponent()
+
+        let resolver = makeResolver()
+        let candidates = await resolver.importDynamicInspection(
+            DynamicPageInspection(media: [], blobs: [first, second], cookies: []),
+            rootURL: pageURL
+        )
+
+        XCTAssertEqual(candidates.count, 2)
+        XCTAssertEqual(Set(candidates.compactMap(\.capturedContentID)).count, 2)
+        XCTAssertEqual(
+            Set(candidates.compactMap { $0.document?.text }),
+            Set([firstManifestText, secondManifestText])
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.fileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.fileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parentDirectory.path))
+    }
+
+    @MainActor
+    private func captureBlobManifest(
+        store: WebBlobCaptureStore,
+        identifier: String,
+        blobURL: String,
+        text: String,
+        pageURL: URL,
+        sequence: Int
+    ) throws -> DynamicBlobReference {
+        let data = Data(text.utf8)
+        var replyError: String?
+        _ = store.handle(
+            body: [
+                "eventKind": "blobStart",
+                "id": identifier,
+                "url": blobURL,
+                "mimeType": "application/vnd.apple.mpegurl",
+                "size": NSNumber(value: data.count),
+                "sequence": NSNumber(value: sequence)
+            ],
+            pageURL: pageURL,
+            iframeDepth: 0
+        ) { _, error in replyError = error }
+        XCTAssertNil(replyError)
+        _ = store.handle(
+            body: [
+                "eventKind": "blobChunk",
+                "id": identifier,
+                "offset": NSNumber(value: 0),
+                "data": data.base64EncodedString()
+            ],
+            pageURL: pageURL,
+            iframeDepth: 0
+        ) { _, error in replyError = error }
+        XCTAssertNil(replyError)
+        let reference = store.handle(
+            body: ["eventKind": "blobFinish", "id": identifier],
+            pageURL: pageURL,
+            iframeDepth: 0
+        ) { _, error in replyError = error }
+        XCTAssertNil(replyError)
+        return try XCTUnwrap(reference)
+    }
+
+    private var firstManifestText: String {
+        "#EXTM3U\n#EXTINF:1,\nfirst.ts\n#EXT-X-ENDLIST\n"
+    }
+
+    private var secondManifestText: String {
+        "#EXTM3U\n#EXTINF:1,\nsecond.ts\n#EXT-X-ENDLIST\n"
     }
 
     private static let widevineMPD = #"""

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -17,6 +18,8 @@ typedef struct {
     std::atomic<int> cancel_requested{0};
     std::atomic<int> execution_finished{0};
     std::vector<std::string> diagnostic_secrets;
+    std::string output_path;
+    int64_t maximum_output_bytes{0};
     bool is_probe{false};
     bool owns_session_gate{false};
 } HLSFFmpegRemuxSession;
@@ -131,9 +134,10 @@ static void hls_copy_redacted_diagnostic_tail(
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
     const char *input_path,
     const char *audio_input_path,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 ) {
-    if (input_path == NULL || output_path == NULL) {
+    if (input_path == NULL || output_path == NULL || maximum_output_bytes <= 0) {
         return NULL;
     }
 
@@ -142,6 +146,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         return NULL;
     }
 
+    const std::string maximum_output_text = std::to_string(maximum_output_bytes);
     const char *normalized_arguments[] = {
         "-hide_banner",
         "-nostdin",
@@ -156,6 +161,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         "-c", "copy",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
+        "-fs", maximum_output_text.c_str(),
         output_path
     };
     const char *combined_arguments[] = {
@@ -178,6 +184,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         "-dn",
         "-c", "copy",
         "-movflags", "+faststart",
+        "-fs", maximum_output_text.c_str(),
         output_path
     };
 
@@ -208,6 +215,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_remux_session_create(
         return NULL;
     }
     session->handle = handle;
+    session->output_path = output_path;
+    session->maximum_output_bytes = maximum_output_bytes;
     session->owns_session_gate = true;
     return session;
 }
@@ -233,10 +242,12 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
     const char *video_decryption_key_hex,
     const char *audio_input_path,
     const char *audio_decryption_key_hex,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 ) {
     if (video_input_path == NULL
         || output_path == NULL
+        || maximum_output_bytes <= 0
         || !hls_is_hex_key(video_decryption_key_hex)) {
         return NULL;
     }
@@ -251,6 +262,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
         return NULL;
     }
 
+    const std::string maximum_output_text = std::to_string(maximum_output_bytes);
     std::vector<const char *> arguments = {
         "-hide_banner",
         "-nostdin",
@@ -275,6 +287,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
         "-dn",
         "-c", "copy",
         "-movflags", "+faststart",
+        "-fs", maximum_output_text.c_str(),
         output_path
     });
 
@@ -296,6 +309,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_cenc_session_create(
     }
     session->handle = handle;
     session->owns_session_gate = true;
+    session->output_path = output_path;
+    session->maximum_output_bytes = maximum_output_bytes;
     session->diagnostic_secrets.emplace_back(video_decryption_key_hex);
     if (audio_decryption_key_hex != NULL) {
         session->diagnostic_secrets.emplace_back(audio_decryption_key_hex);
@@ -307,9 +322,12 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
     const char *primary_playlist_path,
     const char *audio_playlist_path,
     const char *output_path,
-    int32_t output_mode
+    int32_t output_mode,
+    int64_t maximum_output_bytes
 ) {
-    if (primary_playlist_path == NULL || output_path == NULL) {
+    if (primary_playlist_path == NULL
+        || output_path == NULL
+        || maximum_output_bytes <= 0) {
         return NULL;
     }
     const bool writes_mp4 = output_mode == HLS_FFMPEG_SAMPLE_AES_OUTPUT_MP4;
@@ -333,14 +351,18 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
     const char *media_extensions =
         "ts,m2t,m2ts,mts,mpg,mpeg,mpegts,aac,ac3,eac3,ec3,"
         "m4a,m4s,m4v,mov,mp4,cmfa,cmfv,fmp4";
+    const std::string maximum_output_text = std::to_string(maximum_output_bytes);
     std::vector<const char *> arguments = {
         "-hide_banner",
         "-nostdin",
         "-loglevel", "warning",
+        "-xerror",
+        "-abort_on", "empty_output+empty_output_stream",
         "-y",
         "-copyts",
         "-start_at_zero",
         "-fflags", "+genpts",
+        "-err_detect", "explode",
         "-protocol_whitelist", local_protocols,
         "-allowed_extensions", readable_extensions,
         "-allowed_segment_extensions", media_extensions,
@@ -350,6 +372,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
         arguments.insert(arguments.end(), {
             "-isync", "0",
             "-fflags", "+genpts",
+            "-err_detect", "explode",
             "-protocol_whitelist", local_protocols,
             "-allowed_extensions", readable_extensions,
             "-allowed_segment_extensions", media_extensions,
@@ -365,6 +388,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
             "-c", "copy",
             "-movflags", "+faststart",
             "-f", "mp4",
+            "-fs", maximum_output_text.c_str(),
             output_path
         });
     } else {
@@ -376,6 +400,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
             "-c:a", "pcm_s16le",
             "-rf64", "auto",
             "-f", "wav",
+            "-fs", maximum_output_text.c_str(),
             output_path
         });
     }
@@ -397,6 +422,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
         return NULL;
     }
     session->handle = handle;
+    session->output_path = output_path;
+    session->maximum_output_bytes = maximum_output_bytes;
     session->owns_session_gate = true;
     return session;
 }
@@ -404,9 +431,10 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_sample_aes_session_create(
 HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
     const char *input_path,
     const char *decryption_key_hex,
-    const char *output_path
+    const char *output_path,
+    int64_t maximum_output_bytes
 ) {
-    if (input_path == NULL || output_path == NULL) {
+    if (input_path == NULL || output_path == NULL || maximum_output_bytes <= 0) {
         return NULL;
     }
     if (decryption_key_hex != NULL && !hls_is_hex_key(decryption_key_hex)) {
@@ -418,6 +446,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
         return NULL;
     }
 
+    const std::string maximum_output_text = std::to_string(maximum_output_bytes);
     std::vector<const char *> arguments = {
         "-hide_banner",
         "-nostdin",
@@ -428,6 +457,9 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
     };
     if (decryption_key_hex != NULL) {
         arguments.insert(arguments.end(), {
+            "-xerror",
+            "-err_detect", "explode",
+            "-abort_on", "empty_output+empty_output_stream",
             "-decryption_key", decryption_key_hex
         });
     }
@@ -440,6 +472,7 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
         "-c:a", "pcm_s16le",
         "-rf64", "auto",
         "-f", "wav",
+        "-fs", maximum_output_text.c_str(),
         output_path
     });
 
@@ -460,6 +493,8 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_audio_wav_session_create(
         return NULL;
     }
     session->handle = handle;
+    session->output_path = output_path;
+    session->maximum_output_bytes = maximum_output_bytes;
     session->owns_session_gate = true;
     if (decryption_key_hex != NULL) {
         session->diagnostic_secrets.emplace_back(decryption_key_hex);
@@ -543,6 +578,55 @@ HLSFFmpegRemuxSessionHandle hls_ffmpeg_media_probe_session_create(
     if (decryption_key_hex != NULL) {
         session->diagnostic_secrets.emplace_back(decryption_key_hex);
     }
+    return session;
+}
+
+HLSFFmpegRemuxSessionHandle hls_ffmpeg_decode_validation_session_create(
+    const char *input_path
+) {
+    if (input_path == NULL) {
+        return NULL;
+    }
+
+    hls_ffmpeg_initialize_once();
+    if (!hls_ffmpeg_try_acquire_session_gate()) {
+        return NULL;
+    }
+
+    const char *arguments[] = {
+        "-hide_banner",
+        "-nostdin",
+        "-v", "error",
+        "-xerror",
+        "-err_detect", "explode",
+        "-abort_on", "empty_output+empty_output_stream",
+        "-protocol_whitelist", "file,crypto",
+        "-i", input_path,
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+        "-sn",
+        "-dn",
+        "-f", "null",
+        "-"
+    };
+    FFmpegSessionHandle handle = ffmpeg_kit_create_session_from_argv(
+        (int)(sizeof(arguments) / sizeof(arguments[0])),
+        arguments
+    );
+    if (handle == NULL) {
+        ffmpeg_kit_clear_sessions();
+        hls_ffmpeg_release_session_gate();
+        return NULL;
+    }
+    ffmpeg_kit_set_log_callback(handle, hls_ffmpeg_discard_log, NULL);
+
+    HLSFFmpegRemuxSession *session = new (std::nothrow) HLSFFmpegRemuxSession();
+    if (session == NULL) {
+        hls_ffmpeg_release_failed_session(handle);
+        return NULL;
+    }
+    session->handle = handle;
+    session->owns_session_gate = true;
     return session;
 }
 
@@ -681,7 +765,23 @@ int64_t hls_ffmpeg_remux_session_execute(
 
     ffmpeg_kit_session_execute(session->handle);
     int64_t return_code = ffmpeg_kit_session_get_return_code(session->handle);
-    if (return_code != 0) {
+    bool output_limit_failed = false;
+    if (return_code == 0 && session->maximum_output_bytes > 0) {
+        struct stat output_info;
+        if (session->output_path.empty()
+            || stat(session->output_path.c_str(), &output_info) != 0
+            || output_info.st_size <= 0
+            || output_info.st_size >= session->maximum_output_bytes) {
+            output_limit_failed = true;
+            return_code = -1;
+            hls_copy_diagnostic_tail(
+                "FFmpeg output was empty or reached its storage limit.",
+                diagnostic_buffer,
+                diagnostic_buffer_size
+            );
+        }
+    }
+    if (return_code != 0 && !output_limit_failed) {
         char *logs = ffmpeg_kit_session_get_logs_as_string(session->handle);
         hls_copy_redacted_diagnostic_tail(
             logs,
