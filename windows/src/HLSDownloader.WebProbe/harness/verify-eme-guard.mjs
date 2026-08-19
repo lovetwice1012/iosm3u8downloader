@@ -67,6 +67,13 @@ class HarnessLocation {
     });
   }
 }
+class HarnessMediaSource {
+  addSourceBuffer(mime) { return { mime }; }
+}
+let objectUrlSequence = 0;
+URL.createObjectURL = () => `blob:https://example.com/${++objectUrlSequence}`;
+URL.revokeObjectURL = () => { };
+const hostMessageListeners = [];
 const nativeFetch = input => Promise.resolve(
   new HarnessResponse(input, 200, 'application/dash+xml'));
 const location = new HarnessLocation('https://example.com/player');
@@ -78,7 +85,10 @@ const context = vm.createContext({
   location,
   chrome: {
     webview: {
-      postMessage(message) { messages.push(message); }
+      postMessage(message) { messages.push(message); },
+      addEventListener(kind, listener) {
+        if (kind === 'message') hostMessageListeners.push(listener);
+      }
     }
   },
   fetch: nativeFetch,
@@ -87,10 +97,56 @@ const context = vm.createContext({
   XMLHttpRequest: class XMLHttpRequest { open() { } },
   performance: { getEntriesByType() { return []; } },
   URL,
+  Blob,
+  MediaSource: HarnessMediaSource,
+  TextDecoder,
+  ArrayBuffer,
+  Uint8Array,
+  Map,
+  WeakMap,
+  WeakRef,
+  crypto: globalThis.crypto,
+  setTimeout,
   DOMException
 });
 
+const harnessCreateObjectUrl = URL.createObjectURL;
 vm.runInContext(script, context, { filename: 'WebProbeScript.generated.js' });
+assert.notEqual(context.URL.createObjectURL, harnessCreateObjectUrl);
+
+const hlsBlob = new context.Blob([
+  '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nhttps://example.com/one.ts\n'
+], { type: 'application/octet-stream' });
+assert.ok(hlsBlob.size > 0);
+const hlsBlobUrl = context.URL.createObjectURL(hlsBlob);
+assert.match(hlsBlobUrl, /^blob:/);
+await new Promise(resolve => setTimeout(resolve, 50));
+const blobMessage = messages.find(message => message.kind === 'browser-blob');
+assert.ok(blobMessage, 'Browser Blob signal was not emitted.');
+assert.equal(blobMessage.container, 'hls');
+assert.equal(blobMessage.mime, 'application/octet-stream');
+assert.equal(blobMessage.url, 'https://example.com/player');
+assert.match(blobMessage.objectId, /^blob-[0-9a-f]{32}-[0-9]+$/);
+assert.equal('blobUrl' in blobMessage, false);
+assert.equal('data' in blobMessage, false);
+
+const browserBlobSignalsBeforeSpoof = messages.filter(
+  message => message.kind === 'browser-blob').length;
+context.URL.createObjectURL(new context.Blob(['<html>not media</html>'], { type: 'video/mp4' }));
+await new Promise(resolve => setTimeout(resolve, 50));
+assert.equal(
+  messages.filter(message => message.kind === 'browser-blob').length,
+  browserBlobSignalsBeforeSpoof,
+  'A MIME-only Blob must not be accepted without supported media magic.');
+
+const mediaSource = new context.MediaSource();
+const mediaSourceUrl = context.URL.createObjectURL(mediaSource);
+assert.match(mediaSourceUrl, /^blob:/);
+mediaSource.addSourceBuffer('video/webm; codecs="vp9,opus"');
+const mediaSourceMessage = messages.find(
+  message => message.kind === 'media-source' && message.container === 'webm');
+assert.ok(mediaSourceMessage, 'MediaSource signal was not emitted.');
+assert.equal(mediaSourceMessage.byteLength, null);
 
 const prototypeDescriptor = Object.getOwnPropertyDescriptor(
   Navigator.prototype,

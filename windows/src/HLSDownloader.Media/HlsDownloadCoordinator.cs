@@ -27,6 +27,7 @@ public sealed class HlsDownloadCoordinator
     private readonly IResourceDownloader _downloader;
     private readonly IMediaComposer _composer;
     private readonly IWidevineL3MediaProvider _widevineProvider;
+    private readonly ProgressiveMediaProcessor? _progressiveProcessor;
     private readonly HlsMediaDownloadOptions _options;
 
     public HlsDownloadCoordinator(
@@ -34,12 +35,14 @@ public sealed class HlsDownloadCoordinator
         IResourceDownloader downloader,
         IMediaComposer composer,
         IWidevineL3MediaProvider? widevineProvider = null,
-        HlsMediaDownloadOptions? options = null)
+        HlsMediaDownloadOptions? options = null,
+        ProgressiveMediaProcessor? progressiveProcessor = null)
     {
         _planBuilder = planBuilder ?? throw new ArgumentNullException(nameof(planBuilder));
         _downloader = downloader ?? throw new ArgumentNullException(nameof(downloader));
         _composer = composer ?? throw new ArgumentNullException(nameof(composer));
         _widevineProvider = widevineProvider ?? new UnavailableWidevineL3MediaProvider();
+        _progressiveProcessor = progressiveProcessor;
         _options = options ?? new HlsMediaDownloadOptions();
         _options.Validate();
     }
@@ -52,6 +55,16 @@ public sealed class HlsDownloadCoordinator
     {
         ArgumentNullException.ThrowIfNull(candidate);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputBasePath);
+        if (candidate.Kind == MediaCandidateKind.Progressive)
+        {
+            if (_progressiveProcessor is null)
+                throw new NotSupportedException("Progressive media downloading is not configured.");
+            return await _progressiveProcessor.DownloadAsync(
+                candidate,
+                outputBasePath,
+                progress,
+                cancellationToken).ConfigureAwait(false);
+        }
         if (candidate.Kind == MediaCandidateKind.WidevineDash)
         {
             progress?.Report(new DownloadProgress(
@@ -112,6 +125,9 @@ public sealed class HlsDownloadCoordinator
         Directory.CreateDirectory(jobDirectory);
         try
         {
+            long stagingLimit = MediaOutputBudget.LimitForPath(
+                Path.Combine(jobDirectory, ".staging-budget"),
+                _options.MaximumTotalBytes);
             HlsLocalPlaylistBuild[] builds = plan.AudioPlaylist is null
                 ? [new(plan.MainPlaylist, "main")]
                 : [new(plan.MainPlaylist, "main"), new(plan.AudioPlaylist, "audio")];
@@ -128,6 +144,7 @@ public sealed class HlsDownloadCoordinator
                     totalResources,
                     completed,
                     totalBytes,
+                    stagingLimit,
                     redactions,
                     progress,
                     cancellationToken).ConfigureAwait(false);
@@ -135,13 +152,18 @@ public sealed class HlsDownloadCoordinator
 
             ValidateSampleAesDownloadPolicy(candidate, plan);
             progress?.Report(new DownloadProgress(DownloadPhase.Composing, totalResources, totalResources, "実際の映像・音声トラックを確認しています"));
+            MediaOutputBudget.EnsureFits(
+                Path.ChangeExtension(outputBasePath, ".mp4"),
+                totalBytes.Value,
+                _options.MaximumTotalBytes);
             MediaComposeResult result = await _composer.ComposeAsync(
                 new MediaComposeRequest(
                     builds[0].PlaylistPath!,
                     outputBasePath,
                     _options.ComposeTimeout,
                     redactions.Keys.ToArray(),
-                    builds.Length > 1 ? builds[1].PlaylistPath : null),
+                    builds.Length > 1 ? builds[1].PlaylistPath : null,
+                    _options.MaximumTotalBytes),
                 cancellationToken).ConfigureAwait(false);
             progress?.Report(new DownloadProgress(DownloadPhase.Completed, totalResources, totalResources, result.OutputPath));
             return result;
@@ -176,6 +198,7 @@ public sealed class HlsDownloadCoordinator
         int totalResources,
         StrongBox<int> completed,
         StrongBox<long> totalBytes,
+        long stagingLimit,
         ConcurrentDictionary<string, byte> redactions,
         IProgress<DownloadProgress>? progress,
         CancellationToken cancellationToken)
@@ -199,9 +222,9 @@ public sealed class HlsDownloadCoordinator
                     resource.Range?.Length,
                     token).ConfigureAwait(false);
                 long cumulative = Interlocked.Add(ref totalBytes.Value, response.Data.LongLength);
-                if (cumulative > _options.MaximumTotalBytes)
+                if (cumulative >= stagingLimit)
                 {
-                    throw new InvalidDataException("The HLS download exceeded the configured total byte limit.");
+                    throw new InvalidDataException("The HLS download exceeded its bounded staging-space limit.");
                 }
 
                 if (resource.IsKey)

@@ -61,7 +61,7 @@ public static partial class HtmlMediaExtractor
             foreach (var attribute in MediaAttributeNames)
             {
                 var raw = element.GetAttribute(attribute);
-                if (!TryManifest(baseUri, raw, mime, out var uri, out var kind)) continue;
+                if (!TryMedia(baseUri, raw, mime, out var uri, out var kind)) continue;
                 var key = $"{kind}:{uri.AbsoluteUri}";
                 if (seen.Add(key)) media.Add(new(uri, kind, origin, poster ?? thumbnail, title));
             }
@@ -71,7 +71,7 @@ public static partial class HtmlMediaExtractor
         {
             foreach (Match match in ManifestPattern().Matches(DecodeEscapes(script.TextContent)))
             {
-                if (!TryManifest(baseUri, match.Groups[1].Value, null, out var uri, out var kind)) continue;
+                if (!TryMedia(baseUri, match.Groups[1].Value, null, out var uri, out var kind)) continue;
                 var key = $"{kind}:{uri.AbsoluteUri}";
                 if (seen.Add(key)) media.Add(new(uri, kind, MediaCandidateOrigin.InlineScript, thumbnail, pageTitle));
             }
@@ -97,7 +97,7 @@ public static partial class HtmlMediaExtractor
         return new(documentUri, baseUri, pageTitle, thumbnail, media, frames);
     }
 
-    private static bool TryManifest(
+    private static bool TryMedia(
         Uri baseUri, string? raw, string? mimeType, out Uri uri, out MediaCandidateKind kind)
     {
         uri = null!;
@@ -109,7 +109,9 @@ public static partial class HtmlMediaExtractor
         if (mimeType?.Contains("dash+xml", StringComparison.OrdinalIgnoreCase) == true ||
             path.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase)) kind = MediaCandidateKind.WidevineDash;
         else if (mimeType?.Contains("mpegurl", StringComparison.OrdinalIgnoreCase) == true ||
-                 path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase)) kind = MediaCandidateKind.Hls;
+                  path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase)) kind = MediaCandidateKind.Hls;
+        else if (ProgressiveMediaHintClassifier.IsSupportedHint(candidate, mimeType))
+            kind = MediaCandidateKind.Progressive;
         else return false;
         uri = candidate;
         return true;

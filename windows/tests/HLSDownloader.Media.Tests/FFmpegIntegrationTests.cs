@@ -4,6 +4,27 @@ public sealed class FFmpegIntegrationTests
 {
     [Fact]
     [Trait("Category", "Integration")]
+    public async Task RealWebMWithMediaBlockPassesStructuralValidation()
+    {
+        using var scope = new TestFileScope();
+        var locator = new FFmpegToolLocator();
+        var runner = new ExternalToolRunner();
+        string output = scope.PathFor("real.webm");
+        ExternalToolResult fixture = await runner.RunAsync(new ExternalToolInvocation(
+            locator.ResolveFFmpeg(),
+            [
+                "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+                "-t", "0.4", "-an", "-c:v", "libvpx-vp9", "-f", "webm", output
+            ],
+            TimeSpan.FromSeconds(30)));
+
+        Assert.Equal(0, fixture.ExitCode);
+        Assert.True(MediaOutputValidator.IsValidWebM(output));
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
     public async Task RealAudioOnlyHlsIsDetectedAndExportedAsPcm16Wav()
     {
         using var scope = new TestFileScope();
@@ -164,6 +185,78 @@ public sealed class FFmpegIntegrationTests
             ],
             TimeSpan.FromSeconds(30)));
         Assert.True(decodeResult.ExitCode == 0, decodeResult.StandardError);
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
+    public async Task WrongIdentitySampleAesAudioKeyFailsWithoutPublishingPartialWav()
+    {
+        using var scope = new TestFileScope();
+        var locator = new FFmpegToolLocator();
+        var log = new List<string>();
+        var runner = new ExternalToolRunner(log.Add);
+        byte[] encryptionKey = Enumerable.Range(0x20, 16).Select(value => (byte)value).ToArray();
+        byte[] wrongKey = encryptionKey.Select(value => (byte)(value ^ 0xff)).ToArray();
+        byte[] initializationVector = new byte[16];
+        string protectedAac = await IdentitySampleAesFixture.CreateProtectedAacAsync(
+            locator.ResolveFFmpeg(), runner, scope.DirectoryPath, encryptionKey, initializationVector);
+
+        var composer = new SampleAesMediaComposer(
+            new SampleAesLocalPackageBuilder(scope.PathFor("wrong-sample-aes-audio-jobs")),
+            new FFmpegMediaComposer(
+                locator.ResolveFFmpeg(),
+                new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner),
+                runner));
+        string outputBase = scope.PathFor("wrong-sample-aes-audio-result");
+
+        await Assert.ThrowsAnyAsync<Exception>(() => composer.ComposeAsync(
+            new SampleAesPlaylistPackage([
+                new SampleAesSegment(protectedAac, 0.6, new SampleAesKey(wrongKey, Convert.ToHexString(initializationVector)))
+            ]),
+            outputBase,
+            TimeSpan.FromSeconds(30)));
+
+        Assert.False(File.Exists(Path.ChangeExtension(outputBase, ".wav")));
+        Assert.False(File.Exists(Path.ChangeExtension(outputBase, ".wav") + ".part"));
+        Assert.Contains(log, line => line.Contains("-xerror", StringComparison.Ordinal) &&
+            line.Contains("-err_detect explode", StringComparison.Ordinal));
+        Assert.DoesNotContain(log, line => line.Contains(Convert.ToHexString(wrongKey), StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
+    public async Task WrongIdentitySampleAesVideoKeyFailsWithoutPublishingPartialMp4()
+    {
+        using var scope = new TestFileScope();
+        var locator = new FFmpegToolLocator();
+        var log = new List<string>();
+        var runner = new ExternalToolRunner(log.Add);
+        byte[] encryptionKey = Enumerable.Range(0x60, 16).Select(value => (byte)value).ToArray();
+        byte[] wrongKey = encryptionKey.Select(value => (byte)(value ^ 0xff)).ToArray();
+        byte[] initializationVector = new byte[16];
+        string protectedTransportStream = await IdentitySampleAesFixture.CreateProtectedAudioVideoTransportStreamAsync(
+            locator.ResolveFFmpeg(), runner, scope.DirectoryPath, encryptionKey, initializationVector);
+
+        var composer = new SampleAesMediaComposer(
+            new SampleAesLocalPackageBuilder(scope.PathFor("wrong-sample-aes-video-jobs")),
+            new FFmpegMediaComposer(
+                locator.ResolveFFmpeg(),
+                new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner),
+                runner));
+        string outputBase = scope.PathFor("wrong-sample-aes-video-result");
+
+        await Assert.ThrowsAnyAsync<Exception>(() => composer.ComposeAsync(
+            new SampleAesPlaylistPackage([
+                new SampleAesSegment(protectedTransportStream, 2.4, new SampleAesKey(wrongKey, Convert.ToHexString(initializationVector)))
+            ]),
+            outputBase,
+            TimeSpan.FromSeconds(30)));
+
+        Assert.False(File.Exists(Path.ChangeExtension(outputBase, ".mp4")));
+        Assert.False(File.Exists(Path.ChangeExtension(outputBase, ".mp4") + ".part"));
+        Assert.Contains(log, line => line.Contains("-xerror", StringComparison.Ordinal) &&
+            line.Contains("-err_detect explode", StringComparison.Ordinal));
+        Assert.DoesNotContain(log, line => line.Contains(Convert.ToHexString(wrongKey), StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

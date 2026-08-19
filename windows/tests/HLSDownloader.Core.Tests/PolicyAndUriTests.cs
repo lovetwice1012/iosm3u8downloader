@@ -71,6 +71,24 @@ public sealed class PolicyAndUriTests
         Assert.Equal(1, inner.CallCount);
     }
 
+    [Fact]
+    public void ProgressiveCandidateIsDownloadableButItsDisplayIsRedacted()
+    {
+        var page = new Uri("https://page.example/watch?session=page-secret");
+        var candidate = new MediaCandidate(
+            new Uri("https://media.example/video?id=url-secret"),
+            MediaCandidateKind.Progressive,
+            MediaCandidateOrigin.BrowserBlob,
+            page,
+            BrowserSourceId: "opaque-secret");
+
+        Assert.True(candidate.CanDownload);
+        string displayed = candidate.ToString();
+        Assert.DoesNotContain("url-secret", displayed, StringComparison.Ordinal);
+        Assert.DoesNotContain("page-secret", displayed, StringComparison.Ordinal);
+        Assert.DoesNotContain("opaque-secret", displayed, StringComparison.Ordinal);
+    }
+
     private sealed class RecordingOutboundPolicy : IOutboundUriPolicy
     {
         public int CallCount { get; private set; }

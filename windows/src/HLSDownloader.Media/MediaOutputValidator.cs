@@ -12,6 +12,7 @@ public static class MediaOutputValidator
         {
             MediaOutputFormat.Mp4 => IsValidMp4(path),
             MediaOutputFormat.Wav => IsValidPcm16Wav(path),
+            MediaOutputFormat.WebM => IsValidWebM(path),
             _ => false
         };
         if (!valid)
@@ -206,5 +207,11 @@ public static class MediaOutputValidator
         }
 
         return pcm16 && nonEmptyData;
+    }
+
+    public static bool IsValidWebM(string path)
+    {
+        return WebMMediaValidator.TryInspect(path, out WebMMediaInspection inspection) &&
+            !inspection.IsEncrypted;
     }
 }

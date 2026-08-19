@@ -98,6 +98,85 @@ public sealed class BoundedHttpClientTests
         Assert.Single(handler.Referrers);
     }
 
+    [Fact]
+    public async Task StreamsLargeResponseToFileWithoutBufferingDto()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-CoreTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            byte[] payload = Enumerable.Range(0, 512 * 1024).Select(index => (byte)(index % 251)).ToArray();
+            var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload)
+            });
+            using var client = new BoundedHttpClient(handler, uriPolicy: new AlwaysAllowPolicy());
+            string destination = Path.Combine(root, "media.bin");
+
+            StreamedHttpResource result = await client.DownloadToFileAsync(
+                new Uri("https://media.example/video"),
+                destination,
+                maximumBytes: payload.Length + 1);
+
+            Assert.Equal(payload.Length, result.BytesWritten);
+            Assert.Equal(payload, await File.ReadAllBytesAsync(destination));
+            Assert.Empty(Directory.EnumerateFiles(root, "*.part-*"));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task StreamingDownloadDeletesPartialFileWhenLimitIsExceeded()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-CoreTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var handler = new StubHandler(_ => Response(HttpStatusCode.OK, new string('x', 4096), includeLength: false));
+            using var client = new BoundedHttpClient(handler, uriPolicy: new AlwaysAllowPolicy());
+            string destination = Path.Combine(root, "media.bin");
+
+            await Assert.ThrowsAsync<CoreException>(() => client.DownloadToFileAsync(
+                new Uri("https://media.example/video"),
+                destination,
+                maximumBytes: 1024));
+
+            Assert.False(File.Exists(destination));
+            Assert.Empty(Directory.EnumerateFiles(root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PrefixProbeReadsOnlyBoundedPrefixAndReturnsMediaType()
+    {
+        byte[] payload = Enumerable.Range(0, 128 * 1024).Select(index => (byte)(index % 251)).ToArray();
+        var handler = new StubHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload)
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("video/mp4");
+            return response;
+        });
+        using var client = new BoundedHttpClient(handler, uriPolicy: new AlwaysAllowPolicy());
+
+        HttpPrefixResource result = await client.ProbePrefixAsync(
+            new Uri("https://media.example/no-extension"),
+            maximumPrefixBytes: 4096);
+
+        Assert.Equal(payload[..4096], result.Prefix);
+        Assert.Equal("video/mp4", result.MediaType);
+        Assert.Equal("bytes=0-4095", handler.Ranges.Single());
+    }
+
     private static HttpResponseMessage Response(
         HttpStatusCode status, string body = "", string? location = null, bool includeLength = true,
         ContentRangeHeaderValue? contentRange = null)

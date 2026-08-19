@@ -5,6 +5,7 @@ namespace HLSDownloader.WebProbe;
 public static class ProbePayloadParser
 {
     public const int MaximumPayloadCharacters = 32 * 1024;
+    public const long MaximumBrowserBlobBytes = 20L * 1024 * 1024 * 1024;
     private const int MaximumTextLength = 512;
     private const int MaximumUrlLength = 8 * 1024;
 
@@ -47,6 +48,9 @@ public static class ProbePayloadParser
             var keySystem = Limit(ReadString(root, "keySystem"), 160);
             var sequence = Math.Max(0, ReadInt64(root, "seq") ?? 0);
             var emePhase = ParseEmePhase(ReadString(root, "phase"));
+            var browserObjectId = Limit(ReadString(root, "objectId"), 96);
+            var byteLength = ReadInt64(root, "byteLength");
+            var container = ParseContainer(ReadString(root, "container"));
 
             Uri? thumbnail = null;
             if (TryNormalizeHttpUrl(ReadString(root, "thumbnail"), out var parsedThumbnail))
@@ -70,13 +74,31 @@ public static class ProbePayloadParser
                 keySystem,
                 sequence,
                 pageUrl,
-                emePhase);
+                emePhase,
+                browserObjectId,
+                byteLength,
+                container);
             if (!parsed.IsManifest
                 && kind is not ProbeSignalKind.MediaElement
                     and not ProbeSignalKind.EncryptedMedia
-                    and not ProbeSignalKind.EncryptedMediaLifecycle)
+                    and not ProbeSignalKind.EncryptedMediaLifecycle
+                    and not ProbeSignalKind.BrowserBlob
+                    and not ProbeSignalKind.MediaSource)
             {
                 return false;
+            }
+
+            if (kind is ProbeSignalKind.BrowserBlob or ProbeSignalKind.MediaSource)
+            {
+                if (!IsValidBrowserObjectId(browserObjectId)
+                    || pageUrl is null
+                    || !IsSameOrigin(url!, pageUrl)
+                    || (kind == ProbeSignalKind.BrowserBlob
+                        && (byteLength is null or <= 0 or > MaximumBrowserBlobBytes))
+                    || (kind == ProbeSignalKind.MediaSource && byteLength is not null))
+                {
+                    return false;
+                }
             }
 
             if (kind == ProbeSignalKind.EncryptedMediaLifecycle
@@ -150,7 +172,25 @@ public static class ProbePayloadParser
         "media" => ProbeSignalKind.MediaElement,
         "eme" => ProbeSignalKind.EncryptedMedia,
         "eme-lifecycle" => ProbeSignalKind.EncryptedMediaLifecycle,
+        "browser-blob" => ProbeSignalKind.BrowserBlob,
+        "media-source" => ProbeSignalKind.MediaSource,
         _ => ProbeSignalKind.Network
+    };
+
+    private static ProbeMediaContainer ParseContainer(string? raw) => raw switch
+    {
+        "hls" => ProbeMediaContainer.Hls,
+        "dash" => ProbeMediaContainer.Dash,
+        "mp4" => ProbeMediaContainer.Mp4,
+        "quicktime" => ProbeMediaContainer.QuickTime,
+        "mpegts" => ProbeMediaContainer.MpegTs,
+        "webm" => ProbeMediaContainer.WebM,
+        "m4a" => ProbeMediaContainer.M4a,
+        "mp3" => ProbeMediaContainer.Mp3,
+        "aac" => ProbeMediaContainer.Aac,
+        "ogg" => ProbeMediaContainer.Ogg,
+        "opus" => ProbeMediaContainer.Opus,
+        _ => ProbeMediaContainer.Unknown
     };
 
     private static ProbeEmeLifecyclePhase? ParseEmePhase(string? raw) => raw switch
@@ -167,16 +207,59 @@ public static class ProbePayloadParser
             : null;
 
     private static long? ReadInt64(JsonElement root, string name)
-        => root.TryGetProperty(name, out var value) && value.TryGetInt64(out var number)
+        => root.TryGetProperty(name, out var value)
+           && value.ValueKind == JsonValueKind.Number
+           && value.TryGetInt64(out var number)
             ? number
             : null;
 
     private static string? Limit(string? value, int length)
         => string.IsNullOrWhiteSpace(value) ? null : value[..Math.Min(value.Length, length)];
+
+    private static bool IsValidBrowserObjectId(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 96)
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(character) && character is not '-' and not '_')
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsSameOrigin(Uri left, Uri right)
+        => string.Equals(left.Scheme, right.Scheme, StringComparison.OrdinalIgnoreCase)
+           && string.Equals(left.IdnHost, right.IdnHost, StringComparison.OrdinalIgnoreCase)
+           && left.Port == right.Port;
 }
 
 public static class ResourceClassifier
 {
+    private static readonly HashSet<string> ProgressiveExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".mp4", ".mov", ".m4v", ".m4a", ".mp3", ".aac", ".ogg", ".oga", ".opus",
+        ".ts", ".m2ts", ".webm"
+    };
+
+    private static readonly HashSet<string> FragmentExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".m4s", ".cmfv", ".cmfa"
+    };
+
+    private static readonly HashSet<string> ProgressiveMimeTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "video/mp4", "video/quicktime", "video/x-m4v", "audio/mp4", "audio/x-m4a",
+        "audio/mpeg", "audio/aac", "audio/ogg", "application/ogg", "audio/opus",
+        "video/mp2t", "video/mpeg", "video/webm", "audio/webm"
+    };
+
     public static bool IsManifest(Uri url, string? mimeType = null)
     {
         var path = url.AbsolutePath;
@@ -184,5 +267,28 @@ public static class ResourceClassifier
             || path.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase)
             || mimeType?.Contains("mpegurl", StringComparison.OrdinalIgnoreCase) == true
             || mimeType?.Contains("dash+xml", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    public static bool IsProgressiveMedia(Uri url, string? mimeType = null)
+    {
+        ArgumentNullException.ThrowIfNull(url);
+        var extension = Path.GetExtension(url.AbsolutePath);
+        if (FragmentExtensions.Contains(extension))
+        {
+            return false;
+        }
+        if (ProgressiveExtensions.Contains(extension))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(mimeType))
+        {
+            return false;
+        }
+
+        var separator = mimeType.IndexOf(';');
+        var normalized = (separator < 0 ? mimeType : mimeType[..separator]).Trim();
+        return ProgressiveMimeTypes.Contains(normalized);
     }
 }

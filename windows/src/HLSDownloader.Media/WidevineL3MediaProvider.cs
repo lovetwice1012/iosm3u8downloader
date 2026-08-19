@@ -29,6 +29,7 @@ public sealed record WidevineL3MediaOptions(
 /// </summary>
 public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
 {
+    private static readonly TimeSpan AbandonedJobMaximumAge = TimeSpan.FromHours(24);
     private readonly IResourceDownloader _manifestDownloader;
     private readonly IResourceDownloader _segmentDownloader;
     private readonly IWidevineCredentialSource _credentialSource;
@@ -94,16 +95,21 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
             manifestResource.EffectiveUri,
             IsPermitted,
             cancellationToken).ConfigureAwait(false);
+        string? temporaryRoot = null;
         string? jobDirectory = null;
         try
         {
-            string temporaryRoot = Path.GetFullPath(
+            temporaryRoot = Path.GetFullPath(
                 _options.TemporaryRoot ?? Path.Combine(Path.GetTempPath(), "HLSDownloader", "WidevineJobs"));
             Directory.CreateDirectory(temporaryRoot);
+            CleanupAbandonedJobs(temporaryRoot, AbandonedJobMaximumAge);
             jobDirectory = Path.Combine(temporaryRoot, Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(jobDirectory);
             var observedEffectiveUris = new List<Uri>();
-            var byteBudget = new DownloadByteBudget(_options.MaximumTotalBytes);
+            long stagingLimit = MediaOutputBudget.LimitForPath(
+                Path.Combine(jobDirectory, ".staging-budget"),
+                _options.MaximumTotalBytes);
+            var byteBudget = new DownloadByteBudget(stagingLimit);
             string? videoPath = plan.Video is null ? null : await DownloadTrackAsync(
                 plan.Video,
                 Path.Combine(jobDirectory, "video"),
@@ -122,6 +128,9 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
             WidevineFmp4EncryptionValidator.Validate(plan.Video, videoPath);
             WidevineFmp4EncryptionValidator.Validate(plan.Audio, audioPath);
             string clearOutput = Path.Combine(jobDirectory, plan.OutputFormat == MediaOutputFormat.Mp4 ? "clear.mp4" : "clear.wav");
+            long encryptedInputBytes = (videoPath is null ? 0 : new FileInfo(videoPath).Length) +
+                (audioPath is null ? 0 : new FileInfo(audioPath).Length);
+            MediaOutputBudget.EnsureFits(clearOutput, encryptedInputBytes, _options.MaximumTotalBytes);
             await DecryptAndComposeAsync(
                 plan,
                 videoPath,
@@ -129,7 +138,7 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
                 keys,
                 clearOutput,
                 cancellationToken).ConfigureAwait(false);
-            MediaOutputValidator.Validate(clearOutput, plan.OutputFormat);
+            ValidateClearOutput(clearOutput, plan.OutputFormat);
 
             // Final fail-closed policy checkpoint immediately before any clear
             // media enters the caller-selected output location.
@@ -144,29 +153,46 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
             string partialPath = outputPath + ".part";
             File.Delete(partialPath);
+            MediaOutputBudget.EnsureFits(partialPath, new FileInfo(clearOutput).Length, _options.MaximumTotalBytes);
+            bool published = false;
             try
             {
                 File.Copy(clearOutput, partialPath, overwrite: true);
-                MediaOutputValidator.Validate(partialPath, plan.OutputFormat);
+                ValidateClearOutput(partialPath, plan.OutputFormat);
+
+                // Probe the exact bytes that will be atomically published. A
+                // successful container scan alone does not prove that ffmpeg
+                // can expose the expected playable track layout.
+                MediaTrackInfo tracks = await _trackProbe.ProbeAsync(
+                    partialPath,
+                    TimeSpan.FromMinutes(2),
+                    cancellationToken).ConfigureAwait(false);
+                ValidateTrackLayout(plan, tracks);
+                await ValidateDecodeIntegrityAsync(
+                    plan,
+                    tracks,
+                    partialPath,
+                    cancellationToken).ConfigureAwait(false);
+
+                // The source and destination share a directory, so Move is an
+                // atomic rename. Do not mark the destination as ours before a
+                // successful move: a failed overwrite must preserve an older
+                // user file at the same path.
                 File.Move(partialPath, outputPath, overwrite: true);
-                MediaOutputValidator.Validate(outputPath, plan.OutputFormat);
+                published = true;
+                ValidateClearOutput(outputPath, plan.OutputFormat);
+
+                return new MediaComposeResult(outputPath, plan.OutputFormat, tracks);
+            }
+            catch
+            {
+                if (published) TryDeleteFile(outputPath);
+                throw;
             }
             finally
             {
-                File.Delete(partialPath);
+                TryDeleteFile(partialPath);
             }
-
-            MediaTrackInfo tracks = await _trackProbe.ProbeAsync(
-                outputPath,
-                TimeSpan.FromMinutes(2),
-                cancellationToken).ConfigureAwait(false);
-            if ((plan.OutputFormat == MediaOutputFormat.Mp4 && !tracks.HasVideo) ||
-                (plan.OutputFormat == MediaOutputFormat.Wav && (tracks.HasVideo || !tracks.HasAudio)))
-            {
-                File.Delete(outputPath);
-                throw new InvalidDataException("The Widevine output track layout is invalid.");
-            }
-            return new MediaComposeResult(outputPath, plan.OutputFormat, tracks);
         }
         finally
         {
@@ -175,9 +201,9 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
                 CryptographicOperations.ZeroMemory(id);
                 CryptographicOperations.ZeroMemory(value);
             }
-            if (jobDirectory is not null)
+            if (jobDirectory is not null && temporaryRoot is not null)
             {
-                TryDeleteDirectory(jobDirectory);
+                TryDeleteJobDirectory(jobDirectory, temporaryRoot);
             }
         }
     }
@@ -298,6 +324,8 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
             }).ConfigureAwait(false);
 
         string combined = Path.Combine(directory, "encrypted.mp4");
+        long combinedBytes = paths.Sum(path => new FileInfo(path).Length);
+        byteBudget.Add(combinedBytes);
         await using (var output = new FileStream(combined, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
         {
             foreach (string path in paths)
@@ -317,7 +345,16 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
         string outputPath,
         CancellationToken cancellationToken)
     {
+        long outputLimit = MediaOutputBudget.LimitForPath(outputPath, _options.MaximumTotalBytes);
         var arguments = new List<string> { "-y", "-nostdin", "-hide_banner", "-loglevel", "warning" };
+        if (plan.OutputFormat == MediaOutputFormat.Wav)
+        {
+            // Audio-only export decodes the encrypted samples during this
+            // compose step. The later PCM gate cannot distinguish silence or
+            // partial audio produced with a wrong key, so decode errors must
+            // be fatal before the WAV is accepted.
+            arguments.AddRange(["-xerror", "-err_detect", "explode"]);
+        }
         var redactions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (plan.Video is { } video)
         {
@@ -338,11 +375,13 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
         {
             arguments.AddRange(["-map", "0:v:0"]);
             arguments.AddRange(plan.Audio is null ? ["-map", "0:a?"] : ["-map", "1:a:0"]);
-            arguments.AddRange(["-c", "copy", "-movflags", "+faststart", "-f", "mp4", outputPath]);
+            arguments.AddRange(["-c", "copy", "-movflags", "+faststart", "-f", "mp4",
+                "-fs", outputLimit.ToString(System.Globalization.CultureInfo.InvariantCulture), outputPath]);
         }
         else
         {
-            arguments.AddRange(["-map", "0:a:0", "-vn", "-c:a", "pcm_s16le", "-rf64", "auto", "-f", "wav", outputPath]);
+            arguments.AddRange(["-map", "0:a:0", "-vn", "-c:a", "pcm_s16le", "-rf64", "auto", "-f", "wav",
+                "-fs", outputLimit.ToString(System.Globalization.CultureInfo.InvariantCulture), outputPath]);
         }
 
         ExternalToolResult result = await _toolRunner.RunAsync(
@@ -357,6 +396,44 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
             File.Delete(outputPath);
             throw new ExternalToolException($"ffmpeg Widevine compose failed: {result.StandardError}", result.ExitCode);
         }
+        MediaOutputBudget.EnsureBelowLimit(outputPath, outputLimit);
+    }
+
+    private async Task ValidateDecodeIntegrityAsync(
+        WidevineDashDownloadPlan plan,
+        MediaTrackInfo tracks,
+        string inputPath,
+        CancellationToken cancellationToken)
+    {
+        var arguments = new List<string>
+        {
+            "-nostdin", "-hide_banner", "-v", "error", "-xerror",
+            "-err_detect", "explode", "-abort_on", "empty_output+empty_output_stream",
+            "-i", inputPath
+        };
+        if (plan.OutputFormat == MediaOutputFormat.Mp4)
+        {
+            arguments.AddRange(["-map", "0:v:0"]);
+            if (tracks.HasAudio) arguments.AddRange(["-map", "0:a:0"]);
+        }
+        else
+        {
+            arguments.AddRange(["-map", "0:a:0", "-vn"]);
+        }
+        arguments.AddRange(["-sn", "-dn", "-f", "null", "-"]);
+
+        ExternalToolResult result = await _toolRunner.RunAsync(
+            new ExternalToolInvocation(
+                _ffmpegPath,
+                arguments,
+                _options.ComposeTimeout ?? TimeSpan.FromMinutes(30)),
+            cancellationToken).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+        {
+            throw new ExternalToolException(
+                $"ffmpeg Widevine decode integrity validation failed: {result.StandardError}",
+                result.ExitCode);
+        }
     }
 
     private static void EnsurePermitted(Uri uri, Func<Uri, bool> policy, string description)
@@ -364,12 +441,103 @@ public sealed class WidevineL3MediaProvider : IWidevineL3MediaProvider
         if (!policy(uri)) throw new WidevineL3ProviderUnavailableException($"The {description} failed the common Widevine exact-host policy.");
     }
 
-    private static void TryDeleteDirectory(string path)
+    private static void ValidateClearOutput(string path, MediaOutputFormat format)
+    {
+        MediaOutputValidator.Validate(path, format);
+        if (format == MediaOutputFormat.Mp4)
+            WidevineFmp4EncryptionValidator.ValidateClearOutput(path);
+    }
+
+    private static void ValidateTrackLayout(WidevineDashDownloadPlan plan, MediaTrackInfo tracks)
+    {
+        bool valid = plan.OutputFormat switch
+        {
+            MediaOutputFormat.Mp4 => plan.Video is not null && tracks.HasVideo &&
+                (plan.Audio is null || tracks.HasAudio),
+            MediaOutputFormat.Wav => plan.Video is null && plan.Audio is not null &&
+                !tracks.HasVideo && tracks.HasAudio,
+            _ => false
+        };
+        if (!valid)
+            throw new InvalidDataException("The Widevine output track layout is invalid.");
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try { File.Delete(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    internal static void CleanupAbandonedJobs(string temporaryRoot, TimeSpan olderThan)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(temporaryRoot);
+        if (olderThan < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(olderThan));
+        string root = Path.GetFullPath(temporaryRoot);
+        var rootInfo = new DirectoryInfo(root);
+        rootInfo.Refresh();
+        if (!rootInfo.Exists) return;
+        if ((rootInfo.Attributes & FileAttributes.ReparsePoint) != 0 || rootInfo.LinkTarget is not null)
+            throw new InvalidDataException("The Widevine temporary root cannot be a reparse point or symbolic link.");
+
+        DateTime threshold = DateTime.UtcNow - olderThan;
+        foreach (string candidate in Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                var info = new DirectoryInfo(candidate);
+                info.Refresh();
+                if (!info.Exists ||
+                    !IsSafeJobDirectory(root, info.FullName, info.Attributes, info.LinkTarget is not null) ||
+                    info.LastWriteTimeUtc >= threshold)
+                {
+                    continue;
+                }
+                TryDeleteJobDirectory(info.FullName, root);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    internal static bool IsSafeJobDirectory(
+        string temporaryRoot,
+        string candidate,
+        FileAttributes attributes,
+        bool hasLinkTarget)
     {
         try
         {
-            string full = Path.GetFullPath(path);
-            if (Directory.Exists(full) && Guid.TryParseExact(Path.GetFileName(full), "N", out _)) Directory.Delete(full, recursive: true);
+            string root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(temporaryRoot));
+            string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidate));
+            string? parent = Path.GetDirectoryName(full);
+            StringComparison comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            return parent is not null &&
+                string.Equals(Path.TrimEndingDirectorySeparator(parent), root, comparison) &&
+                Guid.TryParseExact(Path.GetFileName(full), "N", out _) &&
+                (attributes & FileAttributes.Directory) != 0 &&
+                (attributes & FileAttributes.ReparsePoint) == 0 &&
+                !hasLinkTarget;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryDeleteJobDirectory(string path, string temporaryRoot)
+    {
+        try
+        {
+            var info = new DirectoryInfo(Path.GetFullPath(path));
+            info.Refresh();
+            if (info.Exists &&
+                IsSafeJobDirectory(temporaryRoot, info.FullName, info.Attributes, info.LinkTarget is not null))
+            {
+                Directory.Delete(info.FullName, recursive: true);
+            }
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }

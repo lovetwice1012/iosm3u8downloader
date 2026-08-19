@@ -33,11 +33,14 @@ public sealed class HtmlMediaTests
     }
 
     [Fact]
-    public void IgnoresOrdinaryMp4AndUnsafeSchemes()
+    public void ExtractsProgressiveMediaAndIgnoresUnsafeSchemes()
     {
-        var html = "<video src='movie.mp4'><source src='javascript:alert(1)'></video>";
+        var html = "<video src='movie.mp4'><source src='javascript:alert(1)'><source src='audio' type='audio/ogg'></video>";
         var result = HtmlMediaExtractor.Extract(html, new Uri("https://example.com/"));
-        Assert.Empty(result.Media);
+        Assert.Equal(2, result.Media.Count);
+        Assert.All(result.Media, media => Assert.Equal(MediaCandidateKind.Progressive, media.Kind));
+        Assert.Contains(result.Media, media => media.Uri == new Uri("https://example.com/movie.mp4"));
+        Assert.Contains(result.Media, media => media.Uri == new Uri("https://example.com/audio"));
     }
 
     [Fact]

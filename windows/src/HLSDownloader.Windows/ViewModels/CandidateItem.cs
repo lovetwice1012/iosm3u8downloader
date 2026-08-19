@@ -11,19 +11,37 @@ public sealed class CandidateItem : INotifyPropertyChanged
     private bool _canDownload;
     private string _downloadHint;
 
-    public CandidateItem(MediaCandidate candidate, bool canDownload, string downloadHint)
+    public CandidateItem(
+        MediaCandidate candidate,
+        bool canDownload,
+        string downloadHint,
+        BrowserGeneratedMediaDescriptor? browserGeneratedMedia = null)
     {
         Candidate = candidate;
         _canDownload = canDownload;
         _downloadHint = downloadHint;
+        BrowserGeneratedMedia = browserGeneratedMedia;
     }
 
     public MediaCandidate Candidate { get; private set; }
+
+    public BrowserGeneratedMediaDescriptor? BrowserGeneratedMedia { get; }
+
+    public BrowserBlobCaptureHandle? BrowserBlobCapture => BrowserGeneratedMedia is { CanCapture: true } generated
+        ? generated.CaptureHandle
+        : null;
 
     public string Url
     {
         get
         {
+            if (BrowserGeneratedMedia is { } generated)
+            {
+                var size = generated.ByteLength is { } bytes ? $" • {bytes:N0} bytes" : string.Empty;
+                var generatedPort = generated.PageUri.IsDefaultPort ? string.Empty : $":{generated.PageUri.Port}";
+                return $"{generated.PageUri.Scheme}://{generated.PageUri.IdnHost}{generatedPort} • browser generated{size}";
+            }
+
             var pathDepth = Candidate.Uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Length;
             var extension = Path.GetExtension(Candidate.Uri.AbsolutePath);
             var query = string.IsNullOrEmpty(Candidate.Uri.Query) ? string.Empty : " • queryあり";
@@ -38,6 +56,9 @@ public sealed class CandidateItem : INotifyPropertyChanged
     {
         MediaCandidateKind.Hls => "HLS / m3u8",
         MediaCandidateKind.WidevineDash => "MPEG-DASH / Widevine",
+        MediaCandidateKind.Progressive when BrowserGeneratedMedia?.CanCapture == false => "MediaSource / MSE",
+        MediaCandidateKind.Progressive when BrowserGeneratedMedia is not null => $"Browser Blob / {BrowserGeneratedMedia.Container}",
+        MediaCandidateKind.Progressive => "Progressive media",
         _ => "動画"
     };
 
@@ -48,6 +69,7 @@ public sealed class CandidateItem : INotifyPropertyChanged
         MediaCandidateOrigin.Source => "sourceタグ",
         MediaCandidateOrigin.DataAttribute => "data属性",
         MediaCandidateOrigin.InlineScript => "ページ内スクリプト",
+        MediaCandidateOrigin.BrowserBlob => "JavaScript / Blob",
         MediaCandidateOrigin.Iframe => $"iframe（深さ {Candidate.IframeDepth}）",
         _ => "ページ解析"
     };

@@ -107,4 +107,70 @@ public sealed class MediaOutputValidatorTests
 
         Assert.True(MediaOutputValidator.IsValidMp4(path));
     }
+
+    [Fact]
+    public void AcceptsWebMWithEbmlHeaderAndSegment()
+    {
+        using var scope = new TestFileScope();
+        string path = scope.PathFor("video.webm");
+        TestFileScope.WriteMinimalWebM(path);
+
+        Assert.True(MediaOutputValidator.IsValidWebM(path));
+    }
+
+    [Fact]
+    public void RejectsWebMWithoutMediaBlock()
+    {
+        using var scope = new TestFileScope();
+        string path = scope.PathFor("empty.webm");
+        TestFileScope.WriteMinimalWebM(path, includeMediaSample: false);
+
+        Assert.False(MediaOutputValidator.IsValidWebM(path));
+    }
+
+    [Fact]
+    public void RejectsEncryptedWebMBlock()
+    {
+        using var scope = new TestFileScope();
+        string path = scope.PathFor("encrypted.webm");
+        TestFileScope.WriteMinimalWebM(path, encryptedBlock: true);
+
+        Assert.False(MediaOutputValidator.IsValidWebM(path));
+    }
+
+    [Fact]
+    public void RejectsUnknownSizeLeafThatWouldHideEncryptedBlock()
+    {
+        using var scope = new TestFileScope();
+        string path = scope.PathFor("unknown-leaf.webm");
+        TestFileScope.WriteMinimalWebM(path);
+        List<byte> bytes = File.ReadAllBytes(path).ToList();
+        byte[] hiddenEncryptedCluster =
+        [
+            // Unknown-size Info leaf followed by a syntactically valid
+            // EncryptedBlock Cluster. Treating arbitrary unknown-size leaves
+            // as parent-sized would skip the encrypted Cluster.
+            0x15, 0x49, 0xA9, 0x66, 0xFF,
+            0x1F, 0x43, 0xB6, 0x75, 0x87,
+            0xAF, 0x85, 0x81, 0x00, 0x00, 0x80, 0x01
+        ];
+        bytes.AddRange(hiddenEncryptedCluster);
+        int segmentPayloadLength = (bytes[16] & 0x7F) + hiddenEncryptedCluster.Length;
+        bytes[16] = checked((byte)(0x80 | segmentPayloadLength));
+        File.WriteAllBytes(path, bytes.ToArray());
+
+        Assert.False(MediaOutputValidator.IsValidWebM(path));
+    }
+
+    [Fact]
+    public void RejectsEbmlHeaderWithoutWebMSegment()
+    {
+        using var scope = new TestFileScope();
+        string path = scope.PathFor("not-webm.bin");
+        byte[] bytes = new byte[32];
+        new byte[] { 0x1A, 0x45, 0xDF, 0xA3 }.CopyTo(bytes, 0);
+        File.WriteAllBytes(path, bytes);
+
+        Assert.False(MediaOutputValidator.IsValidWebM(path));
+    }
 }

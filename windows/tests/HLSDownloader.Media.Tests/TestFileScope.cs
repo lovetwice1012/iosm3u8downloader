@@ -41,18 +41,59 @@ internal sealed class TestFileScope : IDisposable
         File.WriteAllBytes(path, bytes);
     }
 
-    public static void WriteMinimalMp4(string path)
+    public static void WriteMinimalMp4(string path, byte[]? moovPayload = null)
     {
-        byte[] bytes = new byte[41];
+        moovPayload ??= [];
+        byte[] bytes = new byte[41 + moovPayload.Length];
         BinaryPrimitives.WriteUInt32BigEndian(bytes, 24);
         Encoding.ASCII.GetBytes("ftypisom").CopyTo(bytes, 4);
         Encoding.ASCII.GetBytes("isomiso2").CopyTo(bytes, 12);
-        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(24), 8);
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(24), checked((uint)(8 + moovPayload.Length)));
         Encoding.ASCII.GetBytes("moov").CopyTo(bytes, 28);
-        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(32), 9);
-        Encoding.ASCII.GetBytes("mdat").CopyTo(bytes, 36);
-        bytes[40] = 1;
+        moovPayload.CopyTo(bytes, 32);
+        int mediaDataOffset = 32 + moovPayload.Length;
+        BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(mediaDataOffset), 9);
+        Encoding.ASCII.GetBytes("mdat").CopyTo(bytes, mediaDataOffset + 4);
+        bytes[mediaDataOffset + 8] = 1;
         File.WriteAllBytes(path, bytes);
+    }
+
+    public static void WriteMinimalWebM(
+        string path,
+        bool includeMediaSample = true,
+        bool encryptedBlock = false)
+    {
+        List<byte> segmentPayload =
+        [
+            // Tracks -> TrackEntry -> TrackNumber(1)
+            0x16, 0x54, 0xAE, 0x6B, 0x85,
+            0xAE, 0x83,
+            0xD7, 0x81, 0x01
+        ];
+        List<byte> clusterPayload = includeMediaSample
+            ?
+            [
+                encryptedBlock ? (byte)0xAF : (byte)0xA3,
+                0x85,
+                0x81, 0x00, 0x00, 0x80, 0x01
+            ]
+            :
+            [
+                // Timecode only: a valid Cluster that contains no Block.
+                0xE7, 0x81, 0x00
+            ];
+        segmentPayload.AddRange([0x1F, 0x43, 0xB6, 0x75, (byte)(0x80 | clusterPayload.Count)]);
+        segmentPayload.AddRange(clusterPayload);
+
+        List<byte> bytes =
+        [
+            // EBML header -> DocType("webm")
+            0x1A, 0x45, 0xDF, 0xA3, 0x87,
+            0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6D,
+            0x18, 0x53, 0x80, 0x67, (byte)(0x80 | segmentPayload.Count)
+        ];
+        bytes.AddRange(segmentPayload);
+        File.WriteAllBytes(path, bytes.ToArray());
     }
 
     public static void WriteRf64Wav(string path, ulong declaredDataLength, int actualDataLength)

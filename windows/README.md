@@ -5,6 +5,7 @@ iOS版と同じ「URL入力 → 解析 → 候補選択 → 再生または保�
 ## 主な機能
 
 - 拡張子に依存しないHLS / MPD判定
+- direct/progressive HTTP(S)のMP4 / MOV / M4V / M4A / MP3 / Ogg / Opus / WebMを、64 KiB以下の先頭magicとMIME hintで候補化
 - `video` / `source` / data属性 / inline script / 同一origin iframeの静的HTML解析
 - WebView2でページを実際に操作する「再生解析（α）」
   - document-startでDOMとMutationObserverを監視
@@ -12,9 +13,11 @@ iOS版と同じ「URL入力 → 解析 → 候補選択 → 再生または保�
   - EME要求と`encrypted`イベントを検出
   - host側の全WebResource context、redirect先、response MIMEでもm3u8 / MPDを捕捉
   - Content-Lengthが512 KiB以下の拡張子なしtext/XML/octet-stream応答だけ、先頭32 KiBを最大64応答・2並列・3秒で確認
+  - `URL.createObjectURL`で完成済みBlobの種類・サイズ・先頭64 KiBだけを検出し、Blob本体はbase64化せずWebView2のdownload streamで一時取得
+  - MediaSource / MSEのcontainerを検出して候補表示（MSEのappend buffer自体は保存しない）
 - サムネイル、検出元、保存可否を含む候補一覧
 - 通常HLS、identity AES-128 / SAMPLE-AES、MPEG-TS / fMP4のローカル化とFFmpeg合成
-- 実際のtrackをffprobeで確認し、映像ありはMP4、音声だけはPCM 16-bit WAVへ自動出力
+- 実際のtrackをffprobeで確認し、MP4系の映像ありはMP4、WebM映像はWebMのまま、音声だけはPCM 16-bit WAVへ自動出力。TSとraw ADTS AACはmanifestと暗号情報を検証できるHLS経路だけで扱います
 - 進捗、取消、完成ファイルを開く・フォルダー表示・名前を付けて保存
 - WVDをWindowsのユーザー単位データ保護で暗号化して保管・削除するUI
   - 取り込み時と復号読み出し時にWVD v2 / Chrome・Android / L3 / flags 0 / フィールド長を検証（最大256 KiB）
@@ -57,9 +60,11 @@ artifactをダウンロードし、必要なら `Get-FileHash <zip> -Algorithm S
 
 ## 再生解析の安全境界
 
-page scriptからnative bridgeへ送るのは、検出元、公開URL、frameのpage URL、MIME、タイトル、サムネイルURL、EME key-system名だけです。request/response本文、Cookie、Authorization、任意header値、ライセンス応答、init dataの内容はbridge payloadへ入れません。
+page scriptからnative bridgeへ送るのは、検出元、公開URL、frameのpage URL、MIME、タイトル、サムネイルURL、EME key-system名、およびBlob/MSEのopaque ID・byte数・検出containerだけです。request/response本文、Blob本体、Blob URL、Cookie、Authorization、任意header値、ライセンス応答、init dataの内容はbridge payloadへ入れません。
 
-native側では256-bit nonce、schema version、payload長、signal件数、http(s) scheme、userinfo不在を検証します。候補として必要な署名付きURLはメモリ上の候補に保持しますが、診断ログではqueryとfragmentを伏せます。検出URLとframe URLに適合するWebView2 Cookie（HttpOnlyを含む）はCookieManagerから取得し、domain/path/secure/SameSite属性を検証します。Cookie snapshotは候補ごとにメモリ内だけで最大5分保持し、選択時に一度だけforeground download用CookieContainerへ反映して処理後に消去します。Cookie値はUI・ログ・job台帳・ファイルへ出力しません。静的HTTP解析はprivate/local network宛てとHTTPSからHTTPへのdowngrade redirectを拒否します。
+native側では256-bit nonce、schema version、payload長、signal件数、http(s) scheme、userinfo不在を検証します。候補として必要な署名付きURLはメモリ上の候補に保持しますが、診断ログではqueryとfragmentを伏せます。Blob URLやBlob bytesはbridgeへ送らず、documentごとの乱数付きopaque IDだけを使い、record/debugger表示でもpage queryとobject IDを伏せます。検出URLとframe URLに適合するWebView2 Cookie（HttpOnlyを含む）はCookieManagerから取得し、domain/path/secure/SameSite属性を検証します。Cookie snapshotは候補ごとにメモリ内だけで最大5分保持し、選択時に一度だけforeground download用CookieContainerへ反映して処理後に消去します。Cookie値はUI・ログ・job台帳・ファイルへ出力しません。静的HTTP解析はprivate/local network宛てとHTTPSからHTTPへのdowngrade redirectを拒否します。
+
+完成済みBlobの取得は1件ずつ、最大20 GiB、取得前の空き容量確認付きで行います。iframe内のBlobには検出した所有frameへだけdownload commandを返し、navigationやframe破棄後のopaque IDは無効化します。一時ファイルは処理直後に削除し、異常終了で残ったUUID形式の一時directoryも次回起動時に1日経過分だけ清掃します。Blob内HLSは4 MiB以下の厳格UTF-8 manifestに限り、frameのpage URLを相対URLのbase/refererとして既存のCookie付きHLS経路へ渡します。MP4/WAV/WebMの生成中も64 GiBの絶対上限と、保存先に512 MiBを残す空き容量上限の小さい方をFFmpeg/copyへ適用し、上限到達ファイルは公開しません。
 
 高度解析はアプリ内WebView2のnative resource eventで完結し、WindowsのVPN・system proxy・証明書storeを変更しません。HTTPSのCA MITMや自己署名証明書のinstallも行いません。非復号のloopback CONNECT proxyではhost以外の取得情報が増えず、DRMやcertificate pinningとの互換性を落とすためです。
 
@@ -79,6 +84,6 @@ WVDは現在のWindowsユーザーに紐づけて暗号化保管し、許可host
 
 Core、Media、WebProbeはUIから独立した.NET 8コードですが、WinUI 3 / WebView2 / Windows picker / Windowsユーザー単位データ保護はWindows固有です。完全な単一実行ファイルではなく、Windows App SDK self-containedファイル一式とWebView2 Runtimeが必要です。WebView2内のログイン状態やDRM再生能力は、配信サイト、Edge Runtime、端末ポリシーに左右されます。
 
-WebView2内で検出した候補には、そのframeのpage URLをRefererとして引き継ぎ、適合Cookieをメモリ内だけで共有します。fetch / XHRはURLと公開Content-Typeを観測しますがresponse本文は読み取らないため、JSONやJavaScript本文の中にだけmanifest URLが現れ、network responseのURL/MIMEから判別できない配信は拾えない場合があります。Authorizationやサイト独自header、service worker内token、POST本文は取り込まないため、それらが必須のstreamは候補を検出できても保存に失敗する場合があります。
+WebView2内で検出した候補には、そのframeのpage URLをRefererとして引き継ぎ、適合Cookieをメモリ内だけで共有します。fetch / XHRはURLと公開Content-Typeを観測しますがresponse本文は読み取らないため、JSONやJavaScript本文の中にだけmanifest URLが現れ、network responseのURL/MIMEから判別できない配信は拾えない場合があります。完成済みprogressive/HLS Blobは保存できますが、append済みbufferしか残らないMSE-only配信は検出表示のみです。Blob内MPDは検出できますが、providerへraw MPDを安全に渡す経路がないため保存不可で、元の許可host HTTP MPD候補を使います。Authorizationやサイト独自header、service worker内token、POST本文は取り込まないため、それらが必須のstreamは候補を検出できても保存に失敗する場合があります。
 
 Cookieを使わない直接URLかつ、requested/effective/page URLのすべてにqueryを含まない通常HLSだけは、保存jobを別プロセスのWorkerへ引き渡すためUIを閉じても処理を継続できます。次回起動時は実行中jobへ再接続し、直近の完成ファイルも完成カードへ復元します。明示的な「取消」は再接続したworker jobにも送信しますが、ウィンドウを閉じただけではjobを取り消しません。job台帳がない、または実行待ちjobがない起動では、新しいWorkerを起動しません。Workerはjobとpipe利用がなくなってから60秒で終了します。署名tokenや認証状態をjob台帳へ残さないため、HTML/再生解析由来、Cookieあり、query付きの候補はforeground処理に限定します。OS終了、ユーザーログアウト、外部FFmpegの強制終了を越えて無条件に継続するものではありません。

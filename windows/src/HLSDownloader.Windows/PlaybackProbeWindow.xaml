@@ -42,6 +42,7 @@
             <WebView2
                 x:Name="Browser"
                 CoreWebView2Initialized="Browser_OnCoreWebView2Initialized"
+                NavigationStarting="Browser_OnNavigationStarting"
                 NavigationCompleted="Browser_OnNavigationCompleted" />
             <ProgressRing
                 x:Name="BrowserProgress"

@@ -2,6 +2,7 @@ using HLSDownloader.Core;
 using HLSDownloader.Media;
 using HLSDownloader.Worker;
 using System.Net;
+using System.Text;
 
 namespace HLSDownloader.Windows.Services;
 
@@ -10,9 +11,11 @@ namespace HLSDownloader.Windows.Services;
 /// </summary>
 public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 {
+    public const int MaximumCapturedHlsManifestBytes = 4 * 1024 * 1024;
+
     private readonly IWidevineCredentialSource _widevineCredentialSource;
     private readonly object _browserCookieSnapshotLock = new();
-    private readonly Dictionary<Uri, RememberedBrowserCookies> _browserCookieSnapshots = [];
+    private readonly Dictionary<BrowserCookieCapabilityKey, RememberedBrowserCookies> _browserCookieSnapshots = [];
     private readonly Dictionary<Uri, RememberedBrowserCookies> _analysisCookieSnapshots = [];
     private readonly WidevineLicenseHintCache _widevineLicenseHints = new();
     private readonly Timer _browserCookieExpiryTimer;
@@ -37,7 +40,7 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     public bool CanDownload(MediaCandidate candidate, out string reason)
     {
-        if (candidate.Kind == MediaCandidateKind.Hls)
+        if (candidate.Kind is MediaCandidateKind.Hls or MediaCandidateKind.Progressive)
         {
             reason = "再生・保存に対応";
             return true;
@@ -77,10 +80,14 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         return false;
     }
 
-    public void RememberBrowserCookies(Uri candidateUri, BrowserCookieSnapshot snapshot)
+    public void RememberBrowserCookies(
+        Uri candidateUri,
+        BrowserCookieSnapshot snapshot,
+        string? browserSourceId = null)
     {
         ArgumentNullException.ThrowIfNull(candidateUri);
         ArgumentNullException.ThrowIfNull(snapshot);
+        var capabilityKey = new BrowserCookieCapabilityKey(candidateUri, browserSourceId);
         lock (_browserCookieSnapshotLock)
         {
             if (_disposed)
@@ -91,12 +98,12 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             var now = DateTimeOffset.UtcNow;
             PurgeExpiredBrowserCookieSnapshotsLocked(now);
 
-            if (!_browserCookieSnapshots.ContainsKey(candidateUri) && _browserCookieSnapshots.Count >= 128)
+            if (!_browserCookieSnapshots.ContainsKey(capabilityKey) && _browserCookieSnapshots.Count >= 128)
             {
                 _browserCookieSnapshots.Remove(_browserCookieSnapshots.Keys.First());
             }
 
-            _browserCookieSnapshots[candidateUri] = new RememberedBrowserCookies(snapshot, now);
+            _browserCookieSnapshots[capabilityKey] = new RememberedBrowserCookies(snapshot, now);
             ScheduleBrowserCookieExpiryLocked(now);
         }
     }
@@ -300,7 +307,9 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             {
                 var now = DateTimeOffset.UtcNow;
                 PurgeExpiredBrowserCookieSnapshotsLocked(now);
-                if (_browserCookieSnapshots.Remove(candidate.Uri, out var remembered)
+                if (_browserCookieSnapshots.Remove(
+                        new BrowserCookieCapabilityKey(candidate.Uri, candidate.BrowserSourceId),
+                        out var remembered)
                     && now - remembered.CapturedAt <= BrowserCookieSnapshotLifetime)
                 {
                     // A browser credential snapshot is a short-lived, single-use capability.
@@ -353,22 +362,114 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
         }
     }
 
+    public async Task<CompletedMedia> ProcessCapturedProgressiveAsync(
+        MediaCandidate candidate,
+        string capturedPath,
+        string? declaredMediaType,
+        IProgress<DownloadProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentException.ThrowIfNullOrWhiteSpace(capturedPath);
+        if (candidate.Kind != MediaCandidateKind.Progressive
+            || candidate.Origin != MediaCandidateOrigin.BrowserBlob
+            || string.IsNullOrWhiteSpace(candidate.BrowserSourceId))
+        {
+            throw new InvalidOperationException("A browser Blob progressive candidate is required.");
+        }
+
+        await _downloadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var outputDirectory = GetOutputDirectory();
+            Directory.CreateDirectory(outputDirectory);
+            var outputBasePath = Path.Combine(outputDirectory, CreateOutputName(candidate));
+            var runner = new ExternalToolRunner(message => DiagnosticGenerated?.Invoke(message));
+            var locator = new FFmpegToolLocator();
+            var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
+            var composer = new FFmpegMediaComposer(locator.ResolveFFmpeg(), probe, runner);
+            var processor = new ProgressiveMediaProcessor(probe, composer);
+            processor.CleanupAbandonedJobs(TimeSpan.FromDays(1));
+            var result = await processor.ProcessLocalAsync(
+                capturedPath,
+                outputBasePath,
+                declaredMediaType,
+                progress,
+                cancellationToken).ConfigureAwait(false);
+            return ToCompletedMedia(result.OutputPath);
+        }
+        finally
+        {
+            _downloadGate.Release();
+        }
+    }
+
+    public async Task<CompletedMedia> ProcessCapturedHlsAsync(
+        MediaCandidate candidate,
+        string capturedPath,
+        IProgress<DownloadProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentException.ThrowIfNullOrWhiteSpace(capturedPath);
+        ArgumentNullException.ThrowIfNull(progress);
+        if (candidate.Kind != MediaCandidateKind.Hls
+            || candidate.Origin != MediaCandidateOrigin.BrowserBlob
+            || string.IsNullOrWhiteSpace(candidate.BrowserSourceId))
+        {
+            throw new InvalidOperationException("A browser Blob HLS candidate is required.");
+        }
+
+        var manifestText = await ReadCapturedHlsManifestAsync(
+            capturedPath,
+            cancellationToken).ConfigureAwait(false);
+        _ = HlsPlaylistParser.Parse(manifestText, candidate.PageUri, candidate.PageUri);
+
+        await _downloadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            BrowserCookieSnapshot? snapshot = null;
+            lock (_browserCookieSnapshotLock)
+            {
+                var now = DateTimeOffset.UtcNow;
+                PurgeExpiredBrowserCookieSnapshotsLocked(now);
+                if (_browserCookieSnapshots.Remove(
+                        new BrowserCookieCapabilityKey(candidate.Uri, candidate.BrowserSourceId),
+                        out var remembered)
+                    && now - remembered.CapturedAt <= BrowserCookieSnapshotLifetime)
+                {
+                    snapshot = remembered.Snapshot;
+                }
+
+                ScheduleBrowserCookieExpiryLocked(now);
+            }
+
+            var jobCookies = CreateCookieContainer();
+            new BrowserCookieSnapshotSynchronizer().Replace(jobCookies, snapshot);
+            var outputDirectory = GetOutputDirectory();
+            Directory.CreateDirectory(outputDirectory);
+            var outputBasePath = Path.Combine(outputDirectory, CreateOutputName(candidate));
+            using var job = CreateDownloadJob(candidate, jobCookies, manifestText);
+            var result = await job.Coordinator.DownloadAsync(
+                candidate,
+                outputBasePath,
+                progress,
+                cancellationToken).ConfigureAwait(false);
+            return ToCompletedMedia(result.OutputPath);
+        }
+        finally
+        {
+            _downloadGate.Release();
+        }
+    }
+
     private async Task<CompletedMedia> DownloadWithCoordinatorAsync(
         MediaCandidate candidate,
         CookieContainer jobCookies,
         IProgress<DownloadProgress> progress,
         CancellationToken cancellationToken)
     {
-        var outputDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
-            "HLSDownloader");
-        if (string.IsNullOrWhiteSpace(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos)))
-        {
-            outputDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "HLSDownloader.Windows",
-                "Completed");
-        }
+        var outputDirectory = GetOutputDirectory();
 
         Directory.CreateDirectory(outputDirectory);
         var outputBasePath = Path.Combine(outputDirectory, CreateOutputName(candidate));
@@ -387,11 +488,7 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             outputBasePath,
             progress,
             cancellationToken).ConfigureAwait(false);
-        return new CompletedMedia(
-            result.OutputPath,
-            result.OutputFormat == HLSDownloader.Media.MediaOutputFormat.Wav
-                ? HLSDownloader.Core.MediaOutputFormat.Wav
-                : HLSDownloader.Core.MediaOutputFormat.Mp4);
+        return ToCompletedMedia(result.OutputPath);
     }
 
     private async Task<CompletedMedia> DownloadWithBackgroundWorkerAsync(
@@ -486,9 +583,23 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
     private static CompletedMedia ToCompletedMedia(string outputPath)
         => new(
             outputPath,
-            Path.GetExtension(outputPath).Equals(".wav", StringComparison.OrdinalIgnoreCase)
-                ? HLSDownloader.Core.MediaOutputFormat.Wav
-                : HLSDownloader.Core.MediaOutputFormat.Mp4);
+            Path.GetExtension(outputPath).ToLowerInvariant() switch
+            {
+                ".wav" => HLSDownloader.Core.MediaOutputFormat.Wav,
+                ".webm" => HLSDownloader.Core.MediaOutputFormat.WebM,
+                _ => HLSDownloader.Core.MediaOutputFormat.Mp4
+            });
+
+    private static string GetOutputDirectory()
+    {
+        var videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+        return string.IsNullOrWhiteSpace(videos)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "HLSDownloader.Windows",
+                "Completed")
+            : Path.Combine(videos, "HLSDownloader");
+    }
 
     private void EnsureWorkerStarted(string pipeName)
     {
@@ -547,7 +658,10 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
            && string.IsNullOrEmpty(candidate.PageUri.Query)
            && File.Exists(GetWorkerExecutablePath());
 
-    private DownloadJob CreateDownloadJob(MediaCandidate candidate, CookieContainer jobCookies)
+    private DownloadJob CreateDownloadJob(
+        MediaCandidate candidate,
+        CookieContainer jobCookies,
+        string? capturedHlsManifest = null)
     {
         BoundedHttpClient? discoveryClient = null;
         BoundedHttpClient? segmentClient = null;
@@ -571,7 +685,15 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
             var ffmpegPath = locator.ResolveFFmpeg();
             var probe = new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner);
             var composer = new FFmpegMediaComposer(ffmpegPath, probe, runner);
-            var planner = new HlsDownloadPlanBuilder(discoveryClient);
+            ITextResourceFetcher playlistFetcher = capturedHlsManifest is null
+                ? discoveryClient
+                : new HLSDownloader.Core.CapturedRootManifestFetcher(
+                    capturedHlsManifest,
+                    candidate.PageUri,
+                    discoveryClient);
+            var planner = new HlsDownloadPlanBuilder(playlistFetcher);
+            var progressiveProcessor = new ProgressiveMediaProcessor(probe, composer, segmentClient);
+            progressiveProcessor.CleanupAbandonedJobs(TimeSpan.FromDays(1));
             IWidevineL3MediaProvider? widevineProvider = null;
             if (candidate.Kind == MediaCandidateKind.WidevineDash)
             {
@@ -592,7 +714,8 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
                 segmentClient,
                 composer,
                 widevineProvider: widevineProvider,
-                options: new HlsMediaDownloadOptions(MaximumConcurrentRequests: 2));
+                options: new HlsMediaDownloadOptions(MaximumConcurrentRequests: 2),
+                progressiveProcessor: progressiveProcessor);
             coordinator.CleanupAbandonedJobs(TimeSpan.FromDays(1));
             return new DownloadJob(coordinator, discoveryClient, segmentClient, licenseTransport);
         }
@@ -607,6 +730,34 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
 
     private static CookieContainer CreateCookieContainer()
         => new(capacity: 512, perDomainCapacity: 128, maxCookieSize: 8 * 1024);
+
+    private static async Task<string> ReadCapturedHlsManifestAsync(
+        string capturedPath,
+        CancellationToken cancellationToken)
+    {
+        var info = new FileInfo(capturedPath);
+        if (!info.Exists
+            || info.LinkTarget is not null
+            || info.Length is <= 0 or > MaximumCapturedHlsManifestBytes)
+        {
+            throw new InvalidDataException("The captured HLS manifest is missing or exceeds 4 MiB.");
+        }
+
+        var bytes = await File.ReadAllBytesAsync(capturedPath, cancellationToken).ConfigureAwait(false);
+        if (bytes.Length is <= 0 or > MaximumCapturedHlsManifestBytes)
+        {
+            throw new InvalidDataException("The captured HLS manifest changed while it was being read.");
+        }
+        try
+        {
+            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(bytes);
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new InvalidDataException("The captured HLS manifest is not valid UTF-8.", exception);
+        }
+    }
 
     private static string CreateOutputName(MediaCandidate candidate)
     {
@@ -707,6 +858,10 @@ public sealed class CoreMediaWorkflow : IMediaWorkflow, IDisposable
     private sealed record RememberedBrowserCookies(
         BrowserCookieSnapshot Snapshot,
         DateTimeOffset CapturedAt);
+
+    private readonly record struct BrowserCookieCapabilityKey(
+        Uri CandidateUri,
+        string? BrowserSourceId);
 
     private sealed class DownloadJob(
         HlsDownloadCoordinator coordinator,

@@ -21,6 +21,23 @@ public sealed class MediaSourceResolver(
     {
         if (!UriUtilities.IsHttp(requestedUri) || !string.IsNullOrEmpty(requestedUri.UserInfo))
             throw new UnsafeNetworkTargetException("The source URI is not safe HTTP(S).");
+        if (fetcher is IHttpPrefixProbe prefixProbe)
+        {
+            var prefix = await prefixProbe.ProbePrefixAsync(
+                requestedUri,
+                maximumPrefixBytes: 64 * 1024,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (ProgressiveMediaHintClassifier.HasSupportedMagic(prefix.Prefix))
+            {
+                var candidate = new MediaCandidate(
+                    prefix.EffectiveUri,
+                    MediaCandidateKind.Progressive,
+                    MediaCandidateOrigin.Direct,
+                    prefix.EffectiveUri,
+                    RequestedUri: requestedUri);
+                return new(requestedUri, prefix.EffectiveUri, [candidate], false);
+            }
+        }
         var payload = await fetcher.FetchTextAsync(requestedUri, cancellationToken: cancellationToken).ConfigureAwait(false);
         var text = payload.Text.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
         if (HlsPlaylistParser.IsPlaylist(text))

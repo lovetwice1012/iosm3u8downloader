@@ -8,7 +8,10 @@ public interface IMediaWorkflow
 {
     bool CanDownload(MediaCandidate candidate, out string reason);
 
-    void RememberBrowserCookies(Uri candidateUri, BrowserCookieSnapshot snapshot);
+    void RememberBrowserCookies(
+        Uri candidateUri,
+        BrowserCookieSnapshot snapshot,
+        string? browserSourceId = null);
 
     void RememberObservedWidevineLicense(
         Uri manifestUri,

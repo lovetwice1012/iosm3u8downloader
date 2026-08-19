@@ -48,6 +48,7 @@ public static class WebProbeScript
   let allowedWidevineManifestObserved = false;
   let disallowedWidevineManifestObserved = false;
   let widevineAccessGranted = false;
+  let browserObjectSequence = 0;
 
   // Capture the EME guard's security-sensitive intrinsics before page scripts
   // can replace globals or prototype methods. The guarded function below must
@@ -105,6 +106,45 @@ public static class WebProbeScript
     : undefined;
   const originalGenerateRequest = originalGenerateRequestDescriptor?.value;
   const originalUpdate = originalUpdateDescriptor?.value;
+  const SafeBlob = globalThis.Blob;
+  const safeBlobSizeGetter = SafeBlob
+    ? safeGetOwnPropertyDescriptor(SafeBlob.prototype, 'size')?.get
+    : undefined;
+  const safeBlobTypeGetter = SafeBlob
+    ? safeGetOwnPropertyDescriptor(SafeBlob.prototype, 'type')?.get
+    : undefined;
+  const safeBlobSlice = SafeBlob?.prototype?.slice;
+  const safeBlobArrayBuffer = SafeBlob?.prototype?.arrayBuffer;
+  const SafeMediaSource = globalThis.MediaSource;
+  const safeMediaSourceAddSourceBuffer = SafeMediaSource?.prototype?.addSourceBuffer;
+  const safeCreateObjectURL = SafeURL?.createObjectURL;
+  const safeRevokeObjectURL = SafeURL?.revokeObjectURL;
+  const SafeMap = globalThis.Map;
+  const SafeWeakMap = globalThis.WeakMap;
+  const SafeWeakRef = globalThis.WeakRef;
+  const SafeCrypto = globalThis.crypto;
+  const safeCryptoGetRandomValues = SafeCrypto?.getRandomValues;
+  const SafeUint8Array = globalThis.Uint8Array;
+  const SafeArrayBuffer = globalThis.ArrayBuffer;
+  const SafeTextDecoder = globalThis.TextDecoder;
+  const safeStringFromCharCode = globalThis.String.fromCharCode;
+  const browserObjects = new SafeMap();
+  const browserObjectUrls = new SafeMap();
+  const mediaSourceIds = new SafeWeakMap();
+  const MAX_BROWSER_OBJECTS = 64;
+  const MAX_BROWSER_BLOB_BYTES = 20 * 1024 * 1024 * 1024;
+  const MAX_SNIFF_BYTES = 64 * 1024;
+
+  let documentObjectPrefix = '';
+  try {
+    if (typeof safeCryptoGetRandomValues === 'function') {
+      const randomBytes = new SafeUint8Array(16);
+      safeReflectApply(safeCryptoGetRandomValues, SafeCrypto, [randomBytes]);
+      for (let index = 0; index < randomBytes.length; index += 1) {
+        documentObjectPrefix += randomBytes[index].toString(16).padStart(2, '0');
+      }
+    }
+  } catch (_) { }
 
   const lower = value => safeReflectApply(safeToLowerCase, safeString(value ?? ''), []);
 
@@ -249,6 +289,112 @@ public static class WebProbeScript
     } catch (_) { }
   };
 
+  const normalizeMediaMime = value => lower(value).split(';', 1)[0].trim();
+
+  const containerFromMime = value => {
+    const mime = normalizeMediaMime(value);
+    if (safeReflectApply(safeIncludes, mime, ['mpegurl'])) return 'hls';
+    if (safeReflectApply(safeIncludes, mime, ['dash+xml'])) return 'dash';
+    if (mime === 'video/mp4') return 'mp4';
+    if (mime === 'video/quicktime' || mime === 'video/x-m4v') return 'quicktime';
+    if (mime === 'audio/mp4' || mime === 'audio/x-m4a') return 'm4a';
+    if (mime === 'video/mp2t' || mime === 'video/mpeg') return 'mpegts';
+    if (mime === 'video/webm' || mime === 'audio/webm') return 'webm';
+    if (mime === 'audio/mpeg') return 'mp3';
+    if (mime === 'audio/aac') return 'aac';
+    if (mime === 'audio/ogg' || mime === 'application/ogg') return 'ogg';
+    if (mime === 'audio/opus') return 'opus';
+    return 'unknown';
+  };
+
+  const startsWithAscii = (bytes, offset, expected) => {
+    if (!bytes || offset < 0 || bytes.length < offset + expected.length) return false;
+    for (let index = 0; index < expected.length; index += 1) {
+      if (bytes[offset + index] !== expected.charCodeAt(index)) return false;
+    }
+    return true;
+  };
+
+  const classifyMediaPrefix = (buffer, mime) => {
+    const bytes = new SafeUint8Array(buffer || new SafeArrayBuffer(0));
+    let offset = 0;
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      offset = 3;
+    }
+    while (offset < bytes.length
+           && (bytes[offset] === 0x20 || bytes[offset] === 0x09
+               || bytes[offset] === 0x0d || bytes[offset] === 0x0a)) offset += 1;
+    if (startsWithAscii(bytes, offset, '#EXTM3U')) return 'hls';
+    const xmlPrefix = new SafeTextDecoder('utf-8', { fatal: false })
+      .decode(bytes.subarray(offset, Math.min(bytes.length, offset + 4096)));
+    if (/<MPD(?:\s|>|\/)/i.test(xmlPrefix)) return 'dash';
+    if (bytes.length >= 12 && startsWithAscii(bytes, 4, 'ftyp')) {
+      const brand = lower(safeReflectApply(
+        safeStringFromCharCode,
+        safeString,
+        [bytes[8], bytes[9], bytes[10], bytes[11]]));
+      return brand === 'm4a ' || normalizeMediaMime(mime) === 'audio/mp4' ? 'm4a' : 'mp4';
+    }
+    if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45
+        && bytes[2] === 0xdf && bytes[3] === 0xa3) return 'webm';
+    if (bytes.length >= 377 && bytes[0] === 0x47
+        && bytes[188] === 0x47 && bytes[376] === 0x47) return 'mpegts';
+    if (bytes.length >= 4 && startsWithAscii(bytes, 0, 'OggS')) return 'ogg';
+    if (bytes.length >= 3 && startsWithAscii(bytes, 0, 'ID3')) return 'mp3';
+    if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xf6) === 0xf0) return 'aac';
+    if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) return 'mp3';
+    return 'unknown';
+  };
+
+  const extensionForContainer = container => ({
+    hls: 'm3u8', dash: 'mpd', mp4: 'mp4', quicktime: 'mov', mpegts: 'ts',
+    webm: 'webm', m4a: 'm4a', mp3: 'mp3', aac: 'aac', ogg: 'ogg', opus: 'opus'
+  })[container] || 'bin';
+
+  const emitBrowserObject = (kind, objectId, mime, byteLength, container, source) => {
+    if (sequence >= MAX_SIGNALS || typeof objectId !== 'string') return;
+    const pageUrl = absoluteHttpUrl(currentFrameURL());
+    if (!pageUrl) return;
+    const key = `${kind}\n${objectId}\n${container}\n${mime}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    sequence += 1;
+    try {
+      globalThis.chrome?.webview?.postMessage({
+        channel: CHANNEL,
+        version: 1,
+        nonce: NONCE,
+        seq: sequence,
+        kind,
+        url: pageUrl,
+        pageUrl,
+        source: text(source, 80),
+        mime: text(mime, 160),
+        title: text(document.title, 512),
+        objectId,
+        byteLength,
+        container
+      });
+    } catch (_) { }
+  };
+
+  const inspectBrowserBlob = async (objectId, blob, mime, byteLength) => {
+    try {
+      if (typeof safeBlobSlice !== 'function' || typeof safeBlobArrayBuffer !== 'function') return;
+      const prefixBlob = safeReflectApply(
+        safeBlobSlice,
+        blob,
+        [0, Math.min(byteLength, MAX_SNIFF_BYTES)]);
+      const buffer = await safeReflectApply(safeBlobArrayBuffer, prefixBlob, []);
+      const container = classifyMediaPrefix(buffer, mime);
+      if (container !== 'unknown') {
+        const entry = browserObjects.get(objectId);
+        if (entry) entry.container = container;
+        emitBrowserObject('browser-blob', objectId, mime, byteLength, container, 'createObjectURL');
+      }
+    } catch (_) { }
+  };
+
   const scanMedia = root => {
     const elements = [];
     if (root?.matches?.('video,audio,source')) elements.push(root);
@@ -289,6 +435,121 @@ public static class WebProbeScript
   } else {
     observeDocument();
   }
+
+  try {
+    if (typeof safeCreateObjectURL === 'function') {
+      SafeURL.createObjectURL = function(object) {
+        const objectUrl = safeReflectApply(safeCreateObjectURL, this, [object]);
+        let blobSize;
+        let blobType = '';
+        try {
+          if (typeof safeBlobSizeGetter === 'function' && typeof safeBlobTypeGetter === 'function') {
+            blobSize = safeReflectApply(safeBlobSizeGetter, object, []);
+            blobType = safeReflectApply(safeBlobTypeGetter, object, []);
+          }
+        } catch (_) { }
+
+        if (documentObjectPrefix
+            && Number.isSafeInteger(blobSize) && blobSize > 0 && blobSize <= MAX_BROWSER_BLOB_BYTES
+            && browserObjects.size < MAX_BROWSER_OBJECTS) {
+          const objectId = `blob-${documentObjectPrefix}-${++browserObjectSequence}`;
+          browserObjects.set(objectId, {
+            kind: 'blob',
+            object: typeof SafeWeakRef === 'function' ? new SafeWeakRef(object) : null,
+            objectUrl,
+            mime: safeString(blobType || ''),
+            byteLength: blobSize,
+            container: containerFromMime(blobType),
+            revoked: false
+          });
+          browserObjectUrls.set(objectUrl, objectId);
+          void inspectBrowserBlob(objectId, object, blobType, blobSize);
+        } else if (documentObjectPrefix
+                   && SafeMediaSource && typeof safeMediaSourceAddSourceBuffer === 'function'
+                   && object instanceof SafeMediaSource) {
+          if (browserObjects.size < MAX_BROWSER_OBJECTS) {
+            const objectId = `mse-${documentObjectPrefix}-${++browserObjectSequence}`;
+            browserObjects.set(objectId, {
+              kind: 'media-source', objectUrl, mime: '', container: 'unknown', revoked: false
+            });
+            browserObjectUrls.set(objectUrl, objectId);
+            mediaSourceIds.set(object, objectId);
+            emitBrowserObject('media-source', objectId, '', null, 'unknown', 'createObjectURL');
+          }
+        }
+        return objectUrl;
+      };
+    }
+
+    if (typeof safeRevokeObjectURL === 'function') {
+      SafeURL.revokeObjectURL = function(objectUrl) {
+        const normalized = safeString(objectUrl || '');
+        const objectId = browserObjectUrls.get(normalized);
+        if (objectId) {
+          const entry = browserObjects.get(objectId);
+          if (entry) entry.revoked = true;
+          browserObjectUrls.delete(normalized);
+        }
+        return safeReflectApply(safeRevokeObjectURL, this, [objectUrl]);
+      };
+    }
+  } catch (_) { }
+
+  try {
+    if (SafeMediaSource && typeof safeMediaSourceAddSourceBuffer === 'function') {
+      SafeMediaSource.prototype.addSourceBuffer = function(mime) {
+        const sourceBuffer = safeReflectApply(safeMediaSourceAddSourceBuffer, this, [mime]);
+        const objectId = mediaSourceIds.get(this);
+        if (objectId) {
+          const normalizedMime = safeString(mime || '').slice(0, 160);
+          const container = containerFromMime(normalizedMime);
+          const entry = browserObjects.get(objectId);
+          if (entry) {
+            entry.mime = normalizedMime;
+            entry.container = container;
+          }
+          emitBrowserObject('media-source', objectId, normalizedMime, null, container, 'addSourceBuffer');
+        }
+        return sourceBuffer;
+      };
+    }
+  } catch (_) { }
+
+  try {
+    globalThis.chrome?.webview?.addEventListener?.('message', event => {
+      try {
+        if (event?.isTrusted !== true) return;
+        const command = event.data;
+        if (!command || command.channel !== CHANNEL || command.nonce !== NONCE
+            || command.command !== 'download-browser-blob'
+            || typeof command.objectId !== 'string'
+            || typeof command.downloadToken !== 'string'
+            || !/^[A-Za-z0-9_-]{16,96}$/.test(command.downloadToken)) return;
+        const entry = browserObjects.get(command.objectId);
+        if (!entry || entry.kind !== 'blob') return;
+        let objectUrl = entry.revoked ? '' : entry.objectUrl;
+        if (!objectUrl) {
+          const object = typeof entry.object?.deref === 'function'
+            ? entry.object.deref()
+            : entry.object;
+          if (!object || typeof safeCreateObjectURL !== 'function') return;
+          objectUrl = safeReflectApply(safeCreateObjectURL, SafeURL, [object]);
+        }
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = `hls-downloader-${command.downloadToken}.${extensionForContainer(entry.container)}`;
+        anchor.style.display = 'none';
+        (document.documentElement || document.body)?.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        if (entry.revoked && typeof safeRevokeObjectURL === 'function') {
+          globalThis.setTimeout?.(() => {
+            try { safeReflectApply(safeRevokeObjectURL, SafeURL, [objectUrl]); } catch (_) { }
+          }, 30_000);
+        }
+      } catch (_) { }
+    });
+  } catch (_) { }
 
   try {
     const originalFetch = globalThis.fetch;

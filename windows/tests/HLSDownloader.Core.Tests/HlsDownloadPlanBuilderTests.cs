@@ -101,11 +101,57 @@ public sealed class HlsDownloadPlanBuilderTests
             .BuildAsync(new(root, MediaCandidateKind.Hls, MediaCandidateOrigin.Direct, root)));
     }
 
+    [Fact]
+    public async Task CapturedBlobHlsUsesPageUrlAsBaseAndDelegatesChildPlaylist()
+    {
+        var page = new Uri("https://example.com/watch/signed-page?token=secret");
+        const string capturedMaster = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=20\nmedia/high.m3u8";
+        var child = new Uri("https://example.com/watch/media/high.m3u8");
+        var fallback = new RecordingFetcher(new Dictionary<Uri, string>
+        {
+            [child] = Media("../segments/one.ts")
+        });
+        var fetcher = new CapturedRootManifestFetcher(capturedMaster, page, fallback);
+        var candidate = new MediaCandidate(
+            page,
+            MediaCandidateKind.Hls,
+            MediaCandidateOrigin.BrowserBlob,
+            page,
+            BrowserSourceId: "blob-document-1");
+
+        var plan = await new HlsDownloadPlanBuilder(fetcher).BuildAsync(candidate);
+
+        Assert.Equal(child, Assert.Single(fallback.Requests).Uri);
+        Assert.Equal(page, Assert.Single(fallback.Requests).Referer);
+        Assert.Equal(
+            new Uri("https://example.com/watch/segments/one.ts"),
+            Assert.Single(plan.MainPlaylist!.Segments).Uri);
+        Assert.Equal("CapturedRootManifestFetcher(<redacted>)", fetcher.ToString());
+        Assert.DoesNotContain("secret", fetcher.ToString(), StringComparison.Ordinal);
+    }
+
     private static string Media(string segment) => $"#EXTM3U\n#EXTINF:1,\n{segment}\n#EXT-X-ENDLIST";
 
     private sealed class MapFetcher(IReadOnlyDictionary<Uri, string> values) : ITextResourceFetcher
     {
         public Task<TextFetchResult> FetchTextAsync(Uri uri, Uri? referer = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(new TextFetchResult(values[uri], uri, "application/vnd.apple.mpegurl"));
+    }
+
+    private sealed class RecordingFetcher(IReadOnlyDictionary<Uri, string> values) : ITextResourceFetcher
+    {
+        public List<(Uri Uri, Uri? Referer)> Requests { get; } = [];
+
+        public Task<TextFetchResult> FetchTextAsync(
+            Uri uri,
+            Uri? referer = null,
+            CancellationToken cancellationToken = default)
+        {
+            Requests.Add((uri, referer));
+            return Task.FromResult(new TextFetchResult(
+                values[uri],
+                uri,
+                "application/vnd.apple.mpegurl"));
+        }
     }
 }

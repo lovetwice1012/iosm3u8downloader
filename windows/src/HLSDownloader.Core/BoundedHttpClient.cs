@@ -38,6 +38,20 @@ public sealed record HttpResource(
     HttpStatusCode StatusCode,
     string? MediaType);
 
+public sealed record StreamedHttpResource(
+    Uri RequestedUri,
+    Uri EffectiveUri,
+    HttpStatusCode StatusCode,
+    string? MediaType,
+    long BytesWritten);
+
+public sealed record HttpPrefixResource(
+    byte[] Prefix,
+    Uri RequestedUri,
+    Uri EffectiveUri,
+    HttpStatusCode StatusCode,
+    string? MediaType);
+
 public interface IResourceDownloader
 {
     Task<HttpResource> FetchAsync(
@@ -48,7 +62,27 @@ public interface IResourceDownloader
         CancellationToken cancellationToken = default);
 }
 
-public sealed class BoundedHttpClient : IResourceDownloader, ITextResourceFetcher, IDisposable
+public interface IStreamingResourceDownloader
+{
+    Task<StreamedHttpResource> DownloadToFileAsync(
+        Uri uri,
+        string destinationPath,
+        Uri? referer = null,
+        long maximumBytes = 20L * 1024 * 1024 * 1024,
+        TimeSpan? transferTimeout = null,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IHttpPrefixProbe
+{
+    Task<HttpPrefixResource> ProbePrefixAsync(
+        Uri uri,
+        Uri? referer = null,
+        int maximumPrefixBytes = 64 * 1024,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class BoundedHttpClient : IResourceDownloader, IStreamingResourceDownloader, IHttpPrefixProbe, ITextResourceFetcher, IDisposable
 {
     private readonly HttpClient _client;
     private readonly IOutboundUriPolicy _uriPolicy;
@@ -71,6 +105,7 @@ public sealed class BoundedHttpClient : IResourceDownloader, ITextResourceFetche
             MaxConnectionsPerServer = 6
         };
         _client = new HttpClient(handler, disposeHandler: true);
+        _client.Timeout = Timeout.InfiniteTimeSpan;
         _ownsClient = true;
         _uriPolicy = uriPolicy ?? new PublicNetworkUriPolicy();
     }
@@ -84,6 +119,7 @@ public sealed class BoundedHttpClient : IResourceDownloader, ITextResourceFetche
         _options = options ?? new();
         _options.Validate();
         _client = new HttpClient(handler, disposeHandler: false);
+        _client.Timeout = Timeout.InfiniteTimeSpan;
         _ownsClient = true;
         _uriPolicy = uriPolicy ?? new PublicNetworkUriPolicy();
     }
@@ -167,6 +203,192 @@ public sealed class BoundedHttpClient : IResourceDownloader, ITextResourceFetche
         var charset = result.MediaType; // Content-Type parameters are intentionally not trusted by the DTO.
         _ = charset;
         return new(encoding.GetString(result.Data), result.EffectiveUri, result.MediaType);
+    }
+
+    public async Task<StreamedHttpResource> DownloadToFileAsync(
+        Uri uri,
+        string destinationPath,
+        Uri? referer = null,
+        long maximumBytes = 20L * 1024 * 1024 * 1024,
+        TimeSpan? transferTimeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(uri);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        if (maximumBytes is < 1_024 or > 2L * 1_024 * 1_024 * 1_024 * 1_024)
+            throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        TimeSpan effectiveTransferTimeout = transferTimeout ?? TimeSpan.FromHours(2);
+        if (effectiveTransferTimeout < TimeSpan.FromSeconds(1) || effectiveTransferTimeout > TimeSpan.FromHours(12))
+            throw new ArgumentOutOfRangeException(nameof(transferTimeout));
+
+        string destination = Path.GetFullPath(destinationPath);
+        string? destinationDirectory = Path.GetDirectoryName(destination);
+        if (string.IsNullOrWhiteSpace(destinationDirectory))
+            throw new ArgumentException("The destination path has no parent directory.", nameof(destinationPath));
+        Directory.CreateDirectory(destinationDirectory);
+        long safeMaximumBytes = SafeStreamingFileLimit(destinationDirectory, maximumBytes);
+        string partial = destination + ".part-" + Guid.NewGuid().ToString("N");
+        var requested = uri;
+        var current = uri;
+        try
+        {
+            for (var redirects = 0; ; redirects++)
+            {
+                await EnsureAllowedAsync(current, cancellationToken).ConfigureAwait(false);
+                using var request = new HttpRequestMessage(HttpMethod.Get, current);
+                request.Headers.UserAgent.ParseAdd(_options.UserAgent);
+                request.Headers.AcceptLanguage.ParseAdd("ja, en-US;q=0.8, en;q=0.6");
+                if (SanitizeReferer(referer, current) is { } safeReferer)
+                    request.Headers.Referrer = safeReferer;
+
+                using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                headerTimeout.CancelAfter(_options.EffectiveTimeout);
+                using var response = await _client.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    headerTimeout.Token).ConfigureAwait(false);
+                if (IsRedirect(response.StatusCode))
+                {
+                    if (redirects >= _options.MaximumRedirects || response.Headers.Location is null)
+                        throw new CoreException("The redirect limit was exceeded or Location was missing.");
+                    var next = response.Headers.Location.IsAbsoluteUri
+                        ? response.Headers.Location
+                        : new Uri(current, response.Headers.Location);
+                    if (UriUtilities.IsHttpsDowngrade(current, next))
+                        throw new UnsafeNetworkTargetException("HTTPS to HTTP redirects are blocked.");
+                    await EnsureAllowedAsync(next, cancellationToken).ConfigureAwait(false);
+                    referer = UriUtilities.IsSameOrigin(current, next) ? referer : Origin(current);
+                    current = next;
+                    continue;
+                }
+                if (!response.IsSuccessStatusCode)
+                    throw new HttpRequestException($"HTTP {(int)response.StatusCode} from {current.IdnHost}.", null, response.StatusCode);
+                if (response.Content.Headers.ContentLength > safeMaximumBytes)
+                    throw new CoreException("The HTTP response exceeds the configured byte limit.");
+
+                long written = 0;
+                using var transferCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                transferCancellation.CancelAfter(effectiveTransferTimeout);
+                CancellationToken transferToken = transferCancellation.Token;
+                await using (Stream source = await response.Content.ReadAsStreamAsync(transferToken).ConfigureAwait(false))
+                await using (var destinationStream = new FileStream(
+                    partial,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    128 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    var buffer = new byte[128 * 1024];
+                    while (true)
+                    {
+                        int count = await source.ReadAsync(buffer, transferToken).ConfigureAwait(false);
+                        if (count == 0) break;
+                        written = checked(written + count);
+                        if (written > safeMaximumBytes)
+                            throw new CoreException("The HTTP response exceeds the configured byte limit.");
+                        await destinationStream.WriteAsync(buffer.AsMemory(0, count), transferToken).ConfigureAwait(false);
+                    }
+                    await destinationStream.FlushAsync(transferToken).ConfigureAwait(false);
+                }
+                if (written == 0) throw new CoreException("The HTTP response was empty.");
+                File.Move(partial, destination, overwrite: true);
+                return new StreamedHttpResource(
+                    requested,
+                    current,
+                    response.StatusCode,
+                    response.Content.Headers.ContentType?.MediaType,
+                    written);
+            }
+        }
+        catch
+        {
+            File.Delete(partial);
+            throw;
+        }
+    }
+
+    private static long SafeStreamingFileLimit(string destinationDirectory, long requestedMaximumBytes)
+    {
+        const long reserveBytes = 512L * 1024 * 1024;
+        string root = Path.GetPathRoot(Path.GetFullPath(destinationDirectory))
+            ?? throw new IOException("The download volume could not be resolved.");
+        var drive = new DriveInfo(root);
+        if (!drive.IsReady)
+            throw new IOException("The download volume is not ready.");
+        long safeAvailable = drive.AvailableFreeSpace - reserveBytes;
+        long limit = Math.Min(requestedMaximumBytes, safeAvailable);
+        if (limit < 1024)
+            throw new IOException("There is not enough free space to safely stage the download.");
+        return limit;
+    }
+
+    public async Task<HttpPrefixResource> ProbePrefixAsync(
+        Uri uri,
+        Uri? referer = null,
+        int maximumPrefixBytes = 64 * 1024,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(uri);
+        if (maximumPrefixBytes is < 1024 or > 1024 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(maximumPrefixBytes));
+        var requested = uri;
+        var current = uri;
+        for (var redirects = 0; ; redirects++)
+        {
+            await EnsureAllowedAsync(current, cancellationToken).ConfigureAwait(false);
+            using var request = new HttpRequestMessage(HttpMethod.Get, current);
+            request.Headers.UserAgent.ParseAdd(_options.UserAgent);
+            request.Headers.AcceptLanguage.ParseAdd("ja, en-US;q=0.8, en;q=0.6");
+            request.Headers.Range = new RangeHeaderValue(0, maximumPrefixBytes - 1);
+            if (SanitizeReferer(referer, current) is { } safeReferer)
+                request.Headers.Referrer = safeReferer;
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(_options.EffectiveTimeout);
+            using var response = await _client.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                timeout.Token).ConfigureAwait(false);
+            if (IsRedirect(response.StatusCode))
+            {
+                if (redirects >= _options.MaximumRedirects || response.Headers.Location is null)
+                    throw new CoreException("The redirect limit was exceeded or Location was missing.");
+                Uri next = response.Headers.Location.IsAbsoluteUri
+                    ? response.Headers.Location
+                    : new Uri(current, response.Headers.Location);
+                if (UriUtilities.IsHttpsDowngrade(current, next))
+                    throw new UnsafeNetworkTargetException("HTTPS to HTTP redirects are blocked.");
+                await EnsureAllowedAsync(next, cancellationToken).ConfigureAwait(false);
+                referer = UriUtilities.IsSameOrigin(current, next) ? referer : Origin(current);
+                current = next;
+                continue;
+            }
+            if (!response.IsSuccessStatusCode)
+                throw new HttpRequestException($"HTTP {(int)response.StatusCode} from {current.IdnHost}.", null, response.StatusCode);
+            if (response.StatusCode == HttpStatusCode.PartialContent &&
+                response.Content.Headers.ContentRange?.From is not 0)
+            {
+                throw new CoreException("The prefix response did not begin at byte zero.");
+            }
+
+            byte[] prefix = new byte[maximumPrefixBytes];
+            int offset = 0;
+            await using Stream stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+            while (offset < prefix.Length)
+            {
+                int count = await stream.ReadAsync(prefix.AsMemory(offset), timeout.Token).ConfigureAwait(false);
+                if (count == 0) break;
+                offset += count;
+            }
+            if (offset != prefix.Length) Array.Resize(ref prefix, offset);
+            return new HttpPrefixResource(
+                prefix,
+                requested,
+                current,
+                response.StatusCode,
+                response.Content.Headers.ContentType?.MediaType);
+        }
     }
 
     public void Dispose()

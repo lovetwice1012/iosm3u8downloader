@@ -3,7 +3,8 @@ namespace HLSDownloader.Media;
 public enum MediaOutputFormat
 {
     Mp4,
-    Wav
+    Wav,
+    WebM
 }
 
 public sealed record MediaTrackInfo(
@@ -20,7 +21,8 @@ public sealed record MediaComposeRequest(
     string OutputBasePath,
     TimeSpan? Timeout = null,
     IReadOnlyCollection<string>? RedactedValues = null,
-    string? SecondaryAudioInputPath = null);
+    string? SecondaryAudioInputPath = null,
+    long? MaximumOutputBytes = null);
 
 public sealed record MediaComposeResult(
     string OutputPath,

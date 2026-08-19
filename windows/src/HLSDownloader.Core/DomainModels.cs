@@ -3,7 +3,8 @@ namespace HLSDownloader.Core;
 public enum MediaCandidateKind
 {
     Hls,
-    WidevineDash
+    WidevineDash,
+    Progressive
 }
 
 public enum MediaCandidateOrigin
@@ -13,13 +14,15 @@ public enum MediaCandidateOrigin
     Source,
     DataAttribute,
     InlineScript,
-    Iframe
+    Iframe,
+    BrowserBlob
 }
 
 public enum MediaOutputFormat
 {
     Mp4,
-    Wav
+    Wav,
+    WebM
 }
 
 public enum DownloadPhase
@@ -42,6 +45,7 @@ public sealed record DownloadProgress(
         : Math.Clamp((double)CompletedItems / TotalItems, 0, 1);
 }
 
+[System.Diagnostics.DebuggerDisplay("MediaCandidate({Kind}, <redacted>)")]
 public sealed record MediaCandidate(
     Uri Uri,
     MediaCandidateKind Kind,
@@ -51,11 +55,14 @@ public sealed record MediaCandidate(
     Uri? PosterUri = null,
     string? Title = null,
     Uri? RequestedUri = null,
-    Uri? ObservedWidevineLicenseUri = null)
+    Uri? ObservedWidevineLicenseUri = null,
+    string? BrowserSourceId = null)
 {
-    public bool CanDownload => Kind == MediaCandidateKind.Hls ||
+    public bool CanDownload => Kind is MediaCandidateKind.Hls or MediaCandidateKind.Progressive ||
         (WidevineDownloadPolicy.IsDownloadableWidevineDomain(RequestedUri ?? Uri) &&
          WidevineDownloadPolicy.IsDownloadableWidevineDomain(Uri));
+
+    public override string ToString() => $"MediaCandidate({Kind}, <redacted>)";
 }
 
 public sealed record DownloadPlan(

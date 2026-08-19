@@ -24,7 +24,7 @@ public sealed class FFprobeMediaTrackProbe : IMediaTrackProbe
         var arguments = new List<string>
         {
             "-v", "error",
-            "-show_entries", "stream=codec_type,sample_rate,channels",
+            "-show_entries", "stream=codec_type,sample_rate,channels:stream_disposition=attached_pic",
             "-of", "json"
         };
         AddLocalPlaylistProtocolPolicy(arguments, inputPath);
@@ -48,7 +48,10 @@ public sealed class FFprobeMediaTrackProbe : IMediaTrackProbe
             foreach (JsonElement stream in streams.EnumerateArray())
             {
                 string? codecType = stream.TryGetProperty("codec_type", out JsonElement type) ? type.GetString() : null;
-                hasVideo |= string.Equals(codecType, "video", StringComparison.Ordinal);
+                bool attachedPicture = stream.TryGetProperty("disposition", out JsonElement disposition) &&
+                    disposition.TryGetProperty("attached_pic", out JsonElement attached) &&
+                    attached.TryGetInt32(out int attachedValue) && attachedValue != 0;
+                hasVideo |= string.Equals(codecType, "video", StringComparison.Ordinal) && !attachedPicture;
                 if (!string.Equals(codecType, "audio", StringComparison.Ordinal))
                 {
                     continue;

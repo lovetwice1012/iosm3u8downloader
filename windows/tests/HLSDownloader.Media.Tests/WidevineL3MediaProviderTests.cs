@@ -31,12 +31,73 @@ public sealed class WidevineL3MediaProviderTests
     }
 
     [Fact]
+    public void AbandonedJobCleanupDeletesOnlyOldDirectGuidDirectories()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineCleanupTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string stale = Path.Combine(root, Guid.NewGuid().ToString("N"));
+            string fresh = Path.Combine(root, Guid.NewGuid().ToString("N"));
+            string named = Path.Combine(root, "not-a-job");
+            string wrapper = Path.Combine(root, "wrapper");
+            string nested = Path.Combine(wrapper, Guid.NewGuid().ToString("N"));
+            foreach (string directory in new[] { stale, fresh, named, nested })
+            {
+                Directory.CreateDirectory(directory);
+                File.WriteAllBytes(Path.Combine(directory, "clear.mp4"), MakeClearMp4());
+            }
+            Directory.SetLastWriteTimeUtc(stale, DateTime.UtcNow - TimeSpan.FromHours(25));
+            Directory.SetLastWriteTimeUtc(fresh, DateTime.UtcNow - TimeSpan.FromHours(23));
+            Directory.SetLastWriteTimeUtc(named, DateTime.UtcNow - TimeSpan.FromDays(2));
+            Directory.SetLastWriteTimeUtc(nested, DateTime.UtcNow - TimeSpan.FromDays(2));
+            Directory.SetLastWriteTimeUtc(wrapper, DateTime.UtcNow - TimeSpan.FromDays(2));
+
+            WidevineL3MediaProvider.CleanupAbandonedJobs(root, TimeSpan.FromHours(24));
+
+            Assert.False(Directory.Exists(stale));
+            Assert.True(Directory.Exists(fresh));
+            Assert.True(Directory.Exists(named));
+            Assert.True(Directory.Exists(nested));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void JobCleanupSafetyRequiresDirectGuidDirectoryAndRejectsLinks()
+    {
+        string root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "widevine-root"));
+        string direct = Path.Combine(root, Guid.NewGuid().ToString("N"));
+        string nested = Path.Combine(root, "wrapper", Guid.NewGuid().ToString("N"));
+        string siblingPrefix = Path.Combine(root + "-other", Guid.NewGuid().ToString("N"));
+
+        Assert.True(WidevineL3MediaProvider.IsSafeJobDirectory(
+            root, direct, FileAttributes.Directory, hasLinkTarget: false));
+        Assert.False(WidevineL3MediaProvider.IsSafeJobDirectory(
+            root, nested, FileAttributes.Directory, hasLinkTarget: false));
+        Assert.False(WidevineL3MediaProvider.IsSafeJobDirectory(
+            root, siblingPrefix, FileAttributes.Directory, hasLinkTarget: false));
+        Assert.False(WidevineL3MediaProvider.IsSafeJobDirectory(
+            root, direct, FileAttributes.Directory | FileAttributes.ReparsePoint, hasLinkTarget: false));
+        Assert.False(WidevineL3MediaProvider.IsSafeJobDirectory(
+            root, direct, FileAttributes.Directory, hasLinkTarget: true));
+    }
+
+    [Fact]
     public async Task RawOfflineLicenseDownloadsValidatesDecryptsAndPublishesMp4()
     {
         string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineProviderTests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
         {
+            string jobRoot = Path.Combine(root, "jobs");
+            string abandonedJob = Path.Combine(jobRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(abandonedJob);
+            await File.WriteAllBytesAsync(Path.Combine(abandonedJob, "clear.mp4"), MakeClearMp4());
+            Directory.SetLastWriteTimeUtc(abandonedJob, DateTime.UtcNow - TimeSpan.FromHours(25));
             using RSA rsa = RSA.Create(2048);
             byte[] keyId = Enumerable.Repeat((byte)0x21, 16).ToArray();
             byte[] contentKey = Enumerable.Repeat((byte)0x31, 16).ToArray();
@@ -56,15 +117,16 @@ public sealed class WidevineL3MediaProviderTests
             string ffmpeg = Path.Combine(root, "ffmpeg.exe");
             await File.WriteAllBytesAsync(ffmpeg, [0]);
             var runner = new FixtureToolRunner();
+            var providerProbe = new FixtureTrackProbe();
             var provider = new WidevineL3MediaProvider(
                 manifestDownloader,
                 segmentDownloader,
                 new FixtureCredentialSource(wvd),
                 license,
                 ffmpeg,
-                new FixtureTrackProbe(),
+                providerProbe,
                 runner,
-                new WidevineL3MediaOptions(TemporaryRoot: Path.Combine(root, "jobs")));
+                new WidevineL3MediaOptions(TemporaryRoot: jobRoot));
 
             Assert.True(provider.IsConfigured);
             MediaComposeResult result = await provider.DownloadAndComposeAsync(new WidevineL3DownloadRequest(
@@ -76,12 +138,27 @@ public sealed class WidevineL3MediaProviderTests
             Assert.Equal(MediaOutputFormat.Mp4, result.OutputFormat);
             Assert.True(File.Exists(result.OutputPath));
             Assert.True(MediaOutputValidator.IsValidMp4(result.OutputPath));
+            Assert.Equal(1, providerProbe.CallCount);
+            Assert.Equal(result.OutputPath + ".part", providerProbe.InputPath);
+            Assert.False(File.Exists(result.OutputPath + ".part"));
+            Assert.False(Directory.Exists(abandonedJob));
             Assert.Equal(1, license.CallCount);
-            ExternalToolInvocation invocation = Assert.Single(runner.Invocations);
+            Assert.Equal(2, runner.Invocations.Count);
+            ExternalToolInvocation invocation = Assert.Single(
+                runner.Invocations, item => item.Arguments.Contains("-decryption_key"));
+            ExternalToolInvocation integrity = Assert.Single(
+                runner.Invocations, item => item.Arguments.Contains("-xerror"));
             string keyHex = Convert.ToHexString(contentKey).ToLowerInvariant();
             Assert.Contains(keyHex, invocation.Arguments);
             Assert.Contains(keyHex, invocation.RedactedValues!);
             Assert.DoesNotContain(keyHex, invocation.ToString(), StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("-v", integrity.Arguments);
+            Assert.Contains("error", integrity.Arguments);
+            Assert.Contains("-err_detect", integrity.Arguments);
+            Assert.Contains("explode", integrity.Arguments);
+            Assert.Equal("-", integrity.Arguments[^1]);
+            Assert.DoesNotContain(integrity.Arguments, value =>
+                value.Contains(keyHex, StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -159,6 +236,85 @@ public sealed class WidevineL3MediaProviderTests
 
     [Fact]
     [Trait("Category", "Integration")]
+    public async Task RealFfmpegWrongCencKeyFailsDecodeGateWithoutPublishing()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineWrongKeyTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var locator = new FFmpegToolLocator();
+            var logs = new List<string>();
+            var runner = new ExternalToolRunner(logs.Add);
+            string ffmpeg = locator.ResolveFFmpeg();
+            byte[] keyId = Convert.FromHexString("302132435465768798a9bacbdcedfe0f");
+            byte[] encryptionKey = Convert.FromHexString("20112233445566778899aabbccddeeff");
+            byte[] wrongLicenseKey = Convert.FromHexString("30112233445566778899aabbccddeeff");
+            string encryptionKeyHex = Convert.ToHexString(encryptionKey).ToLowerInvariant();
+            string wrongKeyHex = Convert.ToHexString(wrongLicenseKey).ToLowerInvariant();
+            string kidHex = Convert.ToHexString(keyId).ToLowerInvariant();
+            string encryptedPath = Path.Combine(root, "encrypted.mp4");
+            ExternalToolResult fixture = await runner.RunAsync(new ExternalToolInvocation(
+                ffmpeg,
+                [
+                    "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+                    "-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "1",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", encryptionKeyHex,
+                    "-encryption_kid", kidHex, encryptedPath
+                ],
+                TimeSpan.FromSeconds(30),
+                [encryptionKeyHex]));
+            Assert.True(fixture.ExitCode == 0, fixture.StandardError);
+            (byte[] initialization, byte[] fragments) = SplitFmp4(await File.ReadAllBytesAsync(encryptedPath));
+
+            using RSA rsa = RSA.Create(2048);
+            byte[] manifest = Encoding.UTF8.GetBytes(MakeManifest(keyId));
+            var manifestDownloader = new FixtureDownloader((uri, _, _, _) =>
+                new HttpResource(manifest, uri, uri, HttpStatusCode.OK, "application/dash+xml"));
+            var segmentDownloader = new FixtureDownloader((uri, _, _, _) => new HttpResource(
+                uri.AbsolutePath.EndsWith("init.mp4", StringComparison.Ordinal) ? initialization : fragments,
+                uri,
+                uri,
+                HttpStatusCode.OK,
+                "video/mp4"));
+            var provider = new WidevineL3MediaProvider(
+                manifestDownloader,
+                segmentDownloader,
+                new FixtureCredentialSource(MakeWvd(rsa)),
+                new FixtureLicenseTransport(rsa, keyId, wrongLicenseKey),
+                ffmpeg,
+                new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner),
+                runner,
+                new WidevineL3MediaOptions(
+                    TemporaryRoot: Path.Combine(root, "jobs"),
+                    ComposeTimeout: TimeSpan.FromSeconds(30)));
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+            string outputBase = Path.Combine(root, "wrong-key-result");
+
+            ExternalToolException failure = await Assert.ThrowsAsync<ExternalToolException>(() =>
+                provider.DownloadAndComposeAsync(new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.NotEqual(0, failure.ExitCode);
+            Assert.Contains(logs, line => line.Contains("-xerror", StringComparison.Ordinal));
+            Assert.False(File.Exists(outputBase + ".mp4"));
+            Assert.False(File.Exists(outputBase + ".mp4.part"));
+            Assert.DoesNotContain(logs, line =>
+                line.Contains(encryptionKeyHex, StringComparison.OrdinalIgnoreCase) ||
+                line.Contains(wrongKeyHex, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "Integration")]
     public async Task RealAudioOnlyCencFixtureIsExportedAsPcm16Wav()
     {
         string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineAudioTests", Guid.NewGuid().ToString("N"));
@@ -214,6 +370,88 @@ public sealed class WidevineL3MediaProviderTests
     }
 
     [Fact]
+    [Trait("Category", "Integration")]
+    public async Task RealAudioOnlyWrongCencKeyFailsDuringStrictPcmCompose()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineWrongAudioKeyTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var locator = new FFmpegToolLocator();
+            var logs = new List<string>();
+            var runner = new ExternalToolRunner(logs.Add);
+            string ffmpeg = locator.ResolveFFmpeg();
+            byte[] keyId = Convert.FromHexString("402132435465768798a9bacbdcedfe0f");
+            byte[] encryptionKey = Convert.FromHexString("40112233445566778899aabbccddeeff");
+            byte[] wrongLicenseKey = Convert.FromHexString("50112233445566778899aabbccddeeff");
+            string encryptionKeyHex = Convert.ToHexString(encryptionKey).ToLowerInvariant();
+            string wrongKeyHex = Convert.ToHexString(wrongLicenseKey).ToLowerInvariant();
+            string kidHex = Convert.ToHexString(keyId).ToLowerInvariant();
+            string encryptedPath = Path.Combine(root, "encrypted-audio.mp4");
+            ExternalToolResult fixture = await runner.RunAsync(new ExternalToolInvocation(
+                ffmpeg,
+                [
+                    "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
+                    "-t", "0.6", "-vn", "-c:a", "aac",
+                    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                    "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", encryptionKeyHex,
+                    "-encryption_kid", kidHex, encryptedPath
+                ],
+                TimeSpan.FromSeconds(30),
+                [encryptionKeyHex]));
+            Assert.True(fixture.ExitCode == 0, fixture.StandardError);
+            (byte[] initialization, byte[] fragments) = SplitFmp4(await File.ReadAllBytesAsync(encryptedPath));
+
+            using RSA rsa = RSA.Create(2048);
+            byte[] manifest = Encoding.UTF8.GetBytes(MakeAudioManifest(keyId));
+            var manifestDownloader = new FixtureDownloader((uri, _, _, _) =>
+                new HttpResource(manifest, uri, uri, HttpStatusCode.OK, "application/dash+xml"));
+            var segmentDownloader = new FixtureDownloader((uri, _, _, _) => new HttpResource(
+                uri.AbsolutePath.EndsWith("init.mp4", StringComparison.Ordinal) ? initialization : fragments,
+                uri,
+                uri,
+                HttpStatusCode.OK,
+                "audio/mp4"));
+            var provider = new WidevineL3MediaProvider(
+                manifestDownloader,
+                segmentDownloader,
+                new FixtureCredentialSource(MakeWvd(rsa)),
+                new FixtureLicenseTransport(rsa, keyId, wrongLicenseKey),
+                ffmpeg,
+                new FFprobeMediaTrackProbe(locator.ResolveFFprobe(), runner),
+                runner,
+                new WidevineL3MediaOptions(
+                    TemporaryRoot: Path.Combine(root, "jobs"),
+                    ComposeTimeout: TimeSpan.FromSeconds(30)));
+            Uri manifestUri = new("https://widevine.sprink.cloud/audio/manifest.mpd");
+            string outputBase = Path.Combine(root, "wrong-audio-key-result");
+
+            ExternalToolException failure = await Assert.ThrowsAsync<ExternalToolException>(() =>
+                provider.DownloadAndComposeAsync(new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.NotEqual(0, failure.ExitCode);
+            Assert.Contains(logs, line =>
+                line.Contains("-decryption_key", StringComparison.Ordinal) &&
+                line.Contains("-xerror", StringComparison.Ordinal) &&
+                line.Contains("-err_detect explode", StringComparison.Ordinal));
+            Assert.False(File.Exists(outputBase + ".wav"));
+            Assert.False(File.Exists(outputBase + ".wav.part"));
+            Assert.DoesNotContain(logs, line =>
+                line.Contains(encryptionKeyHex, StringComparison.OrdinalIgnoreCase) ||
+                line.Contains(wrongKeyHex, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Fmp4ValidatorRejectsWrongEmbeddedKidAndSampleGroupOverride()
     {
         string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineValidatorTests", Guid.NewGuid().ToString("N"));
@@ -245,6 +483,271 @@ public sealed class WidevineL3MediaProviderTests
         {
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
         }
+    }
+
+    [Theory]
+    [InlineData("pssh")]
+    [InlineData("tenc")]
+    [InlineData("senc")]
+    [InlineData("encv")]
+    [InlineData("enca")]
+    [InlineData("sinf")]
+    [InlineData("schm")]
+    [InlineData("saiz")]
+    [InlineData("saio")]
+    [InlineData("sgpd")]
+    [InlineData("sbgp")]
+    [InlineData("uuid")]
+    [InlineData("cenc")]
+    [InlineData("cbcs")]
+    public void ClearOutputValidatorRejectsResidualEncryptionBoxes(string boxType)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineClearValidatorTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string path = Path.Combine(root, "residual.mp4");
+            File.WriteAllBytes(path, MakeClearMp4(Box(boxType, new byte[24])));
+
+            Assert.Throws<InvalidDataException>(() =>
+                WidevineFmp4EncryptionValidator.ValidateClearOutput(path));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ClearOutputValidatorRequiresFtypMoovAndNonemptyMdat()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineClearShapeTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            byte[] ftyp = Box("ftyp", "isom0000"u8.ToArray());
+            byte[] moov = Box("moov", []);
+            byte[][] invalidFiles =
+            [
+                moov.Concat(Box("mdat", [1])).ToArray(),
+                ftyp.Concat(Box("mdat", [1])).ToArray(),
+                ftyp.Concat(moov).Concat(Box("mdat", [])).ToArray()
+            ];
+            for (int index = 0; index < invalidFiles.Length; index++)
+            {
+                string path = Path.Combine(root, $"invalid-{index}.mp4");
+                File.WriteAllBytes(path, invalidFiles[index]);
+                Assert.Throws<InvalidDataException>(() =>
+                    WidevineFmp4EncryptionValidator.ValidateClearOutput(path));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ResidualEncryptionMetadataNeverReachesProbeOrFinalPath()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineResidualOutputTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using RSA rsa = RSA.Create(2048);
+            var runner = new FixtureToolRunner(MakeClearMp4(Box("pssh", new byte[24])));
+            var probe = new FixtureTrackProbe();
+            WidevineL3MediaProvider provider = CreateVideoFixtureProvider(root, rsa, runner, probe);
+            string outputBase = Path.Combine(root, "residual-result");
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+
+            await Assert.ThrowsAsync<InvalidDataException>(() => provider.DownloadAndComposeAsync(
+                new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.Equal(0, probe.CallCount);
+            Assert.False(File.Exists(outputBase + ".mp4"));
+            Assert.False(File.Exists(outputBase + ".mp4.part"));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ProbeFailureDeletesPartAndNeverPublishesFinalPath()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineProbeFailureTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using RSA rsa = RSA.Create(2048);
+            var runner = new FixtureToolRunner();
+            var probe = new FixtureTrackProbe(failure: new InvalidDataException("fixture probe failure"));
+            WidevineL3MediaProvider provider = CreateVideoFixtureProvider(root, rsa, runner, probe);
+            string outputBase = Path.Combine(root, "probe-result");
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+
+            await Assert.ThrowsAsync<InvalidDataException>(() => provider.DownloadAndComposeAsync(
+                new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.Equal(1, probe.CallCount);
+            Assert.Equal(outputBase + ".mp4.part", probe.InputPath);
+            Assert.False(File.Exists(outputBase + ".mp4"));
+            Assert.False(File.Exists(outputBase + ".mp4.part"));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task InvalidActualTrackLayoutDeletesPartAndNeverPublishesFinalPath()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineTrackFailureTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using RSA rsa = RSA.Create(2048);
+            var runner = new FixtureToolRunner();
+            var probe = new FixtureTrackProbe(new MediaTrackInfo(false, false));
+            WidevineL3MediaProvider provider = CreateVideoFixtureProvider(root, rsa, runner, probe);
+            string outputBase = Path.Combine(root, "track-result");
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+
+            await Assert.ThrowsAsync<InvalidDataException>(() => provider.DownloadAndComposeAsync(
+                new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.Equal(1, probe.CallCount);
+            Assert.Equal(outputBase + ".mp4.part", probe.InputPath);
+            Assert.False(File.Exists(outputBase + ".mp4"));
+            Assert.False(File.Exists(outputBase + ".mp4.part"));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DecodeIntegrityFailureDeletesPartAndNeverPublishesFinalPath()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineDecodeFailureTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using RSA rsa = RSA.Create(2048);
+            var runner = new FixtureToolRunner(
+                integrityResult: new ExternalToolResult(1, string.Empty, "corrupt decoded sample"));
+            var probe = new FixtureTrackProbe();
+            WidevineL3MediaProvider provider = CreateVideoFixtureProvider(root, rsa, runner, probe);
+            string outputBase = Path.Combine(root, "decode-result");
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+
+            ExternalToolException failure = await Assert.ThrowsAsync<ExternalToolException>(() =>
+                provider.DownloadAndComposeAsync(new WidevineL3DownloadRequest(
+                    manifestUri,
+                    manifestUri,
+                    outputBase,
+                    WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+
+            Assert.Equal(1, failure.ExitCode);
+            Assert.Equal(2, runner.Invocations.Count);
+            ExternalToolInvocation integrity = Assert.Single(
+                runner.Invocations, item => item.Arguments.Contains("-xerror"));
+            int inputIndex = Array.IndexOf(integrity.Arguments.ToArray(), "-i");
+            Assert.True(inputIndex >= 0);
+            Assert.Equal(outputBase + ".mp4.part", integrity.Arguments[inputIndex + 1]);
+            Assert.False(File.Exists(outputBase + ".mp4"));
+            Assert.False(File.Exists(outputBase + ".mp4.part"));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MoveFailurePreservesExistingDestinationAndDeletesPart()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string root = Path.Combine(Path.GetTempPath(), "HLSDownloader-WidevineMoveFailureTests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using RSA rsa = RSA.Create(2048);
+            var runner = new FixtureToolRunner();
+            var probe = new FixtureTrackProbe();
+            WidevineL3MediaProvider provider = CreateVideoFixtureProvider(root, rsa, runner, probe);
+            string outputBase = Path.Combine(root, "locked-result");
+            string outputPath = outputBase + ".mp4";
+            byte[] previous = "previous user file"u8.ToArray();
+            await File.WriteAllBytesAsync(outputPath, previous);
+            Uri manifestUri = new("https://widevine.sprink.cloud/video/manifest.mpd");
+
+            await using (var locked = new FileStream(outputPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Exception failure = await Assert.ThrowsAnyAsync<Exception>(() => provider.DownloadAndComposeAsync(
+                    new WidevineL3DownloadRequest(
+                        manifestUri,
+                        manifestUri,
+                        outputBase,
+                        WidevineDownloadPolicy.IsDownloadableWidevineDomain)));
+                Assert.True(failure is IOException or UnauthorizedAccessException, failure.ToString());
+            }
+
+            Assert.Equal(previous, await File.ReadAllBytesAsync(outputPath));
+            Assert.False(File.Exists(outputPath + ".part"));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static WidevineL3MediaProvider CreateVideoFixtureProvider(
+        string root,
+        RSA rsa,
+        IExternalToolRunner runner,
+        IMediaTrackProbe probe)
+    {
+        byte[] keyId = Enumerable.Repeat((byte)0x21, 16).ToArray();
+        byte[] contentKey = Enumerable.Repeat((byte)0x31, 16).ToArray();
+        byte[] manifest = Encoding.UTF8.GetBytes(MakeManifest(keyId));
+        var manifestDownloader = new FixtureDownloader((uri, _, _, _) =>
+            new HttpResource(manifest, uri, uri, HttpStatusCode.OK, "application/dash+xml"));
+        byte[] initialization = MakeEncryptedInitialization(keyId, WidevineDashMediaType.Video);
+        byte[] fragment = MakeEncryptedFragment();
+        var segmentDownloader = new FixtureDownloader((uri, _, _, _) => new HttpResource(
+            uri.AbsolutePath.EndsWith("init.mp4", StringComparison.Ordinal) ? initialization : fragment,
+            uri,
+            uri,
+            HttpStatusCode.OK,
+            "video/mp4"));
+        string ffmpeg = Path.Combine(root, "ffmpeg.exe");
+        File.WriteAllBytes(ffmpeg, [0]);
+        return new WidevineL3MediaProvider(
+            manifestDownloader,
+            segmentDownloader,
+            new FixtureCredentialSource(MakeWvd(rsa)),
+            new FixtureLicenseTransport(rsa, keyId, contentKey),
+            ffmpeg,
+            probe,
+            runner,
+            new WidevineL3MediaOptions(TemporaryRoot: Path.Combine(root, "jobs")));
     }
 
     private static string MakeManifest(byte[] keyId)
@@ -318,8 +821,11 @@ public sealed class WidevineL3MediaProviderTests
         return moof.Concat(Box("mdat", [1, 2, 3, 4])).ToArray();
     }
 
-    private static byte[] MakeClearMp4()
-        => Box("ftyp", "isom0000"u8.ToArray()).Concat(Box("moov", [])).Concat(Box("mdat", [1])).ToArray();
+    private static byte[] MakeClearMp4(byte[]? moovPayload = null)
+        => Box("ftyp", "isom0000"u8.ToArray())
+            .Concat(Box("moov", moovPayload ?? []))
+            .Concat(Box("mdat", [1]))
+            .ToArray();
 
     private static byte[] Box(string type, byte[] payload)
     {
@@ -408,21 +914,36 @@ public sealed class WidevineL3MediaProviderTests
         }
     }
 
-    private sealed class FixtureToolRunner : IExternalToolRunner
+    private sealed class FixtureToolRunner(
+        byte[]? output = null,
+        ExternalToolResult? integrityResult = null) : IExternalToolRunner
     {
         public List<ExternalToolInvocation> Invocations { get; } = [];
         public Task<ExternalToolResult> RunAsync(ExternalToolInvocation invocation, CancellationToken cancellationToken = default)
         {
             Invocations.Add(invocation);
-            File.WriteAllBytes(invocation.Arguments[^1], MakeClearMp4());
+            if (invocation.Arguments.Contains("-xerror"))
+                return Task.FromResult(integrityResult ?? new ExternalToolResult(0, string.Empty, string.Empty));
+            File.WriteAllBytes(invocation.Arguments[^1], output ?? MakeClearMp4());
             return Task.FromResult(new ExternalToolResult(0, string.Empty, string.Empty));
         }
     }
 
-    private sealed class FixtureTrackProbe : IMediaTrackProbe
+    private sealed class FixtureTrackProbe(
+        MediaTrackInfo? result = null,
+        Exception? failure = null) : IMediaTrackProbe
     {
+        public int CallCount { get; private set; }
+        public string? InputPath { get; private set; }
+
         public Task<MediaTrackInfo> ProbeAsync(string inputPath, TimeSpan timeout, CancellationToken cancellationToken = default)
-            => Task.FromResult(new MediaTrackInfo(true, true, 48_000, 2));
+        {
+            CallCount++;
+            InputPath = inputPath;
+            return failure is null
+                ? Task.FromResult(result ?? new MediaTrackInfo(true, false))
+                : Task.FromException<MediaTrackInfo>(failure);
+        }
     }
 
     private static byte[] ExtractRequestId(byte[] request)

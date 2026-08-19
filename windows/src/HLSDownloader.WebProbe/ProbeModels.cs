@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Diagnostics;
 
 namespace HLSDownloader.WebProbe;
 
@@ -9,7 +10,25 @@ public enum ProbeSignalKind
     MediaElement,
     Network,
     EncryptedMedia,
-    EncryptedMediaLifecycle
+    EncryptedMediaLifecycle,
+    BrowserBlob,
+    MediaSource
+}
+
+public enum ProbeMediaContainer
+{
+    Unknown,
+    Hls,
+    Dash,
+    Mp4,
+    QuickTime,
+    MpegTs,
+    WebM,
+    M4a,
+    Mp3,
+    Aac,
+    Ogg,
+    Opus
 }
 
 public enum ProbeEmeLifecyclePhase
@@ -19,6 +38,7 @@ public enum ProbeEmeLifecyclePhase
     UpdateSucceeded
 }
 
+[DebuggerDisplay("ProbeSignal(<redacted>)")]
 public sealed record ProbeSignal(
     ProbeSignalKind Kind,
     Uri Url,
@@ -29,7 +49,10 @@ public sealed record ProbeSignal(
     string? KeySystem = null,
     long Sequence = 0,
     Uri? PageUrl = null,
-    ProbeEmeLifecyclePhase? EmePhase = null)
+    ProbeEmeLifecyclePhase? EmePhase = null,
+    string? BrowserObjectId = null,
+    long? ByteLength = null,
+    ProbeMediaContainer Container = ProbeMediaContainer.Unknown)
 {
     public bool IsDash => Url.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase)
         || MimeType?.Contains("dash", StringComparison.OrdinalIgnoreCase) == true;
@@ -38,6 +61,14 @@ public sealed record ProbeSignal(
         || MimeType?.Contains("mpegurl", StringComparison.OrdinalIgnoreCase) == true;
 
     public bool IsManifest => IsDash || IsHls;
+
+    public bool IsBrowserBlob => Kind == ProbeSignalKind.BrowserBlob;
+
+    public bool IsMediaSource => Kind == ProbeSignalKind.MediaSource;
+
+    public bool IsBrowserGenerated => IsBrowserBlob || IsMediaSource;
+
+    public override string ToString() => "ProbeSignal(<redacted>)";
 }
 
 public sealed class ProbeSession
@@ -77,6 +108,8 @@ public sealed class ProbeSession
             signal.KeySystem,
             "\n",
             signal.EmePhase,
+            "\n",
+            signal.BrowserObjectId,
             signal.Kind == ProbeSignalKind.EncryptedMediaLifecycle
                 ? string.Concat("\n", signal.Sequence)
                 : string.Empty);

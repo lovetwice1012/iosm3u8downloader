@@ -129,6 +129,15 @@ public sealed partial class MainWindow : Window
     {
         if (sender is Button { Tag: CandidateItem item })
         {
+            if (item.BrowserGeneratedMedia is not null)
+            {
+                if (item.BrowserGeneratedMedia.CaptureHandle.TryActivateOwner() != true)
+                {
+                    ShowStatus("このブラウザー生成メディアの再生ページは閉じられています。", InfoBarSeverity.Warning);
+                }
+                return;
+            }
+
             if (item.Candidate.Kind == MediaCandidateKind.WidevineDash)
             {
                 if (!item.Candidate.CanDownload)
@@ -180,18 +189,53 @@ public sealed partial class MainWindow : Window
         AddDiagnostic("INFO", $"保存を開始: {RedactForLog(item.Candidate.Uri)}");
 
         var progress = new Progress<DownloadProgress>(UpdateProgress);
+        string? capturedBlobPath = null;
         try
         {
-            var completed = await _workflow.DownloadAsync(
-                item.Candidate,
-                progress,
-                _downloadCancellation.Token);
+            CompletedMedia completed;
+            if (item.BrowserBlobCapture is { } browserBlobCapture)
+            {
+                if (_workflow is not CoreMediaWorkflow coreWorkflow)
+                {
+                    throw new NotSupportedException("This browser-generated media cannot be saved by the configured workflow.");
+                }
+
+                ProgressTitle.Text = "ブラウザー生成メディアを取得中";
+                capturedBlobPath = await browserBlobCapture.CaptureToTemporaryFileAsync(
+                    _downloadCancellation.Token);
+                completed = item.Candidate.Kind switch
+                {
+                    MediaCandidateKind.Progressive => await coreWorkflow.ProcessCapturedProgressiveAsync(
+                        item.Candidate,
+                        capturedBlobPath,
+                        item.BrowserGeneratedMedia?.MimeType,
+                        progress,
+                        _downloadCancellation.Token),
+                    MediaCandidateKind.Hls => await coreWorkflow.ProcessCapturedHlsAsync(
+                        item.Candidate,
+                        capturedBlobPath,
+                        progress,
+                        _downloadCancellation.Token),
+                    _ => throw new NotSupportedException(
+                        "This browser-generated manifest cannot be saved by the configured workflow.")
+                };
+            }
+            else
+            {
+                completed = await _workflow.DownloadAsync(
+                    item.Candidate,
+                    progress,
+                    _downloadCancellation.Token);
+            }
             _completedFilePath = completed.FilePath;
             ProgressCard.Visibility = Visibility.Collapsed;
             CompletionCard.Visibility = Visibility.Visible;
-            CompletionTitle.Text = completed.Format == MediaOutputFormat.Wav
-                ? "PCM WAVを作成しました"
-                : "MP4を作成しました";
+            CompletionTitle.Text = completed.Format switch
+            {
+                MediaOutputFormat.Wav => "PCM WAVを作成しました",
+                MediaOutputFormat.WebM => "WebMを作成しました",
+                _ => "MP4を作成しました"
+            };
             CompletionPath.Text = completed.FilePath;
             AddDiagnostic("INFO", $"保存完了: {Path.GetFileName(completed.FilePath)}");
         }
@@ -207,6 +251,13 @@ public sealed partial class MainWindow : Window
             var safeMessage = SafeMessage(exception.Message);
             ShowStatus(safeMessage, InfoBarSeverity.Error);
             AddDiagnostic("ERROR", safeMessage);
+        }
+        finally
+        {
+            if (capturedBlobPath is not null)
+            {
+                TryDeleteCapturedBlob(capturedBlobPath);
+            }
         }
     }
 
@@ -300,9 +351,13 @@ public sealed partial class MainWindow : Window
             SuggestedStartLocation = PickerLocationId.VideosLibrary
         };
         InitializePicker(picker);
-        picker.FileTypeChoices.Add(
-            string.Equals(extension, ".wav", StringComparison.OrdinalIgnoreCase) ? "PCM WAV" : "MP4 video",
-            [extension]);
+        var fileTypeDescription = extension.ToLowerInvariant() switch
+        {
+            ".wav" => "PCM WAV",
+            ".webm" => "WebM video",
+            _ => "MP4 video"
+        };
+        picker.FileTypeChoices.Add(fileTypeDescription, [extension]);
         var destination = await picker.PickSaveFileAsync();
         if (destination is null)
         {
@@ -408,6 +463,28 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(() =>
         {
             var signal = detected.Signal;
+            if (detected.BrowserGeneratedMedia is { } browserGenerated)
+            {
+                var browserCandidate = new MediaCandidate(
+                    browserGenerated.PageUri,
+                    browserGenerated.Container switch
+                    {
+                        ProbeMediaContainer.Hls => MediaCandidateKind.Hls,
+                        ProbeMediaContainer.Dash => MediaCandidateKind.WidevineDash,
+                        _ => MediaCandidateKind.Progressive
+                    },
+                    MediaCandidateOrigin.BrowserBlob,
+                    browserGenerated.PageUri,
+                    Title: signal.Title,
+                    BrowserSourceId: browserGenerated.ObjectId);
+                _workflow.RememberBrowserCookies(
+                    browserCandidate.Uri,
+                    detected.CookieSnapshot,
+                    browserCandidate.BrowserSourceId);
+                AddCandidate(browserCandidate, browserGenerated);
+                return;
+            }
+
             if (signal.IsDash && !WidevineDownloadPolicy.IsDownloadableWidevineDomain(signal.Url))
             {
                 AddDiagnostic("PROBE", $"許可されていないWidevine候補を除外: {RedactForLog(signal.Url)}");
@@ -429,7 +506,11 @@ public sealed partial class MainWindow : Window
             var pageUri = signal.PageUrl ?? TryGetInputUriSilently() ?? signal.Url;
             var candidate = new MediaCandidate(
                 signal.Url,
-                signal.IsDash ? MediaCandidateKind.WidevineDash : MediaCandidateKind.Hls,
+                signal.IsDash
+                    ? MediaCandidateKind.WidevineDash
+                    : signal.IsHls
+                        ? MediaCandidateKind.Hls
+                        : MediaCandidateKind.Progressive,
                 signal.Source == "dom" ? MediaCandidateOrigin.Video : MediaCandidateOrigin.InlineScript,
                 pageUri,
                 PosterUri: signal.ThumbnailUrl,
@@ -442,7 +523,9 @@ public sealed partial class MainWindow : Window
     private void ProbeWindow_OnDiagnosticGenerated(object? sender, string message)
         => DispatcherQueue.TryEnqueue(() => AddDiagnostic("PROBE", message));
 
-    private void AddCandidate(MediaCandidate candidate)
+    private void AddCandidate(
+        MediaCandidate candidate,
+        BrowserGeneratedMediaDescriptor? browserGeneratedMedia = null)
     {
         if (candidate.Kind == MediaCandidateKind.WidevineDash && !candidate.CanDownload)
         {
@@ -450,12 +533,19 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        var existing = Candidates.FirstOrDefault(existing => Uri.Compare(
-                existing.Candidate.Uri,
-                candidate.Uri,
-                UriComponents.HttpRequestUrl,
-                UriFormat.SafeUnescaped,
-                StringComparison.OrdinalIgnoreCase) == 0);
+        var existing = Candidates.FirstOrDefault(existing =>
+            candidate.BrowserSourceId is not null
+                ? string.Equals(
+                    existing.Candidate.BrowserSourceId,
+                    candidate.BrowserSourceId,
+                    StringComparison.Ordinal)
+                : existing.Candidate.BrowserSourceId is null
+                  && Uri.Compare(
+                      existing.Candidate.Uri,
+                      candidate.Uri,
+                      UriComponents.HttpRequestUrl,
+                      UriFormat.SafeUnescaped,
+                      StringComparison.OrdinalIgnoreCase) == 0);
         if (existing is not null)
         {
             if (candidate.ObservedWidevineLicenseUri is not null)
@@ -464,17 +554,14 @@ public sealed partial class MainWindow : Window
                 {
                     ObservedWidevineLicenseUri = candidate.ObservedWidevineLicenseUri
                 });
-                var existingCanDownload = _workflow.CanDownload(
-                    existing.Candidate,
-                    out var existingDownloadHint);
-                existing.UpdateDownloadCapability(existingCanDownload, existingDownloadHint);
+                UpdateCandidateDownloadCapability(existing);
             }
 
             return;
         }
 
-        var canDownload = _workflow.CanDownload(candidate, out var downloadHint);
-        var item = new CandidateItem(candidate, canDownload, downloadHint);
+        var item = new CandidateItem(candidate, false, string.Empty, browserGeneratedMedia);
+        UpdateCandidateDownloadCapability(item);
         Candidates.Add(item);
         CandidatesCard.Visibility = Visibility.Visible;
         CandidateCountText.Text = $"{Candidates.Count} 件";
@@ -545,9 +632,34 @@ public sealed partial class MainWindow : Window
         RemoveWvdButton.IsEnabled = available;
         foreach (var item in Candidates)
         {
-            var canDownload = _workflow.CanDownload(item.Candidate, out var downloadHint);
-            item.UpdateDownloadCapability(canDownload, downloadHint);
+            UpdateCandidateDownloadCapability(item);
         }
+    }
+
+    private void UpdateCandidateDownloadCapability(CandidateItem item)
+    {
+        var canDownload = _workflow.CanDownload(item.Candidate, out var downloadHint);
+        if (item.BrowserGeneratedMedia is { CanCapture: false })
+        {
+            canDownload = false;
+            downloadHint = "MediaSourceのみで生成された再生です。元のHLS/MPDが検出された場合は、その候補から保存できます。";
+        }
+        else if (item.BrowserGeneratedMedia is
+                 {
+                     Container: ProbeMediaContainer.Hls,
+                     ByteLength: > CoreMediaWorkflow.MaximumCapturedHlsManifestBytes
+                 })
+        {
+            canDownload = false;
+            downloadHint = "JavaScript生成HLS manifestが4 MiBの上限を超えています。";
+        }
+        else if (item.BrowserGeneratedMedia?.Container == ProbeMediaContainer.Dash)
+        {
+            canDownload = false;
+            downloadHint = "JavaScript生成MPDを検出しました。現在は元のHTTP MPD候補からのみ保存できます。";
+        }
+
+        item.UpdateDownloadCapability(canDownload, downloadHint);
     }
 
     private void ShowStatus(string message, InfoBarSeverity severity)
@@ -595,6 +707,24 @@ public sealed partial class MainWindow : Window
         }
 
         return safe;
+    }
+
+    private static void TryDeleteCapturedBlob(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            var directory = Path.GetDirectoryName(path);
+            if (directory is not null
+                && Directory.Exists(directory)
+                && !Directory.EnumerateFileSystemEntries(directory).Any())
+            {
+                Directory.Delete(directory);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+        }
     }
 
     private void MainWindow_OnClosed(object sender, WindowEventArgs args)
@@ -647,9 +777,12 @@ public sealed partial class MainWindow : Window
             _completedFilePath = completed.FilePath;
             ProgressCard.Visibility = Visibility.Collapsed;
             CompletionCard.Visibility = Visibility.Visible;
-            CompletionTitle.Text = completed.Format == MediaOutputFormat.Wav
-                ? "バックグラウンド処理でPCM WAVを作成しました"
-                : "バックグラウンド処理でMP4を作成しました";
+            CompletionTitle.Text = completed.Format switch
+            {
+                MediaOutputFormat.Wav => "バックグラウンド処理でPCM WAVを作成しました",
+                MediaOutputFormat.WebM => "バックグラウンド処理でWebMを作成しました",
+                _ => "バックグラウンド処理でMP4を作成しました"
+            };
             CompletionPath.Text = completed.FilePath;
             AddDiagnostic("INFO", "直近のバックグラウンド完了jobを復元しました。");
         }

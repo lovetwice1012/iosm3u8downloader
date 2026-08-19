@@ -45,9 +45,68 @@ public sealed class MediaSourceResolverTests
         Assert.Equal(new Uri("https://example.com/stream.m3u8"), result.Candidates.Single().Uri);
     }
 
+    [Fact]
+    public async Task PrefixProbeDetectsLargeProgressiveMp4WithoutFetchingItAsText()
+    {
+        var requested = new Uri("https://example.com/download?id=1");
+        var effective = new Uri("https://cdn.example.com/video/final");
+        byte[] prefix = new byte[32];
+        "ftyp"u8.CopyTo(prefix.AsSpan(4));
+        var fetcher = new PrefixFetcher(
+            new(prefix, requested, effective, System.Net.HttpStatusCode.PartialContent, "application/octet-stream"));
+
+        var result = await new MediaSourceResolver(fetcher).ResolveAsync(requested);
+
+        var candidate = Assert.Single(result.Candidates);
+        Assert.Equal(MediaCandidateKind.Progressive, candidate.Kind);
+        Assert.Equal(requested, candidate.RequestedUri);
+        Assert.Equal(effective, candidate.Uri);
+        Assert.Equal(0, fetcher.TextFetchCount);
+    }
+
+    [Fact]
+    public async Task ProgressiveExtensionDoesNotOverrideNonMediaMagic()
+    {
+        var uri = new Uri("https://example.com/not-really.mp4");
+        var html = new TextFetchResult("<video src='real.webm'></video>", uri, "text/html");
+        var fetcher = new PrefixFetcher(
+            new("<html>"u8.ToArray(), uri, uri, System.Net.HttpStatusCode.OK, "text/html"),
+            html);
+
+        var result = await new MediaSourceResolver(fetcher).ResolveAsync(uri);
+
+        var candidate = Assert.Single(result.Candidates);
+        Assert.Equal(MediaCandidateKind.Progressive, candidate.Kind);
+        Assert.Equal(new Uri("https://example.com/real.webm"), candidate.Uri);
+        Assert.Equal(1, fetcher.TextFetchCount);
+    }
+
     private sealed class SingleFetcher(TextFetchResult result) : ITextResourceFetcher
     {
         public Task<TextFetchResult> FetchTextAsync(Uri uri, Uri? referer = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
+    }
+
+    private sealed class PrefixFetcher(
+        HttpPrefixResource prefix,
+        TextFetchResult? text = null) : ITextResourceFetcher, IHttpPrefixProbe
+    {
+        public int TextFetchCount { get; private set; }
+
+        public Task<HttpPrefixResource> ProbePrefixAsync(
+            Uri uri,
+            Uri? referer = null,
+            int maximumPrefixBytes = 64 * 1024,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(prefix);
+
+        public Task<TextFetchResult> FetchTextAsync(
+            Uri uri,
+            Uri? referer = null,
+            CancellationToken cancellationToken = default)
+        {
+            TextFetchCount++;
+            return Task.FromResult(text ?? throw new InvalidOperationException("Text fetch was not expected."));
+        }
     }
 }
