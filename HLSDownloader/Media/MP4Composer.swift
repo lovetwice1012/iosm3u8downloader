@@ -865,7 +865,8 @@ final class MP4Composer: @unchecked Sendable {
         }
         defer { monitor.cancel() }
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
                 box.session.exportAsynchronously {
                     if box.didExceedOutputLimit() {
                         continuation.resume(
