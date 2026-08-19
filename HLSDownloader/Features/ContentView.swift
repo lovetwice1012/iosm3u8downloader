@@ -152,7 +152,7 @@ struct ContentView: View {
                 Label("検出された動画", systemImage: "play.rectangle.on.rectangle")
                     .font(.headline)
                 Spacer()
-                Text("\(viewModel.candidates.count)件")
+                Text("\(viewModel.candidatePresentations.count)件")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
@@ -162,9 +162,9 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
 
             LazyVStack(spacing: 16) {
-                ForEach(viewModel.candidates) { candidate in
-                    candidateRow(candidate)
-                    if candidate.id != viewModel.candidates.last?.id {
+                ForEach(viewModel.candidatePresentations) { presentation in
+                    candidateRow(presentation)
+                    if presentation.id != viewModel.candidatePresentations.last?.id {
                         Divider()
                     }
                 }
@@ -173,7 +173,9 @@ struct ContentView: View {
         .cardStyle()
     }
 
-    private func candidateRow(_ candidate: HLSCandidate) -> some View {
+    @ViewBuilder
+    private func candidateRow(_ presentation: CandidatePresentation) -> some View {
+        let candidate = presentation.candidate
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
                 candidateThumbnail(candidate)
@@ -210,28 +212,61 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if presentation.resolutionChoices.count > 1 {
+                HStack(spacing: 12) {
+                    Label(
+                        "\(presentation.resolutionChoices.count)画質",
+                        systemImage: "rectangle.on.rectangle"
+                    )
+                    .font(.footnote.weight(.medium))
+                    Spacer()
+                    Picker(
+                        "解像度",
+                        selection: Binding(
+                            get: {
+                                viewModel.selectedResolutionChoice(for: presentation)?.id
+                                    ?? presentation.resolutionChoices[0].id
+                            },
+                            set: { selectedID in
+                                guard let choice = presentation.resolutionChoices.first(where: {
+                                    $0.id == selectedID
+                                }) else { return }
+                                viewModel.selectResolutionChoice(choice, for: presentation)
+                            }
+                        )
+                    ) {
+                        ForEach(presentation.resolutionChoices) { choice in
+                            Text(choice.displayTitle).tag(choice.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(viewModel.isBusy)
+                    .accessibilityHint("選択した解像度でダウンロードします")
+                }
+            }
+
             if candidate.kind == .widevineDASH {
                 Button {
-                    viewModel.download(candidate)
+                    viewModel.download(presentation)
                 } label: {
                     Label("ダウンロード・保存", systemImage: "arrow.down.circle.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canDownload(candidate))
+                .disabled(!viewModel.canDownload(presentation))
 
                 Text(widevineCandidateStatus(candidate))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             } else {
                 Button {
-                    viewModel.download(candidate)
+                    viewModel.download(presentation)
                 } label: {
                     Label("この動画をダウンロード", systemImage: "arrow.down.circle.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canDownload(candidate))
+                .disabled(!viewModel.canDownload(presentation))
             }
         }
         .accessibilityElement(children: .contain)

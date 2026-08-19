@@ -172,6 +172,10 @@ final class HTMLMediaExtractorTests: XCTestCase {
             ]
         )
         XCTAssertEqual(result.media.map(\.kind), Array(repeating: .progressive, count: 4))
+        XCTAssertEqual(result.media[0].mediaGroupID, "media-0")
+        XCTAssertEqual(result.media[1].mediaGroupID, "media-1")
+        XCTAssertNil(result.media[2].mediaGroupID)
+        XCTAssertNil(result.media[3].mediaGroupID)
     }
 
     func testDecodesSemicolonlessEntityAndDoubleEscapedURL() throws {
@@ -232,6 +236,18 @@ final class DiagnosticLogTests: XCTestCase {
 }
 
 final class PlaybackProbePayloadParserTests: XCTestCase {
+    func testMediaGroupIDIsBoundedAndHeaderSafe() {
+        XCTAssertEqual(
+            PlaybackProbePayloadParser.normalizedMediaGroupID("media-12"),
+            "media-12"
+        )
+        XCTAssertNil(PlaybackProbePayloadParser.normalizedMediaGroupID("media:12"))
+        XCTAssertNil(PlaybackProbePayloadParser.normalizedMediaGroupID("media\r\nInjected"))
+        XCTAssertNil(
+            PlaybackProbePayloadParser.normalizedMediaGroupID(String(repeating: "a", count: 65))
+        )
+    }
+
     func testRequiresExactPerSessionMessageNonce() {
         let expected = "0123456789abcdef0123456789abcdef"
         XCTAssertTrue(
@@ -394,6 +410,8 @@ final class PlaybackCapturePersistenceTests: XCTestCase {
         )
 
         XCTAssertTrue(session.webView.configuration.websiteDataStore.isPersistent)
+        XCTAssertEqual(session.webView.customUserAgent, HTTPClient.userAgent)
+        XCTAssertFalse(HTTPClient.userAgent.contains("HLSDownloader/"))
         _ = await session.snapshotAndStop()
     }
 }
@@ -554,6 +572,104 @@ final class WebBlobCaptureQuotaTests: XCTestCase {
 }
 
 final class CandidateMergePolicyTests: XCTestCase {
+    func testPresentationGroupsOnlyExplicitProgressiveMediaElementResolutions() throws {
+        let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        func candidate(path: String, group: String, width: Int, height: Int) -> HLSCandidate {
+            let mediaURL = URL(string: "https://media.example/\(path)")!
+            return HLSCandidate(
+                id: UUID(),
+                kind: .progressive,
+                request: URLCandidates(primary: mediaURL, sameOriginQueryFallback: nil),
+                requestReferer: pageURL,
+                document: nil,
+                progressiveMedia: ProgressiveMediaReference(
+                    storage: .remote,
+                    hintedMIMEType: "video/mp4",
+                    validatedEffectiveURL: mediaURL,
+                    container: .isoBaseMedia,
+                    resolution: MediaResolution(width: width, height: height)
+                ),
+                mediaGroupID: group,
+                pageURL: pageURL,
+                title: "Same title",
+                thumbnailURL: nil,
+                iframeDepth: 0,
+                origin: .source
+            )
+        }
+        let low = candidate(path: "low.mp4", group: "media-0", width: 1280, height: 720)
+        let high = candidate(path: "high.mp4", group: "media-0", width: 1920, height: 1080)
+        let unrelated = candidate(path: "other.mp4", group: "media-1", width: 640, height: 360)
+
+        let presentations = CandidatePresentationPolicy.presentations(
+            from: [low, high, unrelated]
+        )
+        XCTAssertEqual(presentations.count, 2)
+        XCTAssertEqual(
+            presentations[0].resolutionChoices.map(\.resolution.id),
+            ["1920x1080", "1280x720"]
+        )
+        XCTAssertEqual(presentations[0].candidate.id, high.id)
+        XCTAssertEqual(presentations[1].candidate.id, unrelated.id)
+    }
+
+    func testPresentationExposesMasterPlaylistResolutionChoices() throws {
+        let masterURL = try XCTUnwrap(URL(string: "https://media.example/master.m3u8"))
+        let document = PlaylistDocument(
+            text: """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360
+            low.m3u8
+            #EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=1920x1080
+            high.m3u8
+            """,
+            effectiveURL: masterURL,
+            referer: masterURL
+        )
+        let candidate = HLSCandidate(
+            id: UUID(),
+            kind: .hls,
+            request: URLCandidates(primary: masterURL, sameOriginQueryFallback: nil),
+            requestReferer: masterURL,
+            document: document,
+            pageURL: masterURL,
+            title: nil,
+            thumbnailURL: nil,
+            iframeDepth: 0,
+            origin: .direct
+        )
+
+        let presentation = try XCTUnwrap(
+            CandidatePresentationPolicy.presentations(from: [candidate]).first
+        )
+        XCTAssertEqual(
+            presentation.resolutionChoices.map(\.resolution.id),
+            ["1920x1080", "640x360"]
+        )
+        XCTAssertEqual(
+            presentation.resolutionChoices.first?.hlsPreferredResolution?.id,
+            "1920x1080"
+        )
+
+        let childURL = try XCTUnwrap(URL(string: "https://media.example/high.m3u8"))
+        let child = HLSCandidate(
+            id: UUID(),
+            kind: .hls,
+            request: URLCandidates(primary: childURL, sameOriginQueryFallback: nil),
+            requestReferer: masterURL,
+            document: nil,
+            pageURL: masterURL,
+            title: nil,
+            thumbnailURL: nil,
+            iframeDepth: 0,
+            origin: .runtime
+        )
+        XCTAssertEqual(
+            CandidatePresentationPolicy.presentations(from: [candidate, child]).count,
+            1
+        )
+    }
+
     func testMergePreservesProgressiveStorageAndCapturedDocumentState() throws {
         let pageURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
         let captureID = UUID()
@@ -674,6 +790,101 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.candidates[0].kind, .hls)
     }
 
+    func testPageDiscoveredMasterIsEnrichedForResolutionSelection() async throws {
+        let resolver = makeResolver()
+        DiscoveryURLProtocolStub.handler = { request in
+            if request.url?.path == "/watch" {
+                return Self.response(
+                    request,
+                    body: #"<video src="/master.m3u8"></video>"#,
+                    mimeType: "text/html"
+                )
+            }
+            return Self.response(
+                request,
+                body: """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+                low.m3u8
+                #EXT-X-STREAM-INF:BANDWIDTH=3200000,RESOLUTION=1920x1080
+                high.m3u8
+                """,
+                mimeType: "application/vnd.apple.mpegurl"
+            )
+        }
+
+        let discovery = try await resolver.discover(input: "https://site.example/watch")
+        let candidate = try XCTUnwrap(discovery.candidates.first)
+        XCTAssertEqual(candidate.kind, .hls)
+        XCTAssertNotNil(candidate.document)
+        XCTAssertEqual(HLSResolutionCatalog.options(from: candidate.document).count, 2)
+    }
+
+    @MainActor
+    func testDuplicateMasterWithRotatingRedirectRemainsOneOriginalURLCandidate() async throws {
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let masterURL = try XCTUnwrap(URL(string: "https://site.example/master.m3u8"))
+        let recorder = DiscoveryRequestRecorder()
+        let inspector = StubDynamicInspector(
+            inspection: DynamicPageInspection(
+                media: [
+                    DynamicMediaReference(
+                        url: masterURL,
+                        kind: .hls,
+                        pageURL: rootURL,
+                        title: "Movie",
+                        thumbnailURL: nil,
+                        iframeDepth: 0,
+                        origin: .video,
+                        mediaGroupID: "media-0",
+                        frameToken: "frame-one"
+                    )
+                ],
+                cookies: []
+            )
+        )
+        let resolver = makeResolver(dynamicInspector: inspector)
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            if request.url?.path == "/watch" {
+                return Self.response(
+                    request,
+                    body: #"<video src="/master.m3u8"></video>"#,
+                    mimeType: "text/html"
+                )
+            }
+            let generation = recorder.snapshot().filter {
+                $0.url?.path == "/master.m3u8"
+            }.count
+            let effective = URL(
+                string: "https://cdn.example/signed/master.m3u8?generation=\(generation)"
+            )!
+            return (
+                HTTPURLResponse(
+                    url: effective,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/vnd.apple.mpegurl"]
+                )!,
+                Data("""
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+                low.m3u8
+                #EXT-X-STREAM-INF:BANDWIDTH=3200000,RESOLUTION=1920x1080
+                high.m3u8
+                """.utf8)
+            )
+        }
+
+        let discovery = try await resolver.discover(input: rootURL.absoluteString)
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.request.primary, masterURL)
+        XCTAssertEqual(
+            HLSResolutionCatalog.options(from: discovery.candidates.first?.document).count,
+            2
+        )
+    }
+
     func testAcceptsDirectProgressiveMediaOnlyAfterBoundedMagicProbe() async throws {
         let recorder = DiscoveryRequestRecorder()
         let resolver = makeResolver()
@@ -710,6 +921,104 @@ final class SourceDiscoveryTests: XCTestCase {
             "bytes=0-262143"
         )
         XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+
+    func testProgressiveCandidateRetainsOriginalURLAndStoresValidatedRedirectSeparately() async throws {
+        let resolver = makeResolver()
+        let originalURL = try XCTUnwrap(URL(string: "https://media.example/watch/movie"))
+        let signedURL = try XCTUnwrap(
+            URL(string: "https://cdn.example/signed/one-shot.mp4?token=rotating")
+        )
+        let body = Data([
+            0x00, 0x00, 0x00, 0x10,
+            0x66, 0x74, 0x79, 0x70,
+            0x69, 0x73, 0x6F, 0x6D,
+            0x30, 0x30, 0x30, 0x30
+        ])
+        DiscoveryURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url, originalURL)
+            return (
+                HTTPURLResponse(
+                    url: signedURL,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "video/mp4"]
+                )!,
+                body
+            )
+        }
+
+        let discovery = try await resolver.discover(input: originalURL.absoluteString)
+        let candidate = try XCTUnwrap(discovery.candidates.first)
+        XCTAssertEqual(candidate.request.primary, originalURL)
+        XCTAssertEqual(candidate.progressiveMedia?.validatedEffectiveURL, signedURL)
+        XCTAssertEqual(candidate.progressiveMedia?.validatedPrefixByteCount, body.count)
+        XCTAssertEqual(
+            candidate.progressiveMedia?.validatedPrefixSHA256,
+            ProgressiveMediaFingerprint.sha256(body)
+        )
+    }
+
+    @MainActor
+    func testStaticAndWebKitProgressiveReferencesDeduplicateBeforeRotatingRedirect() async throws {
+        let rootURL = try XCTUnwrap(URL(string: "https://site.example/watch"))
+        let mediaURL = try XCTUnwrap(URL(string: "https://site.example/movie.mp4"))
+        let recorder = DiscoveryRequestRecorder()
+        let inspector = StubDynamicInspector(
+            inspection: DynamicPageInspection(
+                media: [
+                    DynamicMediaReference(
+                        url: mediaURL,
+                        kind: .progressive,
+                        pageURL: rootURL,
+                        title: "Movie",
+                        thumbnailURL: nil,
+                        iframeDepth: 0,
+                        origin: .source,
+                        mediaGroupID: "media-0",
+                        frameToken: "frame-one"
+                    )
+                ],
+                cookies: []
+            )
+        )
+        let resolver = makeResolver(dynamicInspector: inspector)
+        let mediaBody = Data([
+            0x00, 0x00, 0x00, 0x10,
+            0x66, 0x74, 0x79, 0x70,
+            0x69, 0x73, 0x6F, 0x6D,
+            0x30, 0x30, 0x30, 0x30
+        ])
+        DiscoveryURLProtocolStub.handler = { request in
+            recorder.append(request)
+            if request.url?.path == "/watch" {
+                return Self.response(
+                    request,
+                    body: #"<video><source src="/movie.mp4" type="video/mp4"></video>"#,
+                    mimeType: "text/html"
+                )
+            }
+            let requestNumber = recorder.snapshot().filter {
+                $0.url?.path == request.url?.path
+            }.count
+            let effective = URL(
+                string: "https://cdn.example/signed/movie.mp4?generation=\(requestNumber)"
+            )!
+            return (
+                HTTPURLResponse(
+                    url: effective,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "video/mp4"]
+                )!,
+                mediaBody
+            )
+        }
+
+        let discovery = try await resolver.discover(input: rootURL.absoluteString)
+        XCTAssertEqual(discovery.candidates.count, 1)
+        XCTAssertEqual(discovery.candidates.first?.request.primary, mediaURL)
+        XCTAssertNotNil(discovery.candidates.first?.mediaGroupID)
     }
 
     func testRejectsStandaloneTransportStreamFailClosed() async throws {
@@ -2018,6 +2327,10 @@ final class SourceDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(providerContext, originalContext)
         XCTAssertNil(redirectedRequest?.value(forHTTPHeaderField: "Cookie"))
+        XCTAssertEqual(
+            redirectedRequest?.value(forHTTPHeaderField: "Referer"),
+            "https://outside.invalid/"
+        )
     }
 
     @MainActor

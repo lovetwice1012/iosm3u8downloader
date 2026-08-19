@@ -1,5 +1,65 @@
 import Foundation
 
+enum HLSResolutionCatalog {
+    static func options(from document: PlaylistDocument?) -> [HLSResolutionOption] {
+        guard let document,
+              let parsed = try? PlaylistParser.parse(
+                text: document.text,
+                effectiveURL: document.effectiveURL,
+                requestReferer: document.referer
+              ),
+              case .master(let master) = parsed else {
+            return []
+        }
+        return options(from: master.variants)
+    }
+
+    static func options(from variants: [Variant]) -> [HLSResolutionOption] {
+        var bestByResolution: [MediaResolution: Int] = [:]
+        for variant in variants {
+            guard let resolution = MediaResolution(hlsAttribute: variant.resolution) else { continue }
+            let bandwidth = effectiveBandwidth(variant)
+            bestByResolution[resolution] = max(bestByResolution[resolution] ?? 0, bandwidth)
+        }
+        return bestByResolution.map {
+            HLSResolutionOption(resolution: $0.key, bandwidth: $0.value)
+        }.sorted { lhs, rhs in
+            if lhs.resolution.pixelCount != rhs.resolution.pixelCount {
+                return lhs.resolution.pixelCount > rhs.resolution.pixelCount
+            }
+            if lhs.bandwidth != rhs.bandwidth { return lhs.bandwidth > rhs.bandwidth }
+            return lhs.resolution.id > rhs.resolution.id
+        }
+    }
+
+    static func selectVariant(
+        _ variants: [Variant],
+        preferredResolution: MediaResolution?
+    ) throws -> Variant {
+        let candidates: [Variant]
+        if let preferredResolution {
+            candidates = variants.filter {
+                MediaResolution(hlsAttribute: $0.resolution) == preferredResolution
+            }
+            guard !candidates.isEmpty else {
+                throw HLSError.invalidPlaylist("選択した解像度は現在のmaster playlistにありません")
+            }
+        } else {
+            candidates = variants
+        }
+        guard let selected = candidates.max(by: {
+            effectiveBandwidth($0) < effectiveBandwidth($1)
+        }) else {
+            throw HLSError.invalidPlaylist("画質variantがありません")
+        }
+        return selected
+    }
+
+    private static func effectiveBandwidth(_ variant: Variant) -> Int {
+        max(variant.averageBandwidth ?? variant.bandwidth, 0)
+    }
+}
+
 struct PreparedDownloadPlan: Sendable {
     let plan: DownloadPlan
     let mainRequestedURL: URL
@@ -70,11 +130,13 @@ final class DownloadPlanBuilder: Sendable {
 
     func build(
         from initialDocument: PlaylistDocument,
-        requestedURL initialRequestedURL: URL? = nil
+        requestedURL initialRequestedURL: URL? = nil,
+        preferredResolution: MediaResolution? = nil
     ) async throws -> PreparedDownloadPlan {
         var document = initialDocument
         var requestedURL = initialRequestedURL ?? initialDocument.effectiveURL
         var selectedAudio: URLCandidates?
+        var unresolvedPreferredResolution = preferredResolution
         let requestReferer = initialDocument.referer ?? initialDocument.effectiveURL
 
         for _ in 0..<6 {
@@ -100,7 +162,11 @@ final class DownloadPlanBuilder: Sendable {
                 return prepared
 
             case .master(let master):
-                let variant = selectVariant(master.variants)
+                let variant = try HLSResolutionCatalog.selectVariant(
+                    master.variants,
+                    preferredResolution: unresolvedPreferredResolution
+                )
+                unresolvedPreferredResolution = nil
                 if let groupID = variant.audioGroupID,
                    let rendition = selectAudioRendition(master.renditions, groupID: groupID) {
                     selectedAudio = rendition.url
@@ -136,18 +202,15 @@ final class DownloadPlanBuilder: Sendable {
                 try validateForDownload(media)
                 return SelectedAudioPlaylist(playlist: media, requestedURL: requestedURL)
             case .master(let master):
-                let variant = selectVariant(master.variants)
+                let variant = try HLSResolutionCatalog.selectVariant(
+                    master.variants,
+                    preferredResolution: nil
+                )
                 requestedURL = variant.url.primary
                 document = try await resolver.load(variant.url, referer: referer)
             }
         }
         throw HLSError.invalidPlaylist("音声playlistの入れ子が深すぎます")
-    }
-
-    private func selectVariant(_ variants: [Variant]) -> Variant {
-        variants.max {
-            ($0.averageBandwidth ?? $0.bandwidth) < ($1.averageBandwidth ?? $1.bandwidth)
-        } ?? variants[0]
     }
 
     private func selectAudioRendition(_ renditions: [MediaRendition], groupID: String) -> MediaRendition? {

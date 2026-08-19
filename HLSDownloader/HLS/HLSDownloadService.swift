@@ -8,6 +8,7 @@ protocol HLSDownloadServicing: Sendable {
     func finishPlaybackCapture(_ session: PlaybackCaptureSession) async -> [HLSCandidate]
     func download(
         candidate: HLSCandidate,
+        preferredResolution: MediaResolution?,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult
     func thumbnailData(for candidate: HLSCandidate) async -> Data?
@@ -201,11 +202,27 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         guard let candidate = discovery.candidates.first else {
             throw HLSError.noPlaylistFound
         }
-        return try await download(candidate: candidate, progress: progress)
+        return try await download(
+            candidate: candidate,
+            preferredResolution: nil,
+            progress: progress
+        )
     }
 
     func download(
         candidate: HLSCandidate,
+        progress: @escaping ProgressHandler
+    ) async throws -> DownloadResult {
+        try await download(
+            candidate: candidate,
+            preferredResolution: nil,
+            progress: progress
+        )
+    }
+
+    func download(
+        candidate: HLSCandidate,
+        preferredResolution: MediaResolution?,
         progress: @escaping ProgressHandler
     ) async throws -> DownloadResult {
         diagnostics.record(
@@ -283,6 +300,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         return try await downloadWithBackgroundExecution(
             document: document,
             requestedPlaylistURL: candidate.request.primary,
+            preferredResolution: preferredResolution,
             planBuilder: jobPlanBuilder,
             segmentDownloader: jobSegmentDownloader,
             progress: progress
@@ -293,6 +311,9 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         var urls = candidate.request.all + [candidate.pageURL]
         if let referer = candidate.requestReferer { urls.append(referer) }
         if let effectiveURL = candidate.document?.effectiveURL { urls.append(effectiveURL) }
+        if let effectiveURL = candidate.progressiveMedia?.validatedEffectiveURL {
+            urls.append(effectiveURL)
+        }
         if let playbackContext = candidate.widevinePlaybackContext {
             urls.append(playbackContext.pageURL)
             urls.append(playbackContext.licenseServerURL)
@@ -341,6 +362,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
         let jobDirectory = try fileStore.makeJobDirectory()
         var temporaryOutput: URL?
+        var failureStage = "prepare"
         defer { fileStore.removeJobDirectory(jobDirectory) }
 
         do {
@@ -353,6 +375,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
 
             switch reference.storage {
             case .remote:
+                failureStage = "network"
                 let downloadedURL = jobDirectory.appendingPathComponent(
                     "progressive-input.media",
                     isDirectory: false
@@ -372,8 +395,13 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 effectiveURL = response.effectiveURL
                 mimeType = response.mimeType ?? reference.hintedMIMEType
                 byteCount = response.byteCount
+                diagnostics.record(
+                    "progressive",
+                    "download response status=\(response.statusCode) bytes=\(response.byteCount) redirected=\(response.effectiveURL != candidate.request.primary)"
+                )
 
             case .capturedBlob(let fileURL, let expectedByteCount):
+                failureStage = "captured-input"
                 let values = try fileURL.resourceValues(
                     forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
                 )
@@ -400,7 +428,24 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             }
 
             try Task.checkCancellation()
+            failureStage = "container-validation"
             let prefix = try Self.readPrefix(from: localInput, maximumBytes: 262_144)
+            if let expectedHash = reference.validatedPrefixSHA256 {
+                let expectedCount = reference.validatedPrefixByteCount
+                guard expectedCount > 0,
+                      expectedCount <= prefix.count,
+                      ProgressiveMediaFingerprint.sha256(
+                        Data(prefix.prefix(expectedCount))
+                      ) == expectedHash else {
+                    throw HLSError.invalidMediaPayload(
+                        stream: "progressive",
+                        number: 1,
+                        mimeType: mimeType,
+                        byteCount: Int(clamping: byteCount),
+                        signature: "changed-after-probe"
+                    )
+                }
+            }
             guard let container = ProgressiveMediaDetector.detect(
                 prefix: prefix,
                 url: candidate.request.primary,
@@ -444,6 +489,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 canMove: capturedInputToConsume == nil
             )
 
+            failureStage = "track-probe"
             let tracks = try await LocalMediaTrackProbe().probe(
                 inputURL: localInput,
                 input: .mediaFile()
@@ -462,6 +508,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             let locations = try fileStore.outputLocations(for: effectiveURL, format: outputFormat)
             temporaryOutput = locations.temporary
 
+            failureStage = "compose"
             if outputFormat == .webm {
                 try await fileStore.copyProtectedFile(from: localInput, to: locations.temporary)
             } else {
@@ -491,6 +538,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             }
 
             try Task.checkCancellation()
+            failureStage = "output-validation"
             guard WidevineMediaOutputValidator.isValid(
                 locations.temporary,
                 format: outputFormat
@@ -510,6 +558,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
                 expectedTracks: expectedOutputTracks
             )
             try Task.checkCancellation()
+            failureStage = "publish"
             try FileManager.default.moveItem(at: locations.temporary, to: locations.final)
             temporaryOutput = nil
             if let capturedInputToConsume {
@@ -527,12 +576,21 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             )
         } catch is CancellationError {
             if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            diagnostics.record("progressive", "cancelled stage=\(failureStage)")
             throw HLSError.cancelled
         } catch let error as HLSError {
             if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            diagnostics.record(
+                "progressive",
+                "failed stage=\(failureStage) error=\(DiagnosticPrivacy.errorCode(error))"
+            )
             throw error
         } catch {
             if let temporaryOutput { try? FileManager.default.removeItem(at: temporaryOutput) }
+            diagnostics.record(
+                "progressive",
+                "failed stage=\(failureStage) error=\(DiagnosticPrivacy.errorCode(error))"
+            )
             throw error
         }
     }
@@ -798,6 +856,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func downloadWithBackgroundExecution(
         document: PlaylistDocument,
         requestedPlaylistURL: URL,
+        preferredResolution: MediaResolution?,
         planBuilder: DownloadPlanBuilder,
         segmentDownloader: SegmentDownloader,
         progress: @escaping ProgressHandler
@@ -813,6 +872,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             return try await download(
                 document: document,
                 requestedPlaylistURL: requestedPlaylistURL,
+                preferredResolution: preferredResolution,
                 planBuilder: planBuilder,
                 segmentDownloader: segmentDownloader
             ) { update in
@@ -825,6 +885,7 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
     private func download(
         document: PlaylistDocument,
         requestedPlaylistURL: URL,
+        preferredResolution: MediaResolution?,
         planBuilder: DownloadPlanBuilder,
         segmentDownloader: SegmentDownloader,
         progress: @escaping ProgressHandler
@@ -835,7 +896,8 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
         do {
             let preparedPlan = try await planBuilder.build(
                 from: document,
-                requestedURL: requestedPlaylistURL
+                requestedURL: requestedPlaylistURL,
+                preferredResolution: preferredResolution
             )
             let plan = preparedPlan.plan
             try Task.checkCancellation()

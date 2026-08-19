@@ -22,6 +22,89 @@ final class PlaylistParserTests: XCTestCase {
         XCTAssertEqual(master.renditions.first?.url?.primary.absoluteString, "https://example.com/path/audio/ja.m3u8")
     }
 
+    func testResolutionCatalogGroupsDuplicateResolutionsAndSelectsRequestedQuality() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360
+        360.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=1800000,AVERAGE-BANDWIDTH=1500000,RESOLUTION=1280x720
+        720.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=3200000,RESOLUTION=1920x1080
+        1080-a.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=4500000,AVERAGE-BANDWIDTH=4000000,RESOLUTION=1920x1080
+        1080-b.m3u8
+        """
+        let base = try XCTUnwrap(URL(string: "https://example.com/master.m3u8"))
+        guard case .master(let master) = try PlaylistParser.parse(text: text, effectiveURL: base) else {
+            return XCTFail("master playlist expected")
+        }
+
+        let options = HLSResolutionCatalog.options(from: master.variants)
+        XCTAssertEqual(options.map(\.resolution.id), ["1920x1080", "1280x720", "640x360"])
+        XCTAssertEqual(options.first?.bandwidth, 4_000_000)
+
+        let selected = try HLSResolutionCatalog.selectVariant(
+            master.variants,
+            preferredResolution: try XCTUnwrap(MediaResolution(width: 1280, height: 720))
+        )
+        XCTAssertEqual(selected.url.primary.lastPathComponent, "720.m3u8")
+
+        XCTAssertThrowsError(
+            try HLSResolutionCatalog.selectVariant(
+                master.variants,
+                preferredResolution: MediaResolution(width: 3840, height: 2160)
+            )
+        )
+    }
+
+    func testMediaResolutionRejectsMalformedOrUnsafeValues() {
+        XCTAssertEqual(MediaResolution(hlsAttribute: "1920X1080")?.id, "1920x1080")
+        XCTAssertNil(MediaResolution(hlsAttribute: "0x1080"))
+        XCTAssertNil(MediaResolution(hlsAttribute: "1920x0"))
+        XCTAssertNil(MediaResolution(hlsAttribute: "999999x1080"))
+        XCTAssertNil(MediaResolution(hlsAttribute: "1920"))
+    }
+
+    func testRejectsMasterWithExcessiveVariantCount() throws {
+        let variants = (0...4_096).map { index in
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=640x360\n\(index).m3u8"
+        }.joined(separator: "\n")
+        XCTAssertThrowsError(
+            try PlaylistParser.parse(
+                text: "#EXTM3U\n\(variants)",
+                effectiveURL: try XCTUnwrap(URL(string: "https://example.com/master.m3u8"))
+            )
+        )
+    }
+
+    func testProgressiveMP4PrefixExtractsTrackHeaderResolution() throws {
+        func bigEndian32(_ value: UInt32) -> Data {
+            Data([
+                UInt8((value >> 24) & 0xFF), UInt8((value >> 16) & 0xFF),
+                UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)
+            ])
+        }
+        func box(_ type: String, _ payload: Data) -> Data {
+            var result = bigEndian32(UInt32(payload.count + 8))
+            result.append(Data(type.utf8))
+            result.append(payload)
+            return result
+        }
+        var trackHeader = Data([0, 0, 0, 7])
+        trackHeader.append(Data(repeating: 0, count: 72))
+        trackHeader.append(bigEndian32(UInt32(1920 << 16)))
+        trackHeader.append(bigEndian32(UInt32(1080 << 16)))
+        let prefix = box("ftyp", Data("isom0000".utf8))
+            + box("moov", box("trak", box("tkhd", trackHeader)))
+
+        let resolution = ProgressiveMediaResolutionProbe.detect(
+            prefix: prefix,
+            container: .isoBaseMedia
+        )
+        XCTAssertEqual(resolution?.id, "1920x1080")
+        XCTAssertNil(ProgressiveMediaResolutionProbe.detect(prefix: prefix, container: .webM))
+    }
+
     func testParsesMediaSequenceMapByteRangesAndAES() throws {
         let text = """
         #EXTM3U
@@ -513,6 +596,25 @@ private final class URLProtocolStub: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class ProgressiveRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [URLRequest] = []
+
+    func append(_ request: URLRequest) -> Int {
+        lock.lock()
+        requests.append(request)
+        let count = requests.count
+        lock.unlock()
+        return count
+    }
+
+    func snapshot() -> [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+}
+
 final class ProgressiveHTTPDownloadTests: XCTestCase {
     override func tearDown() {
         URLProtocolStub.reset()
@@ -532,7 +634,9 @@ final class ProgressiveHTTPDownloadTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let body = Data(repeating: 0x5A, count: 384 * 1_024)
         URLProtocolStub.handler = { request in
-            (
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
+            return (
                 HTTPURLResponse(
                     url: request.url!,
                     statusCode: 200,
@@ -571,6 +675,111 @@ final class ProgressiveHTTPDownloadTests: XCTestCase {
             }
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: rejectedURL.path))
+    }
+
+    func testOpenEndedRangeRejectsAnIncompleteHTTP206Body() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let sourceURL = try XCTUnwrap(URL(string: "https://media.example/movie.mp4"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ProgressiveRangeTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let body = Data(repeating: 0x42, count: 64 * 1_024)
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Range"), "bytes=0-")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 206,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "Content-Type": "video/mp4",
+                        "Content-Range": "bytes 0-\(body.count - 1)/\(body.count + 1)"
+                    ]
+                )!,
+                body
+            )
+        }
+
+        let output = directory.appendingPathComponent("incomplete.media")
+        do {
+            _ = try await client.downloadProgressiveMedia(
+                sourceURL,
+                to: output,
+                referer: nil,
+                maximumBytes: Int64(body.count + 10)
+            )
+            XCTFail("An incomplete 206 response must not be published")
+        } catch {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        }
+    }
+
+    func testProgressiveRetryRebuildsCookiesAfterServerDeletion() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [URLProtocolStub.self]
+        let client = HTTPClient(configuration: configuration)
+        let sourceURL = try XCTUnwrap(URL(string: "https://media.example/movie.mp4"))
+        let cookie = try XCTUnwrap(
+            HTTPCookie(properties: [
+                .name: "session",
+                .value: "secret",
+                .domain: "media.example",
+                .path: "/",
+                .secure: "TRUE"
+            ])
+        )
+        client.storeCookies([cookie])
+        let recorder = ProgressiveRequestRecorder()
+        let body = Data(repeating: 0x33, count: 32 * 1_024)
+        URLProtocolStub.handler = { request in
+            let attempt = recorder.append(request)
+            if attempt == 1 {
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 503,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: [
+                            "Content-Type": "text/plain",
+                            "Set-Cookie": "session=deleted; Max-Age=0; Path=/; Secure"
+                        ]
+                    )!,
+                    Data("retry".utf8)
+                )
+            }
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "video/mp4"]
+                )!,
+                body
+            )
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ProgressiveCookieRetry-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        _ = try await client.downloadProgressiveMedia(
+            sourceURL,
+            to: directory.appendingPathComponent("result.media"),
+            referer: sourceURL,
+            maximumBytes: Int64(body.count + 1)
+        )
+
+        let requests = recorder.snapshot()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Cookie"), "session=secret")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "Cookie"))
     }
 }
 

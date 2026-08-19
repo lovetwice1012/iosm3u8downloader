@@ -1329,3 +1329,156 @@ enum ProgressiveMediaDetector {
         }
     }
 }
+
+enum ProgressiveMediaFingerprint {
+    static func sha256(_ data: Data) -> Data {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        digest.withUnsafeMutableBytes { digestBytes in
+            data.withUnsafeBytes { bytes in
+                _ = CC_SHA256(
+                    bytes.baseAddress,
+                    CC_LONG(data.count),
+                    digestBytes.bindMemory(to: UInt8.self).baseAddress
+                )
+            }
+        }
+        return Data(digest)
+    }
+}
+
+/// Extracts display dimensions only from a structurally bounded `tkhd` box in
+/// the already-downloaded MP4 prefix. A missing/late `moov` box simply leaves
+/// the resolution unknown; URL names and page titles are never treated as
+/// quality evidence.
+enum ProgressiveMediaResolutionProbe {
+    static func detect(prefix: Data, container: MediaContainer) -> MediaResolution? {
+        guard container == .isoBaseMedia, prefix.count >= 8 else { return nil }
+        var scanner = Scanner(data: prefix)
+        scanner.scan(from: 0, to: prefix.count, depth: 0)
+        return scanner.best
+    }
+
+    private struct Scanner {
+        private static let containerTypes: Set<String> = [
+            "moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "mvex"
+        ]
+        private static let maximumBoxes = 4_096
+        private static let maximumDepth = 10
+
+        let data: Data
+        var boxCount = 0
+        var best: MediaResolution?
+
+        mutating func scan(from start: Int, to parentEnd: Int, depth: Int) {
+            guard depth <= Self.maximumDepth,
+                  start >= 0,
+                  parentEnd <= data.count,
+                  start <= parentEnd else {
+                return
+            }
+            var cursor = start
+            while cursor + 8 <= parentEnd, boxCount < Self.maximumBoxes {
+                guard let box = nextBox(at: cursor, parentEnd: parentEnd) else { return }
+                boxCount += 1
+                if box.type == "tkhd", let resolution = trackResolution(box) {
+                    if let current = best {
+                        if resolution.pixelCount > current.pixelCount { best = resolution }
+                    } else {
+                        best = resolution
+                    }
+                } else if Self.containerTypes.contains(box.type) {
+                    scan(from: box.payloadStart, to: box.availableEnd, depth: depth + 1)
+                }
+                guard box.declaredEnd > cursor else { return }
+                if box.declaredEnd > parentEnd { return }
+                cursor = box.declaredEnd
+            }
+        }
+
+        private struct Box {
+            let type: String
+            let payloadStart: Int
+            let declaredEnd: Int
+            let availableEnd: Int
+        }
+
+        private func nextBox(at offset: Int, parentEnd: Int) -> Box? {
+            guard offset >= 0,
+                  offset + 8 <= parentEnd,
+                  let size32 = uint32(at: offset),
+                  let type = ascii(at: offset + 4, count: 4) else {
+                return nil
+            }
+            var headerSize = 8
+            let declaredSize: UInt64
+            if size32 == 1 {
+                guard offset + 16 <= parentEnd,
+                      let size64 = uint64(at: offset + 8),
+                      size64 >= 16 else {
+                    return nil
+                }
+                headerSize = 16
+                declaredSize = size64
+            } else if size32 == 0 {
+                declaredSize = UInt64(parentEnd - offset)
+            } else {
+                guard size32 >= 8 else { return nil }
+                declaredSize = UInt64(size32)
+            }
+            guard declaredSize <= UInt64(Int.max) else { return nil }
+            let (declaredEnd, overflow) = offset.addingReportingOverflow(Int(declaredSize))
+            guard !overflow,
+                  declaredEnd >= offset + headerSize else {
+                return nil
+            }
+            return Box(
+                type: type,
+                payloadStart: offset + headerSize,
+                declaredEnd: declaredEnd,
+                availableEnd: min(declaredEnd, parentEnd)
+            )
+        }
+
+        private func trackResolution(_ box: Box) -> MediaResolution? {
+            guard box.payloadStart < box.availableEnd else { return nil }
+            let version = data[box.payloadStart]
+            let widthOffset: Int
+            switch version {
+            case 0: widthOffset = box.payloadStart + 76
+            case 1: widthOffset = box.payloadStart + 88
+            default: return nil
+            }
+            guard widthOffset + 8 <= box.availableEnd,
+                  let rawWidth = uint32(at: widthOffset),
+                  let rawHeight = uint32(at: widthOffset + 4) else {
+                return nil
+            }
+            return MediaResolution(
+                width: Int(rawWidth >> 16),
+                height: Int(rawHeight >> 16)
+            )
+        }
+
+        private func ascii(at offset: Int, count: Int) -> String? {
+            guard offset >= 0, count > 0, offset + count <= data.count else { return nil }
+            return String(bytes: data[offset..<(offset + count)], encoding: .ascii)
+        }
+
+        private func uint32(at offset: Int) -> UInt32? {
+            guard offset >= 0, offset + 4 <= data.count else { return nil }
+            return UInt32(data[offset]) << 24
+                | UInt32(data[offset + 1]) << 16
+                | UInt32(data[offset + 2]) << 8
+                | UInt32(data[offset + 3])
+        }
+
+        private func uint64(at offset: Int) -> UInt64? {
+            guard offset >= 0, offset + 8 <= data.count else { return nil }
+            var value: UInt64 = 0
+            for byte in data[offset..<(offset + 8)] {
+                value = (value << 8) | UInt64(byte)
+            }
+            return value
+        }
+    }
+}

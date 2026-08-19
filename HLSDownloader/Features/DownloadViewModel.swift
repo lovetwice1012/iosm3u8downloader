@@ -13,6 +13,8 @@ final class DownloadViewModel: ObservableObject {
                 cancelActiveOperation()
                 discardCapturedFiles(in: candidates)
                 candidates = []
+                candidatePresentations = []
+                selectedResolutionChoiceIDs = [:]
                 thumbnails = [:]
                 attemptedThumbnailIDs = []
                 thumbnailIDsInFlight = []
@@ -23,6 +25,8 @@ final class DownloadViewModel: ObservableObject {
     @Published private(set) var outputURL: URL?
     @Published private(set) var downloadedSegmentCount = 0
     @Published private(set) var candidates: [HLSCandidate] = []
+    @Published private(set) var candidatePresentations: [CandidatePresentation] = []
+    @Published private(set) var selectedResolutionChoiceIDs: [UUID: String] = [:]
     @Published private(set) var thumbnails: [UUID: UIImage] = [:]
     @Published private(set) var diagnosticLog = ""
     @Published private(set) var isCancelling = false
@@ -97,6 +101,8 @@ final class DownloadViewModel: ObservableObject {
         errorMessage = nil
         discardCapturedFiles(in: candidates)
         candidates = []
+        candidatePresentations = []
+        selectedResolutionChoiceIDs = [:]
         thumbnails = [:]
         attemptedThumbnailIDs = []
         thumbnailIDsInFlight = []
@@ -126,8 +132,12 @@ final class DownloadViewModel: ObservableObject {
 
                 if discovery.isDirectPlaylist,
                    let candidate = discovery.candidates.first,
-                   candidate.kind == .hls {
-                    let result = try await service.download(candidate: candidate) { [weak self] update in
+                   candidate.kind == .hls,
+                   HLSResolutionCatalog.options(from: candidate.document).count <= 1 {
+                    let result = try await service.download(
+                        candidate: candidate,
+                        preferredResolution: nil
+                    ) { [weak self] update in
                         await self?.apply(update, operationID: operationID)
                     }
                     try Task.checkCancellation()
@@ -137,6 +147,7 @@ final class DownloadViewModel: ObservableObject {
                     discoveredInput = input
                     discardCapturedFiles(in: candidates)
                     candidates = discovery.candidates
+                    reconcileResolutionSelections()
                     progress = DownloadProgress(phase: .idle, completedItems: 0, totalItems: 0)
                 }
             } catch {
@@ -152,6 +163,7 @@ final class DownloadViewModel: ObservableObject {
         task?.cancel()
         discardCapturedFiles(in: candidates)
         candidates.removeAll(where: { $0.capturedContentID != nil })
+        reconcileResolutionSelections()
         outputURL = nil
         downloadedSegmentCount = 0
         errorMessage = nil
@@ -203,7 +215,46 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
+    func selectedResolutionChoice(
+        for presentation: CandidatePresentation
+    ) -> CandidateResolutionChoice? {
+        guard !presentation.resolutionChoices.isEmpty else { return nil }
+        if let selectedID = selectedResolutionChoiceIDs[presentation.id],
+           let selected = presentation.resolutionChoices.first(where: { $0.id == selectedID }) {
+            return selected
+        }
+        return presentation.resolutionChoices.first
+    }
+
+    func selectResolutionChoice(
+        _ choice: CandidateResolutionChoice,
+        for presentation: CandidatePresentation
+    ) {
+        guard presentation.resolutionChoices.contains(where: { $0.id == choice.id }) else { return }
+        selectedResolutionChoiceIDs[presentation.id] = choice.id
+    }
+
+    func canDownload(_ presentation: CandidatePresentation) -> Bool {
+        guard let candidate = selectedCandidate(for: presentation) else { return false }
+        return canDownload(candidate)
+    }
+
+    func download(_ presentation: CandidatePresentation) {
+        guard let candidate = selectedCandidate(for: presentation) else { return }
+        download(
+            candidate,
+            preferredResolution: selectedResolutionChoice(for: presentation)?.hlsPreferredResolution
+        )
+    }
+
     func download(_ candidate: HLSCandidate) {
+        download(candidate, preferredResolution: nil)
+    }
+
+    private func download(
+        _ candidate: HLSCandidate,
+        preferredResolution: MediaResolution?
+    ) {
         guard canDownload(candidate),
               candidates.contains(where: { $0.id == candidate.id }) else { return }
         task?.cancel()
@@ -221,7 +272,10 @@ final class DownloadViewModel: ObservableObject {
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await service.download(candidate: candidate) { [weak self] update in
+                let result = try await service.download(
+                    candidate: candidate,
+                    preferredResolution: preferredResolution
+                ) { [weak self] update in
                     await self?.apply(update, operationID: operationID)
                 }
                 try Task.checkCancellation()
@@ -229,6 +283,7 @@ final class DownloadViewModel: ObservableObject {
                 apply(result)
                 if candidate.capturedContentID != nil {
                     candidates.removeAll(where: { $0.id == candidate.id })
+                    reconcileResolutionSelections()
                 }
             } catch {
                 if self.operationID == operationID { handle(error) }
@@ -393,6 +448,25 @@ final class DownloadViewModel: ObservableObject {
                 candidates.append(candidate)
             }
         }
+        reconcileResolutionSelections()
+    }
+
+    private func selectedCandidate(for presentation: CandidatePresentation) -> HLSCandidate? {
+        let selectedID = selectedResolutionChoice(for: presentation)?.candidateID
+            ?? presentation.candidate.id
+        return candidates.first(where: { $0.id == selectedID })
+    }
+
+    private func reconcileResolutionSelections() {
+        let presentations = CandidatePresentationPolicy.presentations(from: candidates)
+        candidatePresentations = presentations
+        selectedResolutionChoiceIDs = selectedResolutionChoiceIDs.filter {
+            presentationID, choiceID in
+            guard let presentation = presentations.first(where: { $0.id == presentationID }) else {
+                return false
+            }
+            return presentation.resolutionChoices.contains(where: { $0.id == choiceID })
+        }
     }
 
     private func candidateIdentity(_ candidate: HLSCandidate) -> String {
@@ -403,7 +477,7 @@ final class DownloadViewModel: ObservableObject {
         }
         return candidate.kind.rawValue
             + "\n"
-            + canonicalURL(candidate.playlistURL)
+            + canonicalURL(candidate.request.primary)
             + "\n"
             + canonicalURL(candidate.requestReferer ?? candidate.pageURL)
     }
@@ -478,6 +552,7 @@ enum CandidateMergePolicy {
             requestReferer: existing.requestReferer ?? candidate.requestReferer,
             document: existing.document ?? candidate.document,
             progressiveMedia: existing.progressiveMedia ?? candidate.progressiveMedia,
+            mediaGroupID: existing.mediaGroupID ?? candidate.mediaGroupID,
             usesCapturedDocument: existing.usesCapturedDocument || candidate.usesCapturedDocument,
             capturedContentID: existing.capturedContentID ?? candidate.capturedContentID,
             widevinePlaybackContext: existing.widevinePlaybackContext
@@ -488,6 +563,190 @@ enum CandidateMergePolicy {
             iframeDepth: min(existing.iframeDepth, candidate.iframeDepth),
             origin: existing.origin
         )
+    }
+}
+
+struct CandidateResolutionChoice: Identifiable, Equatable {
+    let id: String
+    let resolution: MediaResolution
+    let bandwidth: Int?
+    let candidateID: UUID
+    let hlsPreferredResolution: MediaResolution?
+
+    var displayTitle: String {
+        guard let bandwidth, bandwidth > 0 else { return resolution.displayTitle }
+        return HLSResolutionOption(
+            resolution: resolution,
+            bandwidth: bandwidth
+        ).displayTitle
+    }
+}
+
+struct CandidatePresentation: Identifiable {
+    let id: UUID
+    let candidate: HLSCandidate
+    let resolutionChoices: [CandidateResolutionChoice]
+}
+
+enum CandidatePresentationPolicy {
+    static func presentations(from candidates: [HLSCandidate]) -> [CandidatePresentation] {
+        let progressiveGroups = progressiveResolutionGroups(in: candidates)
+        let suppressedHLSCandidateIDs = hlsVariantCandidateIDsToSuppress(in: candidates)
+        var emittedGroups = Set<String>()
+        var result: [CandidatePresentation] = []
+
+        for candidate in candidates {
+            if suppressedHLSCandidateIDs.contains(candidate.id) { continue }
+            if let key = progressiveGroupKey(candidate),
+               let members = progressiveGroups[key],
+               emittedGroups.insert(key).inserted {
+                let choices = progressiveChoices(from: members)
+                guard choices.count > 1,
+                      let representativeID = choices.first?.candidateID,
+                      let representative = members.first(where: { $0.id == representativeID }) else {
+                    result.append(singlePresentation(candidate))
+                    continue
+                }
+                result.append(
+                    CandidatePresentation(
+                        id: representative.id,
+                        candidate: representative,
+                        resolutionChoices: choices
+                    )
+                )
+                continue
+            }
+            if let key = progressiveGroupKey(candidate), progressiveGroups[key] != nil {
+                continue
+            }
+
+            let hlsOptions = candidate.kind == .hls
+                ? HLSResolutionCatalog.options(from: candidate.document)
+                : []
+            let hlsChoices = hlsOptions.count > 1 ? hlsOptions.map { option in
+                CandidateResolutionChoice(
+                    id: "hls:\(option.id)",
+                    resolution: option.resolution,
+                    bandwidth: option.bandwidth,
+                    candidateID: candidate.id,
+                    hlsPreferredResolution: option.resolution
+                )
+            } : []
+            result.append(
+                CandidatePresentation(
+                    id: candidate.id,
+                    candidate: candidate,
+                    resolutionChoices: hlsChoices
+                )
+            )
+        }
+        return result
+    }
+
+    private static func singlePresentation(_ candidate: HLSCandidate) -> CandidatePresentation {
+        CandidatePresentation(id: candidate.id, candidate: candidate, resolutionChoices: [])
+    }
+
+    private static func progressiveResolutionGroups(
+        in candidates: [HLSCandidate]
+    ) -> [String: [HLSCandidate]] {
+        var grouped: [String: [HLSCandidate]] = [:]
+        for candidate in candidates {
+            guard let key = progressiveGroupKey(candidate) else { continue }
+            grouped[key, default: []].append(candidate)
+        }
+        var result: [String: [HLSCandidate]] = [:]
+        for (key, members) in grouped {
+            let distinct = Set(members.compactMap { $0.progressiveMedia?.resolution })
+            if distinct.count > 1 { result[key] = members }
+        }
+        return result
+    }
+
+    private static func progressiveChoices(
+        from candidates: [HLSCandidate]
+    ) -> [CandidateResolutionChoice] {
+        var bestByResolution: [MediaResolution: HLSCandidate] = [:]
+        for candidate in candidates {
+            guard let resolution = candidate.progressiveMedia?.resolution else { continue }
+            if bestByResolution[resolution] == nil { bestByResolution[resolution] = candidate }
+        }
+        return bestByResolution.map { resolution, candidate in
+            CandidateResolutionChoice(
+                id: "progressive:\(candidate.id.uuidString.lowercased())",
+                resolution: resolution,
+                bandwidth: nil,
+                candidateID: candidate.id,
+                hlsPreferredResolution: nil
+            )
+        }.sorted { lhs, rhs in
+            if lhs.resolution.pixelCount != rhs.resolution.pixelCount {
+                return lhs.resolution.pixelCount > rhs.resolution.pixelCount
+            }
+            return lhs.resolution.id > rhs.resolution.id
+        }
+    }
+
+    private static func progressiveGroupKey(_ candidate: HLSCandidate) -> String? {
+        guard candidate.kind == .progressive,
+              candidate.capturedContentID == nil,
+              let reference = candidate.progressiveMedia,
+              case .remote = reference.storage,
+              reference.resolution != nil,
+              let container = reference.container,
+              let groupID = candidate.mediaGroupID,
+              !groupID.isEmpty else {
+            return nil
+        }
+        return canonicalURL(candidate.pageURL)
+            + "\n\(candidate.iframeDepth)\n"
+            + container.rawValue
+            + "\n" + groupID
+    }
+
+    private static func hlsVariantCandidateIDsToSuppress(
+        in candidates: [HLSCandidate]
+    ) -> Set<UUID> {
+        var suppressed = Set<UUID>()
+        for masterCandidate in candidates where masterCandidate.kind == .hls {
+            guard HLSResolutionCatalog.options(from: masterCandidate.document).count > 1,
+                  let document = masterCandidate.document,
+                  let parsed = try? PlaylistParser.parse(
+                    text: document.text,
+                    effectiveURL: document.effectiveURL,
+                    requestReferer: document.referer
+                  ),
+                  case .master(let master) = parsed else {
+                continue
+            }
+            let variantURLs = Set(master.variants.flatMap { $0.url.all }.map(canonicalURL))
+            let masterPage = canonicalURL(masterCandidate.pageURL)
+            let masterReferer = canonicalURL(
+                masterCandidate.requestReferer ?? masterCandidate.pageURL
+            )
+            for candidate in candidates where candidate.id != masterCandidate.id
+                && candidate.kind == .hls {
+                guard canonicalURL(candidate.pageURL) == masterPage,
+                      canonicalURL(candidate.requestReferer ?? candidate.pageURL) == masterReferer,
+                      candidate.request.all.contains(where: {
+                        variantURLs.contains(canonicalURL($0))
+                      }) else {
+                    continue
+                }
+                suppressed.insert(candidate.id)
+            }
+        }
+        return suppressed
+    }
+
+    private static func canonicalURL(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        components.fragment = nil
+        return components.string ?? url.absoluteString
     }
 }
 

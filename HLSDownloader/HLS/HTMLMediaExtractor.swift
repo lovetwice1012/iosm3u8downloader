@@ -6,6 +6,7 @@ struct ExtractedHTMLMedia: Sendable {
     let title: String?
     let origin: HLSCandidateOrigin
     let kind: MediaCandidateKind
+    let mediaGroupID: String?
 }
 
 struct ExtractedHTMLFrame: Sendable {
@@ -30,15 +31,17 @@ enum HTMLMediaExtractor {
         let isSelfClosing: Bool
     }
 
-    private struct VideoContext {
+    private struct MediaContext {
         let poster: String?
         let title: String?
+        let groupID: String
     }
 
     static func extract(from html: String) -> HTMLMediaExtraction {
         var media: [ExtractedHTMLMedia] = []
         var frames: [ExtractedHTMLFrame] = []
-        var videoStack: [VideoContext] = []
+        var mediaStack: [MediaContext] = []
+        var mediaElementIndex = 0
         var firstBaseHref: String?
         var sawBaseHref = false
         var pageTitle: String?
@@ -70,8 +73,8 @@ enum HTMLMediaExtractor {
             guard let tag = parseTag(body) else { continue }
 
             if tag.isClosing {
-                if tag.name == "video", !videoStack.isEmpty {
-                    videoStack.removeLast()
+                if (tag.name == "video" || tag.name == "audio"), !mediaStack.isEmpty {
+                    mediaStack.removeLast()
                 }
                 continue
             }
@@ -142,23 +145,25 @@ enum HTMLMediaExtractor {
                     break
                 }
 
-            case "video":
-                let context = VideoContext(
+            case "video", "audio":
+                let context = MediaContext(
                     poster: nonempty(tag.attributes["poster"] ?? tag.attributes["data-poster"]),
-                    title: elementTitle(tag.attributes)
+                    title: elementTitle(tag.attributes),
+                    groupID: "media-\(mediaElementIndex)"
                 )
+                mediaElementIndex += 1
                 appendMediaReferences(
                     from: tag,
                     context: context,
                     origin: .video,
                     into: &media
                 )
-                if !tag.isSelfClosing { videoStack.append(context) }
+                if !tag.isSelfClosing { mediaStack.append(context) }
 
             case "source":
                 appendMediaReferences(
                     from: tag,
-                    context: videoStack.last,
+                    context: mediaStack.last,
                     origin: .source,
                     into: &media
                 )
@@ -210,7 +215,8 @@ enum HTMLMediaExtractor {
                     rawPosterURL: nil,
                     title: nil,
                     origin: .inlineScript,
-                    kind: reference.kind
+                    kind: reference.kind,
+                    mediaGroupID: nil
                 )
             )
         }
@@ -301,7 +307,7 @@ enum HTMLMediaExtractor {
 
     private static func appendMediaReferences(
         from tag: Tag,
-        context: VideoContext?,
+        context: MediaContext?,
         origin: HLSCandidateOrigin,
         into media: inout [ExtractedHTMLMedia]
     ) {
@@ -328,7 +334,8 @@ enum HTMLMediaExtractor {
                     rawPosterURL: poster,
                     title: title,
                     origin: origin,
-                    kind: kind
+                    kind: kind,
+                    mediaGroupID: context?.groupID
                 )
             )
         }
@@ -353,7 +360,8 @@ enum HTMLMediaExtractor {
                     rawPosterURL: nonempty(tag.attributes["data-poster"]),
                     title: elementTitle(tag.attributes),
                     origin: .inlineScript,
-                    kind: kind
+                    kind: kind,
+                    mediaGroupID: nil
                 )
             )
         }

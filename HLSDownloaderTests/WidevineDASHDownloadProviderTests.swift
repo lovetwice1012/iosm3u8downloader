@@ -176,6 +176,17 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         }
     }
 
+    func testClearVideoComposerFixtureSatisfiesProviderOutputValidator() throws {
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "widevine-clear-video-fixture-\(UUID().uuidString).mp4"
+        )
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        try clearVideoMP4Data().write(to: output, options: .atomic)
+
+        XCTAssertTrue(WidevineMediaOutputValidator.isValid(output, format: .mp4))
+    }
+
     func testProviderDownloadsInParallelConsolidatesTracksAndPassesPerTrackKeys() async throws {
         let fetcher = RecordingDASHFetcher()
         let acquirer = RecordingKeyAcquirer(
@@ -212,7 +223,7 @@ final class WidevineDASHDownloadProviderTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: result.mediaFileURL) }
 
-        XCTAssertEqual(try Data(contentsOf: result.mediaFileURL), minimalMP4Data())
+        XCTAssertEqual(try Data(contentsOf: result.mediaFileURL), clearVideoMP4Data())
         XCTAssertEqual(result.outputFormat, .mp4)
         XCTAssertEqual(result.mediaFileURL.pathExtension, "mp4")
         XCTAssertTrue(result.mediaFileURL.deletingLastPathComponent().lastPathComponent.hasPrefix("job-"))
@@ -1065,7 +1076,7 @@ private actor RecordingMediaComposer: WidevineMediaComposing {
     private var videoScheme: DASHCommonEncryptionScheme?
     private var audioScheme: DASHCommonEncryptionScheme?
 
-    init(outputData: Data = minimalMP4Data()) {
+    init(outputData: Data = clearVideoMP4Data()) {
         self.outputData = outputData
     }
 
@@ -1095,15 +1106,10 @@ private actor RecordingMediaComposer: WidevineMediaComposing {
     }
 }
 
-private func minimalMP4Data() -> Data {
-    Data([
-        0x00, 0x00, 0x00, 0x18,
-        0x66, 0x74, 0x79, 0x70,
-        0x69, 0x73, 0x6F, 0x6D,
-        0x00, 0x00, 0x02, 0x00,
-        0x69, 0x73, 0x6F, 0x6D,
-        0x69, 0x73, 0x6F, 0x32
-    ])
+private func clearVideoMP4Data() -> Data {
+    Data(
+        base64Encoded: "AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAA0Ftb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAD6AABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACa3RyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAEAAAABAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAA+gAAAAAAAEAAAAAAeNtZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAEAAAABAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAGObWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABTnN0YmwAAADqc3RzZAAAAAAAAAABAAAA2m1wNHYAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAEAAQAEgAAABIAAAAAAAAAAETTGF2YzYyLjI4LjEwMCBtcGVnNAAAAAAAAAAAAAAAAAAY//8AAABgZXNkcwAAAAADgICATwABAASAgIBBIBEAAAAAAw1AAAAAiAWAgIAvAAABsAEAAAG1iRMAAAEAAAABIADEjYgADQCEAhRjAAABskxhdmM2Mi4yOC4xMDAGgICAAQIAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAMNQAAAAIgAAAAYc3R0cwAAAAAAAAABAAAAAQAAQAAAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAEAAAABAAAAFHN0c3oAAAAAAAAAEQAAAAEAAAAUc3RjbwAAAAAAAAABAAADbQAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALWlsc3QAAAAlqXRvbwAAAB1kYXRhAAAAAQAAAABMYXZmNjIuMTIuMTAwAAAACGZyZWUAAAAZbWRhdAAAAbMAEAcAAAG2Fj8Ysbfv"
+    )!
 }
 
 private func minimalPCM16WAVData() -> Data {

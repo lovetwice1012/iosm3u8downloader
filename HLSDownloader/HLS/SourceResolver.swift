@@ -67,14 +67,24 @@ final class SourceResolver: Sendable {
                             id: UUID(),
                             kind: .progressive,
                             request: URLCandidates(
-                                primary: probe.effectiveURL,
+                                primary: inputURL,
                                 sameOriginQueryFallback: nil
                             ),
                             requestReferer: inputURL,
                             document: nil,
                             progressiveMedia: ProgressiveMediaReference(
                                 storage: .remote,
-                                hintedMIMEType: probe.mimeType
+                                hintedMIMEType: probe.mimeType,
+                                validatedEffectiveURL: probe.effectiveURL,
+                                container: container,
+                                resolution: ProgressiveMediaResolutionProbe.detect(
+                                    prefix: probe.prefix,
+                                    container: container
+                                ),
+                                validatedPrefixSHA256: ProgressiveMediaFingerprint.sha256(
+                                    probe.prefix
+                                ),
+                                validatedPrefixByteCount: probe.prefix.count
                             ),
                             pageURL: probe.effectiveURL,
                             title: nil,
@@ -459,6 +469,7 @@ final class SourceResolver: Sendable {
             let pageThumbnailURL = resolvedPageThumbnailURL.flatMap {
                 AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: $0) ? $0 : nil
             }
+            let mediaGroupNamespace = UUID().uuidString
 
             for reference in extraction.media where results.count < maximumResults {
                 guard discoveredCandidates.count < maximumCandidateReferences else { break }
@@ -478,7 +489,7 @@ final class SourceResolver: Sendable {
                     url: request.primary,
                     referer: documentURL
                 )
-                _ = discoveredCandidates.insert(attemptKey)
+                guard discoveredCandidates.insert(attemptKey).inserted else { continue }
 
                 let resolvedThumbnailURL = resolvedAutomaticURL(
                     reference.rawPosterURL,
@@ -489,11 +500,16 @@ final class SourceResolver: Sendable {
                 }
                 switch reference.kind {
                 case .hls:
+                    let inspectedDocument = await inspectHLSPlaylist(
+                        request,
+                        referer: documentURL,
+                        rootURL: rootURL
+                    )
                     appendCandidate(
                         kind: .hls,
                         request: request,
                         requestReferer: documentURL,
-                        document: nil,
+                        document: inspectedDocument,
                         pageURL: documentURL,
                         title: limitedTitle(reference.title ?? pageTitle),
                         thumbnailURL: thumbnailURL,
@@ -544,8 +560,16 @@ final class SourceResolver: Sendable {
                             document: nil,
                             progressiveMedia: ProgressiveMediaReference(
                                 storage: .remote,
-                                hintedMIMEType: validated.mimeType
+                                hintedMIMEType: validated.mimeType,
+                                validatedEffectiveURL: validated.effectiveURL,
+                                container: validated.container,
+                                resolution: validated.resolution,
+                                validatedPrefixSHA256: validated.prefixSHA256,
+                                validatedPrefixByteCount: validated.prefixByteCount
                             ),
+                            mediaGroupID: reference.mediaGroupID.map {
+                                "\(mediaGroupNamespace):\($0)"
+                            },
                             pageURL: documentURL,
                             title: limitedTitle(reference.title ?? pageTitle),
                             thumbnailURL: thumbnailURL,
@@ -734,20 +758,50 @@ final class SourceResolver: Sendable {
                 url: reference.url,
                 referer: pageURL
             )
-            _ = discovered.insert(attemptKey)
-
             let thumbnailURL = reference.thumbnailURL.flatMap {
                 isSafeAutomaticURL($0)
                     && AutomaticNavigationPolicy.isAllowedFrameNavigation(from: rootURL, to: $0)
                     ? $0 : nil
             }
+            let dynamicRequest = URLCandidates(
+                primary: reference.url,
+                sameOriginQueryFallback: nil
+            )
+            if !discovered.insert(attemptKey).inserted {
+                if reference.kind == .hls,
+                   let inspectedDocument = await inspectHLSPlaylist(
+                    dynamicRequest,
+                    referer: pageURL,
+                    rootURL: rootURL
+                   ) {
+                    appendCandidate(
+                        kind: .hls,
+                        request: dynamicRequest,
+                        requestReferer: pageURL,
+                        document: inspectedDocument,
+                        pageURL: pageURL,
+                        title: limitedTitle(reference.title),
+                        thumbnailURL: thumbnailURL,
+                        iframeDepth: reference.iframeDepth,
+                        origin: reference.origin,
+                        accepted: &accepted,
+                        results: &results
+                    )
+                }
+                continue
+            }
             switch reference.kind {
             case .hls:
+                let inspectedDocument = await inspectHLSPlaylist(
+                    dynamicRequest,
+                    referer: pageURL,
+                    rootURL: rootURL
+                )
                 appendCandidate(
                     kind: .hls,
-                    request: URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                    request: dynamicRequest,
                     requestReferer: pageURL,
-                    document: nil,
+                    document: inspectedDocument,
                     pageURL: pageURL,
                     title: limitedTitle(reference.title),
                     thumbnailURL: thumbnailURL,
@@ -759,7 +813,7 @@ final class SourceResolver: Sendable {
             case .widevineDASH:
                 do {
                     let validated = try await loadWidevineDASH(
-                        URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                        dynamicRequest,
                         referer: pageURL,
                         rootURL: rootURL
                     )
@@ -796,7 +850,7 @@ final class SourceResolver: Sendable {
             case .progressive:
                 do {
                     let validated = try await probeProgressiveMedia(
-                        URLCandidates(primary: reference.url, sameOriginQueryFallback: nil),
+                        dynamicRequest,
                         referer: pageURL,
                         rootURL: rootURL
                     )
@@ -807,8 +861,16 @@ final class SourceResolver: Sendable {
                         document: nil,
                         progressiveMedia: ProgressiveMediaReference(
                             storage: .remote,
-                            hintedMIMEType: validated.mimeType
+                            hintedMIMEType: validated.mimeType,
+                            validatedEffectiveURL: validated.effectiveURL,
+                            container: validated.container,
+                            resolution: validated.resolution,
+                            validatedPrefixSHA256: validated.prefixSHA256,
+                            validatedPrefixByteCount: validated.prefixByteCount
                         ),
+                        mediaGroupID: reference.mediaGroupID.flatMap { groupID in
+                            reference.frameToken.map { "\($0):\(groupID)" }
+                        },
                         pageURL: pageURL,
                         title: limitedTitle(reference.title),
                         thumbnailURL: thumbnailURL,
@@ -1126,6 +1188,55 @@ final class SourceResolver: Sendable {
         throw lastError
     }
 
+    /// Best-effort bounded enrichment for a displayed HLS candidate. The
+    /// original observed URL remains authoritative for the later download;
+    /// this document is used only to expose master-playlist quality choices.
+    private func inspectHLSPlaylist(
+        _ candidates: URLCandidates,
+        referer: URL?,
+        rootURL: URL
+    ) async -> PlaylistDocument? {
+        var lastError: Error?
+        for candidate in candidates.all {
+            do {
+                let payload = try await client.fetch(
+                    candidate,
+                    referer: referer,
+                    maximumBytes: 8 * 1_024 * 1_024
+                )
+                guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                    from: rootURL,
+                    to: payload.effectiveURL
+                ),
+                let text = decodeText(payload.data),
+                PlaylistParser.isPlaylist(text) else {
+                    continue
+                }
+                let document = PlaylistDocument(
+                    text: text,
+                    effectiveURL: payload.effectiveURL,
+                    referer: referer
+                )
+                let optionCount = HLSResolutionCatalog.options(from: document).count
+                if optionCount > 1 {
+                    log("playlist", "quality metadata accepted resolutions=\(optionCount)")
+                }
+                return document
+            } catch {
+                if error is CancellationError { return nil }
+                if let hlsError = error as? HLSError, case .cancelled = hlsError { return nil }
+                lastError = error
+            }
+        }
+        if let lastError {
+            log(
+                "playlist",
+                "quality metadata unavailable error=\(DiagnosticPrivacy.errorCode(lastError))"
+            )
+        }
+        return nil
+    }
+
     /// A URL suffix or DOM MIME type is only a discovery hint. Every remote
     /// progressive candidate must pass a fresh bounded byte probe before it is
     /// shown, and is probed again after the complete job download.
@@ -1135,8 +1246,12 @@ final class SourceResolver: Sendable {
         rootURL: URL
     ) async throws -> (
         request: URLCandidates,
+        effectiveURL: URL,
         mimeType: String?,
-        container: MediaContainer
+        container: MediaContainer,
+        resolution: MediaResolution?,
+        prefixSHA256: Data,
+        prefixByteCount: Int
     ) {
         var lastError: Error = HLSError.invalidMediaPayload(
             stream: "progressive",
@@ -1175,11 +1290,18 @@ final class SourceResolver: Sendable {
                 )
                 return (
                     URLCandidates(
-                        primary: probe.effectiveURL,
+                        primary: candidate,
                         sameOriginQueryFallback: nil
                     ),
+                    probe.effectiveURL,
                     probe.mimeType,
-                    container
+                    container,
+                    ProgressiveMediaResolutionProbe.detect(
+                        prefix: probe.prefix,
+                        container: container
+                    ),
+                    ProgressiveMediaFingerprint.sha256(probe.prefix),
+                    probe.prefix.count
                 )
             } catch is CancellationError {
                 throw HLSError.cancelled
@@ -1240,6 +1362,7 @@ final class SourceResolver: Sendable {
         requestReferer: URL?,
         document: PlaylistDocument?,
         progressiveMedia: ProgressiveMediaReference? = nil,
+        mediaGroupID: String? = nil,
         usesCapturedDocument: Bool = false,
         capturedContentID: UUID? = nil,
         widevinePlaybackContext: WidevinePlaybackContext? = nil,
@@ -1253,16 +1376,16 @@ final class SourceResolver: Sendable {
     ) {
         let key = candidateKey(
             kind: kind,
-            url: document?.effectiveURL ?? request.primary,
-            referer: document?.referer ?? requestReferer ?? pageURL,
+            url: request.primary,
+            referer: requestReferer ?? pageURL,
             capturedContentID: capturedContentID
         )
         guard accepted.insert(key).inserted else {
             guard let index = results.firstIndex(where: {
                 candidateKey(
                     kind: $0.kind,
-                    url: $0.document?.effectiveURL ?? $0.request.primary,
-                    referer: $0.document?.referer ?? $0.requestReferer ?? $0.pageURL,
+                    url: $0.request.primary,
+                    referer: $0.requestReferer ?? $0.pageURL,
                     capturedContentID: $0.capturedContentID
                 ) == key
             }) else { return }
@@ -1274,6 +1397,7 @@ final class SourceResolver: Sendable {
                 requestReferer: existing.requestReferer ?? requestReferer,
                 document: existing.document ?? document,
                 progressiveMedia: existing.progressiveMedia ?? progressiveMedia,
+                mediaGroupID: existing.mediaGroupID ?? mediaGroupID,
                 usesCapturedDocument: existing.usesCapturedDocument || usesCapturedDocument,
                 capturedContentID: existing.capturedContentID ?? capturedContentID,
                 widevinePlaybackContext: existing.widevinePlaybackContext ?? widevinePlaybackContext,
@@ -1297,6 +1421,7 @@ final class SourceResolver: Sendable {
                 requestReferer: requestReferer,
                 document: document,
                 progressiveMedia: progressiveMedia,
+                mediaGroupID: mediaGroupID,
                 usesCapturedDocument: usesCapturedDocument,
                 capturedContentID: capturedContentID,
                 widevinePlaybackContext: widevinePlaybackContext,

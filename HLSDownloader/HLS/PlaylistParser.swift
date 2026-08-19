@@ -6,8 +6,20 @@ enum PlaylistKind {
 }
 
 enum PlaylistParser {
+    private static let maximumPlaylistBytes = 8 * 1_024 * 1_024
+    private static let maximumLines = 100_000
+    private static let maximumMasterVariants = 4_096
+    private static let maximumRenditions = 4_096
+    private static let maximumMediaSegments = 100_000
+
     static func parse(text: String, effectiveURL: URL, requestReferer: URL? = nil) throws -> PlaylistKind {
+        guard text.utf8.count <= maximumPlaylistBytes else {
+            throw HLSError.invalidPlaylist("playlistが大きすぎます")
+        }
         let normalized = normalize(text)
+        guard normalized.components(separatedBy: .newlines).count <= maximumLines else {
+            throw HLSError.invalidPlaylist("playlistの行数が多すぎます")
+        }
         guard normalized.hasPrefix("#EXTM3U") else {
             throw HLSError.invalidPlaylist("#EXTM3U がありません")
         }
@@ -44,6 +56,9 @@ enum PlaylistParser {
                 let attributes = AttributeListParser.parse(value(afterColonIn: line))
                 guard let type = attributes["TYPE"],
                       let groupID = attributes["GROUP-ID"] else { continue }
+                guard renditions.count < maximumRenditions else {
+                    throw HLSError.invalidPlaylist("音声・字幕renditionが多すぎます")
+                }
                 let url = try attributes["URI"].map { try URIResolver.resolve($0, relativeTo: effectiveURL) }
                 renditions.append(
                     MediaRendition(
@@ -59,6 +74,9 @@ enum PlaylistParser {
             }
 
             if !line.hasPrefix("#"), let attributes = pendingVariantAttributes {
+                guard variants.count < maximumMasterVariants else {
+                    throw HLSError.invalidPlaylist("画質variantが多すぎます")
+                }
                 let url = try URIResolver.resolve(line, relativeTo: effectiveURL)
                 variants.append(
                     Variant(
@@ -138,6 +156,9 @@ enum PlaylistParser {
                 hasEndList = true
             } else if !line.hasPrefix("#") {
                 if pendingGap { throw HLSError.gapUnsupported }
+                guard segments.count < maximumMediaSegments else {
+                    throw HLSError.invalidPlaylist("media segmentが多すぎます")
+                }
                 guard let duration = pendingDuration else {
                     throw HLSError.invalidPlaylist("メディア断片の前にEXTINFがありません")
                 }

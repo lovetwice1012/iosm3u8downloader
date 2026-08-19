@@ -61,6 +61,80 @@ enum ProgressiveMediaStorage: Equatable, Sendable {
 struct ProgressiveMediaReference: Equatable, Sendable {
     let storage: ProgressiveMediaStorage
     let hintedMIMEType: String?
+    /// The redirect target that passed the bounded discovery probe. Remote
+    /// downloads deliberately start again from the original observed URL so
+    /// short-lived or one-shot CDN redirects are refreshed for the real job.
+    let validatedEffectiveURL: URL?
+    let container: MediaContainer?
+    let resolution: MediaResolution?
+    let validatedPrefixSHA256: Data?
+    let validatedPrefixByteCount: Int
+
+    init(
+        storage: ProgressiveMediaStorage,
+        hintedMIMEType: String?,
+        validatedEffectiveURL: URL? = nil,
+        container: MediaContainer? = nil,
+        resolution: MediaResolution? = nil,
+        validatedPrefixSHA256: Data? = nil,
+        validatedPrefixByteCount: Int = 0
+    ) {
+        self.storage = storage
+        self.hintedMIMEType = hintedMIMEType
+        self.validatedEffectiveURL = validatedEffectiveURL
+        self.container = container
+        self.resolution = resolution
+        self.validatedPrefixSHA256 = validatedPrefixSHA256
+        self.validatedPrefixByteCount = max(validatedPrefixByteCount, 0)
+    }
+}
+
+struct MediaResolution: Hashable, Sendable, Identifiable {
+    let width: Int
+    let height: Int
+
+    init?(width: Int, height: Int) {
+        guard (1...32_768).contains(width),
+              (1...32_768).contains(height) else {
+            return nil
+        }
+        self.width = width
+        self.height = height
+    }
+
+    init?(hlsAttribute: String?) {
+        guard let value = hlsAttribute?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return nil
+        }
+        let components = value.split(separator: "x", omittingEmptySubsequences: false)
+        guard components.count == 2,
+              let width = Int(components[0]),
+              let height = Int(components[1]) else {
+            return nil
+        }
+        self.init(width: width, height: height)
+    }
+
+    var id: String { "\(width)x\(height)" }
+
+    var pixelCount: Int64 { Int64(width) * Int64(height) }
+
+    var displayTitle: String { "\(width)×\(height)" }
+}
+
+struct HLSResolutionOption: Hashable, Sendable, Identifiable {
+    let resolution: MediaResolution
+    let bandwidth: Int
+
+    var id: String { resolution.id }
+
+    var displayTitle: String {
+        guard bandwidth > 0 else { return resolution.displayTitle }
+        let megabits = Double(bandwidth) / 1_000_000
+        return String(format: "%@・%.1f Mbps", resolution.displayTitle, megabits)
+    }
 }
 
 /// Non-secret facts observed for a possible Widevine license request.
@@ -269,6 +343,10 @@ struct HLSCandidate: Identifiable, Sendable {
     let requestReferer: URL?
     let document: PlaylistDocument?
     let progressiveMedia: ProgressiveMediaReference?
+    /// An opaque, session-local identity assigned only when the page explicitly
+    /// places multiple sources under the same media element. It is never
+    /// inferred from a title, thumbnail, or URL filename.
+    let mediaGroupID: String?
     let usesCapturedDocument: Bool
     /// Native-only identity for one captured Blob. It prevents two manifest
     /// Blobs created by the same page URL from collapsing into one candidate
@@ -288,6 +366,7 @@ struct HLSCandidate: Identifiable, Sendable {
         requestReferer: URL?,
         document: PlaylistDocument?,
         progressiveMedia: ProgressiveMediaReference? = nil,
+        mediaGroupID: String? = nil,
         usesCapturedDocument: Bool = false,
         capturedContentID: UUID? = nil,
         widevinePlaybackContext: WidevinePlaybackContext? = nil,
@@ -303,6 +382,7 @@ struct HLSCandidate: Identifiable, Sendable {
         self.requestReferer = requestReferer
         self.document = document
         self.progressiveMedia = kind == .progressive ? progressiveMedia : nil
+        self.mediaGroupID = kind == .progressive ? mediaGroupID : nil
         self.usesCapturedDocument = usesCapturedDocument && document != nil
         self.capturedContentID = capturedContentID
         self.widevinePlaybackContext = kind == .widevineDASH ? widevinePlaybackContext : nil

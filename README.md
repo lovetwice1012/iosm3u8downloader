@@ -14,6 +14,7 @@ iOS・Android・Windowsの再生解析ブラウザーは、それぞれアプリ
 - WebKitでJavaScript実行後のDOM変更、`fetch` / XHR、resource timingを全frameから監視
 - **再生通信を解析（α）**: アプリ内ブラウザで実際に動画を再生し、その操作後に発生したDOM・`fetch` / XHR・resource timing・navigationからHLS/MPDと通常メディア候補を追加。`URL.createObjectURL(Blob)`とMedia Source Extensionsも検出し、Widevine EME試行とライセンス要求候補は同一frame内で関連付け
 - HTML入力では候補URL・検出元・サムネイルを一覧表示し、選択した候補だけを検証して保存
+- 同じHLS master内、または同じvideo/audio要素配下でMP4内部の実解像度を確認できた通常メディアは1件にまとめ、ダウンロード前に解像度を選択
 - playlistごとの実URL（リダイレクト後）を基準にした相対URL補完
 - `segment.ts`、`../segment.ts`、`/segment.ts`、`//cdn.example/...`、絶対URL
 - 最高帯域variantと既定audio renditionの自動選択
@@ -65,6 +66,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 ### Blob / Media Source Extensions
 
 `blob:` URLはサーバー上のファイルURLではなく、そのブラウザー環境が保持する`Blob`や`MediaSource`への一時参照です。そのためURL文字列をHTTPで取得せず、完全な`Blob`だけを解析ブラウザーの生存中に上限付き・分割転送でアプリ専用一時領域へ取り出します。取得後もコンテナ、暗号化metadata、実track、完成ファイルを再検証し、ジョブ終了時に一時実体を削除します。
+
+通常メディアの検出probeでCDNの一時署名URLへredirectされた場合も、その一時URLを本体取得へ使い回しません。保存時はページが示した元URLからredirectを取り直し、解析WebKitと同じ端末OS版のブラウザ互換User-Agent、適合Cookie・Referer、open-ended Range要求を使用します。取得、container検証、track確認、合成、完成検証の失敗段階は秘密値を含めず診断ログへ残します。
 
 典型的なhls.js/dash.jsは`video.currentSrc`が`blob:`でも、元のm3u8/MPD通信を検出できるため既存manifest経路で保存します。manifestを公開せず`SourceBuffer.appendBuffer()`だけで組み立てるMSEは、ABR切替・映像/音声分離・eviction・暗号化を安全に復元できないため検出表示だけです。元のHLS/MPD候補が見つかった場合は、そちらを保存してください。
 

@@ -13,6 +13,8 @@ async function runProbe() {
   const blobMessages = [];
   const nonce = '0123456789abcdef0123456789abcdef';
   const listeners = new Map();
+  const intervalCallbacks = [];
+  const mediaElements = [];
 
   class MockMediaKeySession {
     addEventListener(name, callback) {
@@ -56,7 +58,10 @@ async function runProbe() {
     readyState: 'complete',
     documentElement: {},
     querySelector() { return null; },
-    querySelectorAll() { return []; },
+    querySelectorAll(selector) {
+      if (selector === 'video, audio') return mediaElements;
+      return [];
+    },
     addEventListener() {}
   };
   const context = {
@@ -84,7 +89,7 @@ async function runProbe() {
       requestMediaKeySystemAccess: async () => ({})
     },
     performance: { getEntriesByType: () => [] },
-    setInterval() { return 1; },
+    setInterval(callback) { intervalCallbacks.push(callback); return intervalCallbacks.length; },
     setTimeout(callback) { callback(); return 1; },
     webkit: {
       messageHandlers: {
@@ -107,6 +112,33 @@ async function runProbe() {
     .replaceAll('__HLS_DOWNLOADER_INTERACTIVE__', 'true')
     .replaceAll('__HLS_DOWNLOADER_MESSAGE_NONCE__', nonce);
   vm.runInNewContext(script, context, { timeout: 2_000 });
+
+  const mockVideo = url => ({
+    currentSrc: url,
+    src: url,
+    poster: '',
+    muted: false,
+    playsInline: false,
+    getAttribute(name) {
+      if (name === 'src') return url;
+      return '';
+    },
+    querySelectorAll() { return []; }
+  });
+  const firstVideo = mockVideo('https://media.example/first.mp4');
+  const secondVideo = mockVideo('https://media.example/second.mp4');
+  mediaElements.push(firstVideo, secondVideo);
+  intervalCallbacks.forEach(callback => callback());
+  const firstGroup = messages.find(message => message.url === firstVideo.src)?.mediaGroupID;
+  const secondGroup = messages.find(message => message.url === secondVideo.src)?.mediaGroupID;
+  assert(firstGroup && secondGroup && firstGroup !== secondGroup);
+  mediaElements.reverse();
+  intervalCallbacks.forEach(callback => callback());
+  assert.deepEqual(
+    [...new Set(messages.filter(message => message.url === firstVideo.src).map(message => message.mediaGroupID))],
+    [firstGroup],
+    'a DOM reorder must not change an existing media element group'
+  );
 
   const mp4Bytes = Uint8Array.from([
     0x00, 0x00, 0x00, 0x10,

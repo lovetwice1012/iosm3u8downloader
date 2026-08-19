@@ -25,6 +25,9 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
         }
 
         var sanitizedRequest = request
+        let originalSiteContext = task.originalRequest?
+            .value(forHTTPHeaderField: "Referer")
+            .flatMap { URL(string: $0) }
         // A proposed redirect request can retain a manually supplied Cookie
         // header. Always discard it and rebuild against the redirect target so
         // Domain/Path/Secure/expiry and site-context checks cannot be bypassed.
@@ -33,16 +36,14 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
             sanitizedRequest.setValue(nil, forHTTPHeaderField: "Authorization")
             sanitizedRequest.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
             sanitizedRequest.setValue(nil, forHTTPHeaderField: "Cookie")
-            sanitizedRequest.setValue(
-                Self.originString(sourceURL),
-                forHTTPHeaderField: "Referer"
-            )
+        }
+        sanitizedRequest.setValue(nil, forHTTPHeaderField: "Referer")
+        if let originalSiteContext,
+           let referer = Self.redirectReferer(from: originalSiteContext, to: targetURL) {
+            sanitizedRequest.setValue(referer, forHTTPHeaderField: "Referer")
         }
         // Keep the top-level site context stable for the entire redirect
         // chain. A redirecting CDN must not become a new first-party context.
-        let originalSiteContext = task.originalRequest?
-            .value(forHTTPHeaderField: "Referer")
-            .flatMap { URL(string: $0) }
         if let originalSiteContext,
            let cookieHeader = cookieHeaderProvider?(targetURL, originalSiteContext) {
             sanitizedRequest.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
@@ -76,6 +77,29 @@ final class HTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked S
         components.port = url.port
         components.path = "/"
         return components.url?.absoluteString
+    }
+
+    private static func redirectReferer(from context: URL, to target: URL) -> String? {
+        guard let contextScheme = context.scheme?.lowercased(),
+              contextScheme == "http" || contextScheme == "https",
+              let targetScheme = target.scheme?.lowercased(),
+              targetScheme == "http" || targetScheme == "https",
+              context.host != nil,
+              context.user == nil,
+              context.password == nil,
+              !(contextScheme == "https" && targetScheme == "http") else {
+            return nil
+        }
+        if isSameOrigin(context, target) {
+            guard var components = URLComponents(url: context, resolvingAgainstBaseURL: false) else {
+                return nil
+            }
+            components.user = nil
+            components.password = nil
+            components.fragment = nil
+            return components.url?.absoluteString
+        }
+        return originString(context)
     }
 }
 
@@ -221,6 +245,7 @@ private final class HTTPProgressiveDownloadDelegate: NSObject, URLSessionDownloa
                   Int64(fileSize) < copyMaximumBytes else {
                 throw HLSError.network("progressive media exceeded the size limit")
             }
+            try validateCompleteRangeResponse(response, fileSize: Int64(fileSize))
             try copyDownloadedFile(
                 from: location,
                 to: destinationURL,
@@ -299,6 +324,37 @@ private final class HTTPProgressiveDownloadDelegate: NSObject, URLSessionDownloa
             try? input.close()
             try? output.close()
             throw error
+        }
+    }
+
+    private func validateCompleteRangeResponse(
+        _ response: HTTPURLResponse,
+        fileSize: Int64
+    ) throws {
+        guard response.statusCode == 206 else { return }
+        guard let contentRange = response.value(forHTTPHeaderField: "Content-Range")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              contentRange.lowercased().hasPrefix("bytes ") else {
+            throw HLSError.network("progressive media range response was invalid")
+        }
+        let value = contentRange.dropFirst(6)
+        let halves = value.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard halves.count == 2,
+              halves[1] != "*",
+              let total = Int64(halves[1]),
+              total > 0 else {
+            throw HLSError.network("progressive media range total was invalid")
+        }
+        let bounds = halves[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard bounds.count == 2,
+              let lower = Int64(bounds[0]),
+              let upper = Int64(bounds[1]),
+              lower == 0,
+              upper >= lower,
+              upper < Int64.max,
+              upper + 1 == total,
+              total == fileSize else {
+            throw HLSError.network("progressive media range was incomplete")
         }
     }
 
@@ -487,7 +543,12 @@ struct HTTPFileDownload: Sendable {
 }
 
 final class HTTPClient: @unchecked Sendable {
-    static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 HLSDownloader/1.0"
+    static let userAgent: String = {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        let os = "\(version.majorVersion)_\(version.minorVersion)"
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS \(os) like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"
+    }()
+    private static let progressiveMediaAccept = "video/*,audio/*,application/ogg,application/octet-stream,*/*;q=0.4"
     private static let maximumTransientResponseCookies = 512
     static let maximumBufferedResponseBytes: Int64 = 64 * 1_024 * 1_024
 
@@ -859,10 +920,8 @@ final class HTTPClient: @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue(
-            "video/*,audio/*,application/ogg,application/octet-stream,application/vnd.apple.mpegurl,application/dash+xml,*/*;q=0.4",
-            forHTTPHeaderField: "Accept"
-        )
+        request.setValue(Self.progressiveMediaAccept, forHTTPHeaderField: "Accept")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("bytes=0-\(maximumBytes - 1)", forHTTPHeaderField: "Range")
         if let referer = safeReferer(referer, target: url) {
             request.setValue(referer, forHTTPHeaderField: "Referer")
@@ -944,17 +1003,23 @@ final class HTTPClient: @unchecked Sendable {
         let destinationMaximumBytes = try LocalFFmpegOutputLimit.maximumBytes(for: destinationURL)
         let effectiveMaximumBytes = min(maximumBytes, destinationMaximumBytes)
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(
-            "video/*,audio/*,application/ogg,application/octet-stream,*/*;q=0.4",
-            forHTTPHeaderField: "Accept"
-        )
-        if let referer = safeReferer(referer, target: url) {
-            request.setValue(referer, forHTTPHeaderField: "Referer")
-        }
-        if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
-            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        func makeRequest() -> URLRequest {
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.setValue(Self.progressiveMediaAccept, forHTTPHeaderField: "Accept")
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            // Safari/WebKit normally retrieves progressive media with a byte-range
+            // request. Some signed CDNs accept the bounded discovery probe but
+            // reject a later plain full GET, so restart from byte zero while still
+            // allowing servers that legally ignore Range and return HTTP 200.
+            request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+            if let referer = safeReferer(referer, target: url) {
+                request.setValue(referer, forHTTPHeaderField: "Referer")
+            }
+            if let cookieHeader = requestCookieHeader(for: url, referer: referer) {
+                request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+            }
+            return request
         }
 
         try? FileManager.default.removeItem(at: destinationURL)
@@ -966,44 +1031,53 @@ final class HTTPClient: @unchecked Sendable {
         guard created else { throw HLSError.network("could not create progressive media file") }
 
         do {
-            let delegate = HTTPProgressiveDownloadDelegate(
-                maximumBytes: effectiveMaximumBytes,
-                destinationURL: destinationURL,
-                redirectPolicy: redirectDelegate
-            )
-            let configuration = session.configuration
-            configuration.timeoutIntervalForRequest = max(
-                configuration.timeoutIntervalForRequest,
-                60
-            )
-            configuration.timeoutIntervalForResource = max(
-                configuration.timeoutIntervalForResource,
-                24 * 60 * 60
-            )
-            let delegateQueue = OperationQueue()
-            delegateQueue.maxConcurrentOperationCount = 1
-            let downloadSession = URLSession(
-                configuration: configuration,
-                delegate: delegate,
-                delegateQueue: delegateQueue
-            )
-            do {
-                let downloaded = try await delegate.start(
-                    session: downloadSession,
-                    request: request
+            var lastError: Error?
+            for attempt in 0..<2 {
+                let delegate = HTTPProgressiveDownloadDelegate(
+                    maximumBytes: effectiveMaximumBytes,
+                    destinationURL: destinationURL,
+                    redirectPolicy: redirectDelegate
                 )
-                downloadSession.finishTasksAndInvalidate()
-                let effectiveURL = downloaded.response.url ?? url
-                return HTTPFileDownload(
-                    effectiveURL: effectiveURL,
-                    statusCode: downloaded.response.statusCode,
-                    mimeType: downloaded.response.mimeType,
-                    byteCount: downloaded.byteCount
+                let configuration = session.configuration
+                configuration.timeoutIntervalForRequest = max(
+                    configuration.timeoutIntervalForRequest,
+                    60
                 )
-            } catch {
-                downloadSession.invalidateAndCancel()
-                throw error
+                configuration.timeoutIntervalForResource = max(
+                    configuration.timeoutIntervalForResource,
+                    24 * 60 * 60
+                )
+                let delegateQueue = OperationQueue()
+                delegateQueue.maxConcurrentOperationCount = 1
+                let downloadSession = URLSession(
+                    configuration: configuration,
+                    delegate: delegate,
+                    delegateQueue: delegateQueue
+                )
+                do {
+                    let downloaded = try await delegate.start(
+                        session: downloadSession,
+                        request: makeRequest()
+                    )
+                    downloadSession.finishTasksAndInvalidate()
+                    let effectiveURL = downloaded.response.url ?? url
+                    return HTTPFileDownload(
+                        effectiveURL: effectiveURL,
+                        statusCode: downloaded.response.statusCode,
+                        mimeType: downloaded.response.mimeType,
+                        byteCount: downloaded.byteCount
+                    )
+                } catch {
+                    downloadSession.invalidateAndCancel()
+                    lastError = error
+                    if attempt == 0, shouldRetry(error: error) {
+                        try await backoff(attempt: attempt)
+                        continue
+                    }
+                    throw error
+                }
             }
+            throw lastError ?? HLSError.network("progressive media download did not complete")
         } catch is CancellationError {
             try? FileManager.default.removeItem(at: destinationURL)
             throw HLSError.cancelled
@@ -1464,6 +1538,9 @@ final class HTTPClient: @unchecked Sendable {
             existing.expiresDate.map { $0 <= now } ?? false
         }
         for cookie in received {
+            importedCookies.removeAll {
+                Self.cookieIdentity($0) == Self.cookieIdentity(cookie)
+            }
             transientResponseCookies.removeAll {
                 Self.cookieIdentity($0) == Self.cookieIdentity(cookie)
             }
@@ -1487,11 +1564,11 @@ final class HTTPClient: @unchecked Sendable {
         if cookie.expiresDate.map({ $0 <= now }) == true { return true }
         guard let rawMaximumAge = cookie.properties?[.maximumAge] else { return false }
         if let value = rawMaximumAge as? NSNumber {
-            return cookie.value.isEmpty && value.intValue <= 0
+            return value.intValue <= 0
         }
         if let value = rawMaximumAge as? String,
            let seconds = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return cookie.value.isEmpty && seconds <= 0
+            return seconds <= 0
         }
         return false
     }

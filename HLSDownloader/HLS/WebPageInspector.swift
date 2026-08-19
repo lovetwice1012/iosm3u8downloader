@@ -10,6 +10,7 @@ struct DynamicMediaReference: Sendable {
     let thumbnailURL: URL?
     let iframeDepth: Int
     let origin: HLSCandidateOrigin
+    let mediaGroupID: String?
     let frameToken: String?
     let sequence: Int
 
@@ -21,6 +22,7 @@ struct DynamicMediaReference: Sendable {
         thumbnailURL: URL?,
         iframeDepth: Int,
         origin: HLSCandidateOrigin,
+        mediaGroupID: String? = nil,
         frameToken: String? = nil,
         sequence: Int = 0
     ) {
@@ -31,6 +33,7 @@ struct DynamicMediaReference: Sendable {
         self.thumbnailURL = thumbnailURL
         self.iframeDepth = max(iframeDepth, 0)
         self.origin = origin
+        self.mediaGroupID = PlaybackProbePayloadParser.normalizedMediaGroupID(mediaGroupID)
         self.frameToken = PlaybackProbePayloadParser.normalizedFrameToken(frameToken)
         self.sequence = max(sequence, 0)
     }
@@ -115,6 +118,7 @@ struct PlaybackLicenseProbePayload {
 enum PlaybackProbePayloadParser {
     private static let maximumURLLength = 8_192
     private static let maximumFrameTokenLength = 64
+    private static let maximumMediaGroupIDLength = 64
     private static let maximumHeaderNames = 32
 
     static func hasValidNonce(_ body: [String: Any], expected: String) -> Bool {
@@ -177,6 +181,20 @@ enum PlaybackProbePayloadParser {
             return nil
         }
         return token
+    }
+
+    static func normalizedMediaGroupID(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let identifier = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !identifier.isEmpty,
+              identifier.count <= maximumMediaGroupIDLength,
+              identifier.unicodeScalars.allSatisfy({ scalar in
+                  CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+                      .contains(scalar)
+              }) else {
+            return nil
+        }
+        return identifier
     }
 }
 
@@ -798,7 +816,6 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         configuration.websiteDataStore = websiteDataStore
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
-        configuration.applicationNameForUserAgent = "HLSDownloader/1.0"
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
         let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: configuration)
@@ -1085,6 +1102,9 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             thumbnailURL: thumbnailURL,
             iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
             origin: origin,
+            mediaGroupID: PlaybackProbePayloadParser.normalizedMediaGroupID(
+                body["mediaGroupID"] as? String
+            ),
             frameToken: PlaybackProbePayloadParser.normalizedFrameToken(body["frameToken"] as? String),
             sequence: (body["sequence"] as? NSNumber)?.intValue ?? 0
         )
@@ -1177,6 +1197,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         thumbnailURL: URL?,
         iframeDepth: Int,
         origin: HLSCandidateOrigin,
+        mediaGroupID: String? = nil,
         frameToken: String? = nil,
         sequence: Int = 0
     ) {
@@ -1189,6 +1210,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             duplicateReferenceCount += 1
             if existing.title == nil && title != nil
                 || existing.thumbnailURL == nil && thumbnailURL != nil
+                || existing.mediaGroupID == nil && mediaGroupID != nil
                 || existing.frameToken == nil && frameToken != nil
                 || existing.sequence == 0 && sequence > 0 {
                 references[key] = DynamicMediaReference(
@@ -1199,6 +1221,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
                     iframeDepth: existing.iframeDepth,
                     origin: existing.origin,
+                    mediaGroupID: existing.mediaGroupID ?? mediaGroupID,
                     frameToken: existing.frameToken ?? frameToken,
                     sequence: existing.sequence > 0 ? existing.sequence : sequence
                 )
@@ -1218,6 +1241,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
                 thumbnailURL: thumbnailURL,
                 iframeDepth: iframeDepth,
                 origin: origin,
+                mediaGroupID: mediaGroupID,
                 frameToken: frameToken,
                 sequence: sequence
             )
@@ -1354,6 +1378,15 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         return observationSequence;
       };
       const posted = new Map();
+      const mediaElementGroups = new WeakMap();
+      let nextMediaElementGroup = 0;
+      const mediaGroupIDFor = element => {
+        let existing = mediaElementGroups.get(element);
+        if (existing) return existing;
+        const identifier = `media-${nextMediaElementGroup++}`;
+        mediaElementGroups.set(element, identifier);
+        return identifier;
+      };
       const postedLicenseRequests = new Set();
       const maximumPostedEntries = 2048;
       const maximumPostedLicenseRequests = 256;
@@ -1401,7 +1434,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
           return element && element.getAttribute('content') || '';
         } catch (_) { return ''; }
       };
-      const post = (value, kind, poster, title, forcedManifestKind, baseURL) => {
+      const post = (value, kind, poster, title, forcedManifestKind, baseURL, mediaGroupID) => {
         const url = absolute(value, baseURL);
         if (!url || !/^https?:/i.test(url)) return;
         const normalizedKind = kind || 'runtime';
@@ -1422,8 +1455,11 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
         if (manifestKind === 'widevineDASH') widevineManifestObserved = true;
         const normalizedPoster = absolute(poster || pagePoster() || '') || '';
         const normalizedTitle = String(title || document.title || '').slice(0, 256);
+        const normalizedMediaGroupID = /^[A-Za-z0-9_-]{1,64}$/.test(String(mediaGroupID || ''))
+          ? String(mediaGroupID)
+          : '';
         const key = `${normalizedKind}\n${manifestKind}\n${url}`;
-        const signature = `${normalizedPoster}\n${normalizedTitle}`;
+        const signature = `${normalizedPoster}\n${normalizedTitle}\n${normalizedMediaGroupID}`;
         if (posted.get(key) === signature) return;
         if (!posted.has(key) && posted.size >= maximumPostedEntries) {
           const oldest = posted.keys().next();
@@ -1439,6 +1475,7 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
             manifestKind,
             poster: normalizedPoster,
             title: normalizedTitle,
+            mediaGroupID: normalizedMediaGroupID,
             frameToken,
             sequence: nextSequence()
           });
@@ -1858,29 +1895,38 @@ private final class WebPageInspectionSession: NSObject, WKNavigationDelegate, WK
       };
       const scan = () => {
         try {
-          document.querySelectorAll('video').forEach(video => {
+          document.querySelectorAll('video, audio').forEach(video => {
+            const mediaGroupID = mediaGroupIDFor(video);
             if (!interactive) {
               try { video.muted = true; video.playsInline = true; } catch (_) {}
             }
             const poster = video.poster || video.getAttribute('poster') || video.getAttribute('data-poster') || '';
             const title = video.getAttribute('title') || video.getAttribute('aria-label') || document.title || '';
             const type = video.getAttribute('type') || '';
-            ['currentSrc', 'src'].forEach(name => post(video[name], 'video', poster, title, typeKind(type) || 'hlsFallback'));
+            ['currentSrc', 'src'].forEach(name => post(
+              video[name], 'video', poster, title, typeKind(type) || 'hlsFallback', undefined, mediaGroupID
+            ));
             ['data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-video-src', 'data-playlist', 'data-file', 'data-url']
-              .forEach(name => post(video.getAttribute(name), 'video', poster, title, false));
+              .forEach(name => post(
+                video.getAttribute(name), 'video', poster, title, false, undefined, mediaGroupID
+              ));
             video.querySelectorAll('source').forEach(source => {
               const type = source.type || source.getAttribute('type') || '';
               ['src', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-file', 'data-url']
-                .forEach(name => post(source.getAttribute(name), 'source', poster, title, typeKind(type)));
+                .forEach(name => post(
+                  source.getAttribute(name), 'source', poster, title, typeKind(type), undefined, mediaGroupID
+                ));
             });
           });
           document.querySelectorAll('source').forEach(source => {
+            if (source.closest('video, audio')) return;
             const type = source.type || source.getAttribute('type') || '';
             ['src', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-file', 'data-url']
               .forEach(name => post(source.getAttribute(name), 'source', '', document.title, typeKind(type)));
           });
           document.querySelectorAll('[src],[href],[data-src],[data-hls-src],[data-dash-src],[data-mpd],[data-playlist],[data-file],[data-url]')
             .forEach(element => {
+              if (element.matches('video, audio, source')) return;
               const type = element.getAttribute('type') || '';
               ['src', 'href', 'data-src', 'data-hls-src', 'data-dash-src', 'data-mpd', 'data-playlist', 'data-file', 'data-url']
                 .forEach(name => post(element.getAttribute(name), 'runtime', '', document.title, typeKind(type)));
@@ -2100,7 +2146,6 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         configuration.websiteDataStore = websiteDataStore
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = .all
-        configuration.applicationNameForUserAgent = "HLSDownloader/1.0"
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         webView = WKWebView(frame: .zero, configuration: configuration)
 
@@ -2437,6 +2482,9 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             thumbnailURL: thumbnailURL,
             iframeDepth: message.frameInfo.isMainFrame ? 0 : 1,
             origin: origin,
+            mediaGroupID: PlaybackProbePayloadParser.normalizedMediaGroupID(
+                body["mediaGroupID"] as? String
+            ),
             frameToken: PlaybackProbePayloadParser.normalizedFrameToken(body["frameToken"] as? String),
             sequence: (body["sequence"] as? NSNumber)?.intValue ?? 0
         )
@@ -2532,6 +2580,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
         thumbnailURL: URL?,
         iframeDepth: Int,
         origin: HLSCandidateOrigin,
+        mediaGroupID: String? = nil,
         frameToken: String? = nil,
         sequence: Int = 0
     ) {
@@ -2550,6 +2599,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             let existing = references[index]
             if existing.title == nil && title != nil
                 || existing.thumbnailURL == nil && thumbnailURL != nil
+                || existing.mediaGroupID == nil && mediaGroupID != nil
                 || existing.frameToken == nil && frameToken != nil
                 || existing.sequence == 0 && sequence > 0 {
                 references[index] = DynamicMediaReference(
@@ -2560,6 +2610,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
                     thumbnailURL: existing.thumbnailURL ?? thumbnailURL,
                     iframeDepth: existing.iframeDepth,
                     origin: existing.origin,
+                    mediaGroupID: existing.mediaGroupID ?? mediaGroupID,
                     frameToken: existing.frameToken ?? frameToken,
                     sequence: existing.sequence > 0 ? existing.sequence : sequence
                 )
@@ -2583,6 +2634,7 @@ final class PlaybackCaptureSession: NSObject, ObservableObject, WKNavigationDele
             thumbnailURL: thumbnailURL,
             iframeDepth: iframeDepth,
             origin: origin,
+            mediaGroupID: mediaGroupID,
             frameToken: frameToken,
             sequence: sequence
         )
