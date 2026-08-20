@@ -1,5 +1,14 @@
 import Foundation
 
+enum ProgressiveOutputStrategy {
+    static func shouldPassthrough(
+        container: MediaContainer,
+        format: MediaOutputFormat
+    ) -> Bool {
+        format == .webm || (format == .mp4 && container == .isoBaseMedia)
+    }
+}
+
 protocol HLSDownloadServicing: Sendable {
     func discover(input: String) async throws -> HLSDiscoveryResult
     @MainActor
@@ -509,7 +518,14 @@ final class HLSDownloadService: HLSDownloadServicing, @unchecked Sendable {
             temporaryOutput = locations.temporary
 
             failureStage = "compose"
-            if outputFormat == .webm {
+            if ProgressiveOutputStrategy.shouldPassthrough(
+                container: container,
+                format: outputFormat
+            ) {
+                diagnostics.record(
+                    "progressive",
+                    "passthrough selected container=\(container.rawValue) format=\(outputFormat.rawValue)"
+                )
                 try await fileStore.copyProtectedFile(from: localInput, to: locations.temporary)
             } else {
                 let source = MediaSegment(

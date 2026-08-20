@@ -1288,6 +1288,13 @@ final class SourceResolver: Sendable {
                     "progressive",
                     "media accepted container=\(container.rawValue) bytesProbed=\(probe.prefix.count) \(DiagnosticPrivacy.urlSummary(probe.effectiveURL))"
                 )
+                let resolution = await progressiveResolution(
+                    from: probe,
+                    originalURL: candidate,
+                    referer: referer,
+                    rootURL: rootURL,
+                    container: container
+                )
                 return (
                     URLCandidates(
                         primary: candidate,
@@ -1296,10 +1303,7 @@ final class SourceResolver: Sendable {
                     probe.effectiveURL,
                     probe.mimeType,
                     container,
-                    ProgressiveMediaResolutionProbe.detect(
-                        prefix: probe.prefix,
-                        container: container
-                    ),
+                    resolution,
                     ProgressiveMediaFingerprint.sha256(probe.prefix),
                     probe.prefix.count
                 )
@@ -1313,6 +1317,58 @@ final class SourceResolver: Sendable {
             }
         }
         throw lastError
+    }
+
+    private func progressiveResolution(
+        from probe: HTTPResourceProbe,
+        originalURL: URL,
+        referer: URL?,
+        rootURL: URL,
+        container: MediaContainer
+    ) async -> MediaResolution? {
+        if let resolution = ProgressiveMediaResolutionProbe.detect(
+            prefix: probe.prefix,
+            container: container
+        ) {
+            return resolution
+        }
+        guard container == .isoBaseMedia,
+              let total = probe.totalResourceLength,
+              total > Int64(probe.prefix.count) else {
+            return nil
+        }
+        let length = min(total, 1_048_576)
+        let offset = total - length
+        do {
+            let payload = try await client.fetch(
+                originalURL,
+                referer: referer,
+                byteRange: ByteRange(offset: offset, length: length),
+                maximumBytes: length
+            )
+            guard AutomaticNavigationPolicy.isAllowedFrameNavigation(
+                from: rootURL,
+                to: payload.effectiveURL
+            ) else {
+                return nil
+            }
+            let resolution = ProgressiveMediaResolutionProbe.detect(
+                prefix: payload.data,
+                container: container
+            )
+            if let resolution {
+                log("progressive", "resolution metadata accepted value=\(resolution.id)")
+            }
+            return resolution
+        } catch {
+            if error is CancellationError { return nil }
+            if let hlsError = error as? HLSError, case .cancelled = hlsError { return nil }
+            log(
+                "progressive",
+                "resolution metadata unavailable error=\(DiagnosticPrivacy.errorCode(error))"
+            )
+            return nil
+        }
     }
 
     private func validateWidevineDASHPayload(

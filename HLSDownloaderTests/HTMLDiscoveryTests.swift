@@ -1162,7 +1162,10 @@ final class SourceDiscoveryTests: XCTestCase {
             discovery.candidates.first?.playlistURL.absoluteString,
             "https://example.com/video/actual-master.m3u8"
         )
-        XCTAssertEqual(recorder.snapshot().count, 1)
+        XCTAssertEqual(
+            recorder.snapshot().map { $0.url?.path },
+            ["/player/page.mpd", "/video/actual-master.m3u8"]
+        )
     }
 
     func testRejectsDirectWidevineMPDRedirectedOutsideDownloadableDomain() async throws {
@@ -1190,7 +1193,7 @@ final class SourceDiscoveryTests: XCTestCase {
         }
     }
 
-    func testResolvesCandidateAndPosterAgainstFirstBaseWithoutFetchingManifest() async throws {
+    func testResolvesCandidateAndPosterAgainstFirstBaseAndBoundsManifestEnrichment() async throws {
         let recorder = DiscoveryRequestRecorder()
         let resolver = makeResolver()
         DiscoveryURLProtocolStub.handler = { request in
@@ -1216,10 +1219,10 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(candidate.title, "本編")
         XCTAssertEqual(candidate.origin, .video)
         XCTAssertNil(candidate.document)
-        XCTAssertEqual(recorder.snapshot().count, 1, "候補は選択前に自動GETしません")
+        XCTAssertEqual(recorder.snapshot().count, 2, "候補表示用のHLS metadata取得は1回に制限します")
     }
 
-    func testValidatesStaticWidevineMPDAndKeepsHLSBehaviorLazy() async throws {
+    func testValidatesStaticWidevineMPDAndAttemptsHLSQualityEnrichment() async throws {
         let recorder = DiscoveryRequestRecorder()
         let resolver = makeResolver()
         DiscoveryURLProtocolStub.handler = { request in
@@ -1243,7 +1246,7 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.candidates.map(\.kind), [.hls, .widevineDASH])
         XCTAssertNil(discovery.candidates[0].document)
         XCTAssertNotNil(discovery.candidates[1].document)
-        XCTAssertEqual(recorder.snapshot().count, 2, "HLSは候補選択まで取得せずMPDだけを検証します")
+        XCTAssertEqual(recorder.snapshot().count, 3, "root、HLS metadata、MPDを各1回だけ確認します")
     }
 
     func testRejectsStaticWidevineMPDOnOtherDomainAfterContentValidation() async throws {
@@ -1368,7 +1371,9 @@ final class SourceDiscoveryTests: XCTestCase {
         XCTAssertEqual(candidate.iframeDepth, 1)
 
         let requests = recorder.snapshot()
-        XCTAssertEqual(requests.count, 2, "rootへ戻るiframe cycleを再取得してはいけません")
+        XCTAssertEqual(requests.filter { $0.url?.path == "/watch" }.count, 1)
+        XCTAssertEqual(requests.filter { $0.url?.path == "/player/frame" }.count, 1)
+        XCTAssertEqual(requests.filter { $0.url?.path == "/player/media/index.m3u8" }.count, 2)
         let frameRequest = try XCTUnwrap(requests.first { $0.url?.path == "/player/frame" })
         XCTAssertEqual(frameRequest.value(forHTTPHeaderField: "Referer"), "https://site.example/watch")
     }
@@ -1812,7 +1817,9 @@ final class SourceDiscoveryTests: XCTestCase {
 
         let discovery = try await resolver.discover(input: "https://public.example/watch")
         XCTAssertEqual(discovery.candidates.count, 1)
-        XCTAssertEqual(recorder.snapshot().count, 1)
+        let requests = recorder.snapshot()
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/watch", "/safe.m3u8"])
+        XCTAssertFalse(requests.contains { $0.url?.host == "127.0.0.1" })
     }
 
     func testDiscoveryDiagnosticsExplainCoverageWithoutLeakingURLSecrets() async throws {

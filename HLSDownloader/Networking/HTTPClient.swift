@@ -532,6 +532,7 @@ struct HTTPResourceProbe: Sendable {
     let statusCode: Int
     let mimeType: String?
     let expectedContentLength: Int64
+    let totalResourceLength: Int64?
     let isCompleteResponse: Bool
 }
 
@@ -964,6 +965,7 @@ final class HTTPClient: @unchecked Sendable {
                 statusCode: http.statusCode,
                 mimeType: http.mimeType,
                 expectedContentLength: http.expectedContentLength,
+                totalResourceLength: Self.totalResourceLength(from: http),
                 isCompleteResponse: http.statusCode == 200 && reachedEnd
             )
         } catch is CancellationError {
@@ -1399,6 +1401,21 @@ final class HTTPClient: @unchecked Sendable {
         } catch is CancellationError {
             throw HLSError.cancelled
         }
+    }
+
+    private static func totalResourceLength(from response: HTTPURLResponse) -> Int64? {
+        if response.statusCode == 200, response.expectedContentLength > 0 {
+            return response.expectedContentLength
+        }
+        guard response.statusCode == 206,
+              let contentRange = response.value(forHTTPHeaderField: "Content-Range")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let slash = contentRange.lastIndex(of: "/") else {
+            return nil
+        }
+        let rawTotal = contentRange[contentRange.index(after: slash)...]
+        guard rawTotal != "*", let total = Int64(rawTotal), total > 0 else { return nil }
+        return total
     }
 
     private func checkedUpperBound(_ range: ByteRange) throws -> Int64 {

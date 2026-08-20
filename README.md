@@ -51,6 +51,8 @@ IPA内は標準の `Payload/HLSDownloader.app` 構造です。アプリ本体と
 
 未署名IPA自体は通常の非脱獄iPhoneへ直接インストールできません。利用する個人署名環境で再署名してからインストールしてください。本プロジェクトにはApp Groups、Push、iCloudなど個人署名を複雑にするentitlementを設定していません。
 
+iOS 26のContinued Processingを使う場合、再署名時に`CFBundleIdentifier`を変更したら、Info.plistの`BGTaskSchedulerPermittedIdentifiers`も`<新しいBundle ID>.continued-download.*`へ同時に更新してください。Appleの仕様上、task identifierは実行中アプリのBundle IDで始まる必要があります。片方だけ変更されたIPAではアプリが不一致を診断ログへ記録し、安全な短時間background allowanceへフォールバックします。
+
 ## 対応範囲
 
 - `#EXT-X-ENDLIST` を含む終了済みVOD

@@ -132,6 +132,27 @@ final class BackgroundExecutionCoordinator {
             .lowercased()
         return "\(bundleIdentifier).continued-download.\(suffix)"
     }
+
+    static func permittedTaskIdentifier(
+        bundleIdentifier: String,
+        permittedIdentifiers: [String],
+        jobID: UUID
+    ) -> String? {
+        let prefix = permittedIdentifiers.compactMap { value -> String? in
+            guard value.hasSuffix(".*") else { return nil }
+            let candidate = String(value.dropLast(2))
+            guard candidate == bundleIdentifier
+                    || candidate.hasPrefix(bundleIdentifier + ".") else {
+                return nil
+            }
+            return candidate
+        }.max(by: { $0.count < $1.count })
+        guard let prefix else { return nil }
+        let suffix = jobID.uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+        return "\(prefix).\(suffix)"
+    }
     static let shared = BackgroundExecutionCoordinator()
 
     enum ContinuedProcessingPolicy: Equatable {
@@ -158,6 +179,7 @@ final class BackgroundExecutionCoordinator {
         let startWork: @MainActor (BackgroundExecutionProgressReporter) -> Task<Void, Never>
         let failBeforeStart: @MainActor (Error) -> Void
         let diagnosticSink: DiagnosticSink?
+        let continuedConfigurationIsValid: Bool
         var workTask: Task<Void, Never>?
         var launchTimeoutTask: Task<Void, Never>?
         var shortTaskToken: ShortBackgroundTaskToken?
@@ -174,7 +196,8 @@ final class BackgroundExecutionCoordinator {
             subtitle: String,
             startWork: @escaping @MainActor (BackgroundExecutionProgressReporter) -> Task<Void, Never>,
             failBeforeStart: @escaping @MainActor (Error) -> Void,
-            diagnosticSink: DiagnosticSink?
+            diagnosticSink: DiagnosticSink?,
+            continuedConfigurationIsValid: Bool
         ) {
             self.id = id
             self.taskIdentifier = taskIdentifier
@@ -183,6 +206,7 @@ final class BackgroundExecutionCoordinator {
             self.startWork = startWork
             self.failBeforeStart = failBeforeStart
             self.diagnosticSink = diagnosticSink
+            self.continuedConfigurationIsValid = continuedConfigurationIsValid
         }
     }
 
@@ -213,7 +237,15 @@ final class BackgroundExecutionCoordinator {
 
         let jobID = UUID()
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.example.HLSDownloader"
-        let taskIdentifier = Self.taskIdentifier(
+        let permittedIdentifiers = Bundle.main.object(
+            forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers"
+        ) as? [String] ?? []
+        let permittedTaskIdentifier = Self.permittedTaskIdentifier(
+            bundleIdentifier: bundleIdentifier,
+            permittedIdentifiers: permittedIdentifiers,
+            jobID: jobID
+        )
+        let taskIdentifier = permittedTaskIdentifier ?? Self.taskIdentifier(
             bundleIdentifier: bundleIdentifier,
             jobID: jobID
         )
@@ -251,12 +283,13 @@ final class BackgroundExecutionCoordinator {
                     failBeforeStart: { error in
                         continuation.resume(throwing: error)
                     },
-                    diagnosticSink: diagnosticSink
+                    diagnosticSink: diagnosticSink,
+                    continuedConfigurationIsValid: permittedTaskIdentifier != nil
                 )
                 activeJob = job
                 log(
                     job,
-                    "request started continuedEligible=\(continuedProcessingPolicy == .automatic && isContinuedProcessingAvailable)"
+                    "request started continuedEligible=\(continuedProcessingPolicy == .automatic && isContinuedProcessingAvailable && job.continuedConfigurationIsValid)"
                 )
 
                 if Task.isCancelled {
@@ -396,6 +429,10 @@ final class BackgroundExecutionCoordinator {
 
     private func submitContinuedTaskIfPossible(for job: Job) -> Bool {
         guard continuedProcessingPolicy == .automatic else { return false }
+        guard job.continuedConfigurationIsValid else {
+            log(job, "continued identifier not permitted; re-signing metadata mismatch")
+            return false
+        }
         if #available(iOS 26.0, *) {
             return submitContinuedTask(for: job)
         }

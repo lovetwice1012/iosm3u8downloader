@@ -56,6 +56,27 @@ final class BackgroundExecutionCoordinatorTests: XCTestCase {
         XCTAssertTrue(second.hasPrefix("com.example.HLSDownloader.continued-download."))
     }
 
+    func testContinuedIdentifierRequiresWildcardMatchingResignedBundleID() throws {
+        let jobID = try XCTUnwrap(
+            UUID(uuidString: "11111111-2222-3333-4444-555555555555")
+        )
+        XCTAssertEqual(
+            BackgroundExecutionCoordinator.permittedTaskIdentifier(
+                bundleIdentifier: "personal.example.Downloader",
+                permittedIdentifiers: ["personal.example.Downloader.continued-download.*"],
+                jobID: jobID
+            ),
+            "personal.example.Downloader.continued-download.11111111222233334444555555555555"
+        )
+        XCTAssertNil(
+            BackgroundExecutionCoordinator.permittedTaskIdentifier(
+                bundleIdentifier: "personal.example.Downloader",
+                permittedIdentifiers: ["com.example.HLSDownloader.continued-download.*"],
+                jobID: jobID
+            )
+        )
+    }
+
     func testLegacyFallbackRunsOperationAndEndsAllowance() async throws {
         let manager = FakeShortBackgroundTaskManager()
         let coordinator = BackgroundExecutionCoordinator(

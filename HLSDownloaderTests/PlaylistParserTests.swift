@@ -102,6 +102,15 @@ final class PlaylistParserTests: XCTestCase {
             container: .isoBaseMedia
         )
         XCTAssertEqual(resolution?.id, "1920x1080")
+        let unalignedTail = Data(repeating: 0xAA, count: 31)
+            + box("moov", box("trak", box("tkhd", trackHeader)))
+        XCTAssertEqual(
+            ProgressiveMediaResolutionProbe.detect(
+                prefix: unalignedTail,
+                container: .isoBaseMedia
+            )?.id,
+            "1920x1080"
+        )
         XCTAssertNil(ProgressiveMediaResolutionProbe.detect(prefix: prefix, container: .webM))
     }
 
@@ -619,6 +628,27 @@ final class ProgressiveHTTPDownloadTests: XCTestCase {
     override func tearDown() {
         URLProtocolStub.reset()
         super.tearDown()
+    }
+
+    func testCompleteMP4AndWebMUseQualityPreservingPassthrough() {
+        XCTAssertTrue(
+            ProgressiveOutputStrategy.shouldPassthrough(
+                container: .isoBaseMedia,
+                format: .mp4
+            )
+        )
+        XCTAssertTrue(
+            ProgressiveOutputStrategy.shouldPassthrough(
+                container: .webM,
+                format: .webm
+            )
+        )
+        XCTAssertFalse(
+            ProgressiveOutputStrategy.shouldPassthrough(
+                container: .isoBaseMedia,
+                format: .wav
+            )
+        )
     }
 
     func testDownloadTaskWritesCompleteProgressiveFileAndEnforcesLimit() async throws {

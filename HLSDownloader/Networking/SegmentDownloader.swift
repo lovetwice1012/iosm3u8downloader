@@ -1355,7 +1355,32 @@ enum ProgressiveMediaResolutionProbe {
         guard container == .isoBaseMedia, prefix.count >= 8 else { return nil }
         var scanner = Scanner(data: prefix)
         scanner.scan(from: 0, to: prefix.count, depth: 0)
-        return scanner.best
+        if let best = scanner.best { return best }
+
+        // A suffix Range can begin before a fast-searchable `moov` box rather
+        // than at a top-level box boundary. Locate a fully contained normal-size
+        // movie box, then run the same bounded structural scanner on that slice.
+        var inspectedMarkers = 0
+        for typeOffset in 4..<(prefix.count - 4) {
+            guard inspectedMarkers < 128,
+                  prefix[typeOffset] == 0x6D,
+                  prefix[typeOffset + 1] == 0x6F,
+                  prefix[typeOffset + 2] == 0x6F,
+                  prefix[typeOffset + 3] == 0x76 else {
+                continue
+            }
+            inspectedMarkers += 1
+            let start = typeOffset - 4
+            let size = Int(prefix[start]) << 24
+                | Int(prefix[start + 1]) << 16
+                | Int(prefix[start + 2]) << 8
+                | Int(prefix[start + 3])
+            guard size >= 8, start <= prefix.count - size else { continue }
+            var embedded = Scanner(data: Data(prefix[start..<(start + size)]))
+            embedded.scan(from: 0, to: size, depth: 0)
+            if let best = embedded.best { return best }
+        }
+        return nil
     }
 
     private struct Scanner {
